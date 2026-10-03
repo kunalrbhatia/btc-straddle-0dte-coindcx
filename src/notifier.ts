@@ -2,8 +2,17 @@
  * Telegram Notifier
  * Uses Telegram Bot API sendMessage only (no polling/getUpdates to avoid conflicts).
  * Gracefully disables if credentials are not configured.
+ * Also journals every alert locally (see fileAlerter) so the Hermes watch banner
+ * can forward failures to Telegram even without a bot token configured here.
  * Never prints or leaks bot tokens.
  */
+
+import { appendAlert } from './fileAlerter';
+
+/** Strips the HTML tags used for Telegram formatting, for plain-text journalling. */
+function stripHtml(text: string): string {
+  return text.replace(/<\/?[^>]+>/g, '').replace(/\n{3,}/g, '\n\n').trim();
+}
 
 export interface Notifier {
   readonly isEnabled: boolean;
@@ -61,6 +70,12 @@ export class TelegramNotifier implements Notifier {
   }
 
   private async send(text: string): Promise<void> {
+    // Always journal every alert locally, even when Telegram is disabled. The
+    // Hermes watch banner (~/.hermes/scripts/btc-banner.py) tails this journal
+    // and forwards alerts to Telegram, so failures are never silent — and no
+    // bot token is required in .env.
+    appendAlert('notify', stripHtml(text));
+
     if (!this.isEnabled) return;
 
     const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;

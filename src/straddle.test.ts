@@ -45,6 +45,7 @@ describe('Straddle Execution & Unwind Tests', () => {
 
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
+      getContractPrice: async () => 500,
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           callOrderPlaced = true;
@@ -84,6 +85,7 @@ describe('Straddle Execution & Unwind Tests', () => {
 
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
+      getContractPrice: async () => 500,
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           return {
@@ -138,6 +140,7 @@ describe('Straddle Execution & Unwind Tests', () => {
 
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
+      getContractPrice: async () => 500,
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           return {
@@ -184,5 +187,96 @@ describe('Straddle Execution & Unwind Tests', () => {
     assert.equal(unwoundQuantity, mockConfig.orderQuantity);
     assert.equal(result.unwoundLeg, unwoundSymbol);
     assert.equal(notifiedUnwound, unwoundSymbol);
+  });
+
+  it('pre-flight blocks ordering when a contract is not listed on the exchange', async () => {
+    // Regression guard for 2026-10-03: CoinDCX rejected both legs with a blank
+    // symbol error (" does not exist."). The pre-flight must catch that BEFORE
+    // any order is sent — a doomed order wastes the once-daily entry window.
+    let anyOrderSent = false;
+
+    const mockClient = {
+      getBtcSpotPrice: async () => 84822,
+      // CALL resolves, PUT does not => both must be listed for a straddle
+      getContractPrice: async (symbol: string) => (symbol.includes('-C-') ? 420 : 0),
+      placeOrder: async () => {
+        anyOrderSent = true;
+        return { symbol: 'x', side: 'sell', success: true, rawResponse: {} };
+      },
+      placeOptionsOrder: async () => {
+        anyOrderSent = true;
+        return { symbol: 'x', side: 'sell', success: true, rawResponse: {} };
+      },
+      closePosition: async () => {
+        anyOrderSent = true;
+        return { symbol: 'x', side: 'buy', success: true, rawResponse: {} };
+      },
+    } as unknown as CoinDCXClient;
+
+    let abortedReason = '';
+    const mockNotifier: Notifier = {
+      isEnabled: true,
+      notifyStraddleEntered: async () => {},
+      notifyLegClosed: async () => {},
+      notifyScenarioResolved: async () => {},
+      notifyEntryAborted: async (p) => {
+        abortedReason = p.reason;
+      },
+      notifyError: async () => {},
+      notifyReconciliation: async () => {},
+    };
+
+    const result = await executeShortStraddle(mockClient, mockConfig, mockNotifier);
+
+    assert.equal(result.success, false, 'pre-flight failure must report success=false');
+    assert.equal(result.partialFailure, false, 'nothing was filled, so not a partial failure');
+    assert.equal(anyOrderSent, false, 'NO order (or close) may be sent when pre-flight fails');
+    assert.match(abortedReason, /Pre-flight failed/);
+    assert.match(abortedReason, /NOT FOUND/);
+  });
+
+  it('pre-flight allows ordering when both contracts are listed', async () => {
+    let ordersSent = 0;
+
+    // Pre-flight + entry-price resolution each read the mark (4 calls at 350),
+    // then the monitor sees a much cheaper mark (10) which fires the profit
+    // target and terminates the monitor loop — otherwise the interval never
+    // clears and the test runner hangs. (Must stay > 0: the monitor ignores
+    // non-positive prices.)
+    let priceCalls = 0;
+
+    const mockClient = {
+      getBtcSpotPrice: async () => 84822,
+      getContractPrice: async () => {
+        priceCalls += 1;
+        return priceCalls <= 4 ? 350 : 10;
+      },
+      placeOptionsOrder: async (symbol: string) => {
+        ordersSent += 1;
+        return { symbol, side: 'sell', success: true, orderId: `id-${ordersSent}`, rawResponse: {} };
+      },
+      placeOrder: async (order: { pair: string }) => {
+        ordersSent += 1;
+        return { symbol: order.pair, side: 'sell', success: true, orderId: `id-${ordersSent}`, rawResponse: {} };
+      },
+      closePosition: async () => ({ symbol: 'x', side: 'buy', success: true, rawResponse: {} }),
+    } as unknown as CoinDCXClient;
+
+    const mockNotifier: Notifier = {
+      isEnabled: true,
+      notifyStraddleEntered: async () => {},
+      notifyLegClosed: async () => {},
+      notifyScenarioResolved: async () => {},
+      notifyEntryAborted: async () => {},
+      notifyError: async () => {},
+      notifyReconciliation: async () => {},
+    };
+
+    const result = await executeShortStraddle(mockClient, mockConfig, mockNotifier);
+
+    assert.equal(ordersSent, 2, 'both legs should be sent once pre-flight passes');
+    assert.equal(result.success, true);
+    assert.equal(result.callOutcome.success, true);
+    assert.equal(result.putOutcome.success, true);
   });
 });

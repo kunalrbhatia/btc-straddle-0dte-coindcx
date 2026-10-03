@@ -97,6 +97,60 @@ export async function executeShortStraddle(
   console.log(`[Straddle] Order Quantity      : ${config.orderQuantity}`);
   console.log(`[Straddle] Leverage            : ${config.leverage}x`);
 
+  // Step 1b: PRE-FLIGHT instrument validation.
+  // CoinDCX rejects unknown symbols with a blank-symbol error (" does not exist."),
+  // which is undiagnosable and wastes the (once-daily) entry window. Verify both
+  // contracts are actually listed on the exchange BEFORE sending any order:
+  // a doomed order is useless, and a single filled leg is a naked short.
+  const [callMark, putMark] = await Promise.all([
+    client.getContractPrice(legs.callSymbol),
+    client.getContractPrice(legs.putSymbol),
+  ]);
+  const callListed = Number.isFinite(callMark) && callMark > 0;
+  const putListed = Number.isFinite(putMark) && putMark > 0;
+
+  if (!callListed || !putListed) {
+    const errorMsg =
+      `Pre-flight failed: contract not listed on CoinDCX — ` +
+      `CALL ${legs.callSymbol} [${callListed ? 'listed' : 'NOT FOUND'}], ` +
+      `PUT ${legs.putSymbol} [${putListed ? 'listed' : 'NOT FOUND'}]. ` +
+      `NO orders were sent. Verify the 0DTE expiry date and symbol format.`;
+    console.error(`[Straddle] 🚫 ${errorMsg}`);
+    if (notifier) {
+      void notifier.notifyEntryAborted({
+        reason: errorMsg,
+        callSuccess: false,
+        putSuccess: false,
+      });
+    }
+    return {
+      executedAt: new Date(),
+      success: false,
+      partialFailure: false,
+      atmStrike: legs.atmStrike,
+      spotPrice: legs.spotPrice,
+      callOutcome: {
+        symbol: legs.callSymbol,
+        side: 'sell',
+        success: false,
+        message: 'pre-flight: contract not listed',
+        rawResponse: {},
+      },
+      putOutcome: {
+        symbol: legs.putSymbol,
+        side: 'sell',
+        success: false,
+        message: 'pre-flight: contract not listed',
+        rawResponse: {},
+      },
+      message: errorMsg,
+    };
+  }
+
+  console.log(
+    `[Straddle] Pre-flight OK       : CALL $${callMark.toFixed(2)} · PUT $${putMark.toFixed(2)}`
+  );
+
   // Step 2: Build Sell Order for Call Leg
   const callOrder: OrderItem = {
     side: 'sell',

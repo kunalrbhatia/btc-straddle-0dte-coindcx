@@ -1,0 +1,79 @@
+import fs from 'fs';
+import path from 'path';
+
+/**
+ * Local alert journal.
+ *
+ * Why this exists: the bot's own Telegram notifier needs TELEGRAM_BOT_TOKEN in
+ * .env, which is not configured, so failures were only visible in pm2 logs.
+ * Every alert is therefore ALSO appended to a local JSONL journal that the
+ * Hermes watch banner (`~/.hermes/scripts/btc-banner.py`) reads and forwards to
+ * Telegram. No credentials required, and no polling conflict with other bots.
+ *
+ * File: logs/alerts-<YYYY-MM-DD>.jsonl  (one JSON object per line)
+ */
+
+// Overridable so test runs can never write into the live logs/ journal
+// (the Hermes watch banner reads that directory and would forward test noise).
+const LOGS_DIR = process.env.BTC_ALERTS_DIR
+  ? path.resolve(process.env.BTC_ALERTS_DIR)
+  : path.resolve(process.cwd(), 'logs');
+const IST_OFFSET_MINUTES = 330;
+
+export interface AlertRecord {
+  readonly ts: string;
+  readonly kind: string;
+  readonly message: string;
+  readonly meta?: Record<string, unknown>;
+}
+
+/** IST calendar date (YYYY-MM-DD) — the bot schedules everything in IST. */
+export function getIstDateString(now = new Date()): string {
+  const ist = new Date(now.getTime() + IST_OFFSET_MINUTES * 60 * 1000);
+  const y = ist.getUTCFullYear();
+  const m = String(ist.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(ist.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/** Human-readable IST timestamp for the journal line. */
+function getIstTimestamp(now = new Date()): string {
+  const ist = new Date(now.getTime() + IST_OFFSET_MINUTES * 60 * 1000);
+  const datePart = getIstDateString(now);
+  const timePart = [
+    ist.getUTCHours(),
+    ist.getUTCMinutes(),
+    ist.getUTCSeconds(),
+  ]
+    .map((v) => String(v).padStart(2, '0'))
+    .join(':');
+  return `${datePart} ${timePart} IST`;
+}
+
+export function alertFilePath(dateStr = getIstDateString()): string {
+  return path.join(LOGS_DIR, `alerts-${dateStr}.jsonl`);
+}
+
+/**
+ * Appends one alert to the journal. Never throws: an alerting failure must
+ * never break trading.
+ */
+export function appendAlert(
+  kind: string,
+  message: string,
+  meta?: Record<string, unknown>
+): void {
+  try {
+    fs.mkdirSync(LOGS_DIR, { recursive: true });
+    const record: AlertRecord = {
+      ts: getIstTimestamp(),
+      kind,
+      message,
+      ...(meta ? { meta } : {}),
+    };
+    fs.appendFileSync(alertFilePath(), `${JSON.stringify(record)}\n`, 'utf8');
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error(`[AlertJournal] Failed to write alert (${kind}): ${msg}`);
+  }
+}

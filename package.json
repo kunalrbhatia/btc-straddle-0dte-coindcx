@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "ts-node src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --require ts-node/register --test src/**/*.test.ts",
+    "test": "BTC_ALERTS_DIR=/tmp/btc-test-alerts BTC_STATE_DIR=/tmp/btc-test-state BTC_LOGS_DIR=/tmp/btc-test-logs node --require ts-node/register --test src/**/*.test.ts",
     "test:auth": "ts-node src/testAuth.ts"
   },
   "keywords": [
