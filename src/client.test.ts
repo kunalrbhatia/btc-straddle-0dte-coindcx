@@ -121,4 +121,53 @@ describe('CoinDCXClient Options Unit Tests', () => {
     assert.equal(networkCalled, false, 'DRY_RUN must not send network cancel requests');
     assert.equal(cancelResult, true);
   });
+
+  it('getContractPrice NEVER fabricates a price when no real one is available', async () => {
+    // Regression guard: a previous revision returned a hard-coded 500 for a
+    // "listed" contract. That invented number could become an entry price (wrong
+    // SL/PT) or a monitor reading (a FALSE stop-loss that closes a healthy leg).
+    global.fetch = async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes('/api/v1/options/positions')) {
+        return new Response(JSON.stringify({ status: 'success', data: [] }), { status: 200 });
+      }
+      if (u.includes('/api/v1/options/margin')) {
+        // Preview succeeds (contract IS listed) but carries no mark price.
+        return new Response(
+          JSON.stringify({ status: 'success', data: { margin: 450, currency: 'INR' } }),
+          { status: 200 }
+        );
+      }
+      if (u.includes('/exchange/ticker')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const client = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+    const price = await client.getContractPrice('BTC-4OCT26-84750-C-USDT');
+
+    assert.equal(price, 0, 'must return 0 rather than inventing a price');
+  });
+
+  it('isContractListed reports listing via the margin preview, independent of price', async () => {
+    global.fetch = async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes('/api/v1/options/margin')) {
+        return new Response(JSON.stringify({ status: 'success', data: { margin: 450 } }), {
+          status: 200,
+        });
+      }
+      return new Response(JSON.stringify({ status: 'error', message: 'not found' }), { status: 404 });
+    };
+    const listed = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+    assert.equal(await listed.isContractListed('BTC-4OCT26-84750-C-USDT'), true);
+
+    global.fetch = async () =>
+      new Response(JSON.stringify({ status: 'error', error: { code: 422, message: 'Invalid' } }), {
+        status: 200,
+      });
+    const notListed = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+    assert.equal(await notListed.isContractListed('BTC-9DEC26-99999-C-USDT'), false);
+  });
 });

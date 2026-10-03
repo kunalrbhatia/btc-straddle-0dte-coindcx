@@ -241,7 +241,10 @@ export class CoinDCXClient {
       // If error fetching positions (e.g. no position exists yet during pre-flight), continue to preview
     }
 
-    // 2. Try margin preview endpoint for contract existence & valuation
+    // 2. Try the margin preview endpoint — it can carry a real mark price.
+    //    NEVER fabricate a price here. An invented number becomes an entry price
+    //    (=> wrong SL/PT levels) or a monitor reading (=> a FALSE stop-loss that
+    //    closes a healthy leg). Return 0 and let callers decide.
     try {
       const marginRes = await this.getOptionsMargin({
         symbol,
@@ -250,15 +253,9 @@ export class CoinDCXClient {
         orderType: 'Limit',
         price: '500',
       });
-      // If the margin endpoint returned success / valid margin data, contract is listed
-      if (marginRes.status === 'success' || (marginRes.data && !marginRes.error)) {
-        // Return 500 or mark if provided
-        const mark = Number(marginRes.data?.markPrice ?? marginRes.data?.price);
-        if (Number.isFinite(mark) && mark > 0) {
-          return mark;
-        }
-        // Valid listed contract indicated by successful margin preview
-        return 500;
+      const mark = Number(marginRes.data?.markPrice ?? marginRes.data?.price);
+      if (Number.isFinite(mark) && mark > 0) {
+        return mark;
       }
     } catch (err) {
       if (err instanceof SessionTokenExpiredError) {
@@ -279,6 +276,32 @@ export class CoinDCXClient {
     }
 
     return 0;
+  }
+
+  /**
+   * Contract-existence check via the margin preview endpoint.
+   *
+   * This deliberately does NOT use a price: existence and valuation are different
+   * questions. The preview returning a successful margin calculation proves the
+   * symbol is listed, which is exactly what the entry pre-flight needs.
+   */
+  public async isContractListed(symbol: string, qty = '0.01'): Promise<boolean> {
+    try {
+      const res = await this.getOptionsMargin({
+        symbol,
+        qty,
+        side: 'sell',
+        orderType: 'Limit',
+        price: '500',
+      });
+      if (res.status === 'success') return true;
+      return Boolean(res.data) && !res.error;
+    } catch (err) {
+      if (err instanceof SessionTokenExpiredError) {
+        throw err;
+      }
+      return false;
+    }
   }
 
   /**

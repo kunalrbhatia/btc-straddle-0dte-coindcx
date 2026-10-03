@@ -134,12 +134,14 @@ export async function executeShortStraddle(
   // which is undiagnosable and wastes the (once-daily) entry window. Verify both
   // contracts are actually listed on the exchange BEFORE sending any order:
   // a doomed order is useless, and a single filled leg is a naked short.
-  const [callMark, putMark] = await Promise.all([
-    client.getContractPrice(legs.callSymbol),
-    client.getContractPrice(legs.putSymbol),
+  //
+  // Existence is checked via the margin preview (isContractListed), NOT via a price:
+  // a contract can be listed while its mark is unavailable, and inferring existence
+  // from a price is what previously led to a fabricated number.
+  const [callListed, putListed] = await Promise.all([
+    client.isContractListed(legs.callSymbol, String(config.orderQuantity)),
+    client.isContractListed(legs.putSymbol, String(config.orderQuantity)),
   ]);
-  const callListed = Number.isFinite(callMark) && callMark > 0;
-  const putListed = Number.isFinite(putMark) && putMark > 0;
 
   if (!callListed || !putListed) {
     const errorMsg =
@@ -180,7 +182,7 @@ export async function executeShortStraddle(
   }
 
   console.log(
-    `[Straddle] Pre-flight OK       : CALL $${callMark.toFixed(2)} · PUT $${putMark.toFixed(2)}`
+    `[Straddle] Pre-flight OK       : both contracts listed (CALL ${legs.callSymbol}, PUT ${legs.putSymbol})`
   );
 
   // Step 2: Build Sell Order for Call Leg
@@ -373,18 +375,53 @@ export async function executeShortStraddle(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[Straddle] ❌ Error initializing straddle state: ${msg}`);
+
+    // CRITICAL: both legs were SOLD successfully, so we are short and — because
+    // state init failed — completely unmonitored. Leaving them open would be a
+    // naked, unwatched straddle. Unwind both legs immediately.
+    console.error('[Straddle] 🚨 Unwinding both filled legs (state init failed after entry)');
+    const unwound: string[] = [];
+    const unwindFailed: string[] = [];
+    for (const symbol of [legs.callSymbol, legs.putSymbol]) {
+      try {
+        const unwind = await client.closePosition(symbol, config.orderQuantity, config.leverage);
+        if (unwind.success) {
+          unwound.push(symbol);
+          console.log(`[Straddle] ✅ Unwound ${symbol}`);
+        } else {
+          unwindFailed.push(symbol);
+          console.error(`[Straddle] ❌ Unwind failed for ${symbol}: ${unwind.message ?? 'unknown'}`);
+        }
+      } catch (unwindErr) {
+        const uMsg = unwindErr instanceof Error ? unwindErr.message : String(unwindErr);
+        unwindFailed.push(symbol);
+        console.error(`[Straddle] ❌ Unwind threw for ${symbol}: ${uMsg}`);
+      }
+    }
+
     if (notifier) {
       void notifier.notifyError('initializeStraddleState', err);
+      void notifier.notifyEntryAborted({
+        reason:
+          `State initialization failed AFTER both legs filled: ${msg}. ` +
+          `Unwound: ${unwound.join(', ') || 'none'}. ` +
+          `${unwindFailed.length ? `⚠️ STILL OPEN — MANUAL ACTION NEEDED: ${unwindFailed.join(', ')}` : ''}`,
+        callSuccess: true,
+        putSuccess: true,
+      });
     }
+
     return {
       executedAt: new Date(),
       success: false,
-      partialFailure: false,
+      partialFailure: true,
       atmStrike: legs.atmStrike,
       spotPrice: legs.spotPrice,
       callOutcome,
       putOutcome,
-      message: `State initialization failed: ${msg}`,
+      message:
+        `State initialization failed: ${msg}. Unwound ${unwound.length}/2 legs` +
+        `${unwindFailed.length ? ` — STILL OPEN: ${unwindFailed.join(', ')}` : ''}`,
     };
   }
 }

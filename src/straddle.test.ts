@@ -63,7 +63,7 @@ describe('Straddle Execution & Unwind Tests', () => {
 
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
-      getContractPrice: async () => 500,
+      isContractListed: async () => true,
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           callOrderPlaced = true;
@@ -103,7 +103,7 @@ describe('Straddle Execution & Unwind Tests', () => {
 
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
-      getContractPrice: async () => 500,
+      isContractListed: async () => true,
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           return {
@@ -158,7 +158,7 @@ describe('Straddle Execution & Unwind Tests', () => {
 
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
-      getContractPrice: async () => 500,
+      isContractListed: async () => true,
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           return {
@@ -215,8 +215,8 @@ describe('Straddle Execution & Unwind Tests', () => {
 
     const mockClient = {
       getBtcSpotPrice: async () => 84822,
-      // CALL resolves, PUT does not => both must be listed for a straddle
-      getContractPrice: async (symbol: string) => (symbol.includes('-C-') ? 420 : 0),
+      // CALL is listed, PUT is not => both must be listed for a straddle
+      isContractListed: async (symbol: string) => symbol.includes('-C-'),
       placeOrder: async () => {
         anyOrderSent = true;
         return { symbol: 'x', side: 'sell', success: true, rawResponse: {} };
@@ -269,6 +269,7 @@ describe('Straddle Execution & Unwind Tests', () => {
         priceCalls += 1;
         return priceCalls <= 4 ? 350 : 10;
       },
+      isContractListed: async () => true,
       placeOptionsOrder: async (symbol: string) => {
         ordersSent += 1;
         return { symbol, side: 'sell', success: true, orderId: `id-${ordersSent}`, rawResponse: {} };
@@ -296,5 +297,52 @@ describe('Straddle Execution & Unwind Tests', () => {
     assert.equal(result.success, true);
     assert.equal(result.callOutcome.success, true);
     assert.equal(result.putOutcome.success, true);
+  });
+
+  it('unwinds BOTH legs when state init fails AFTER both legs filled (naked-short guard)', async () => {
+    // Regression guard: previously this path logged the error and returned, leaving
+    // a filled, unmonitored short straddle open with no state file.
+    const closed: string[] = [];
+    const mockClient = {
+      getBtcSpotPrice: async () => 84822,
+      isContractListed: async () => true,
+      // No price available anywhere => entry price is unresolvable => state init throws.
+      getContractPrice: async () => 0,
+      placeOptionsOrder: async (symbol: string) => ({
+        symbol,
+        side: 'sell',
+        success: true,
+        orderId: 'o1',
+        rawResponse: {},
+      }),
+      placeOrder: async (order: { pair: string }) => ({
+        symbol: order.pair,
+        side: 'sell',
+        success: true,
+        orderId: 'o1',
+        rawResponse: {},
+      }),
+      closePosition: async (symbol: string) => {
+        closed.push(symbol);
+        return { symbol, side: 'buy', success: true, rawResponse: {} };
+      },
+    } as unknown as CoinDCXClient;
+
+    const mockNotifier: Notifier = {
+      isEnabled: true,
+      notifyStraddleEntered: async () => {},
+      notifyLegClosed: async () => {},
+      notifyScenarioResolved: async () => {},
+      notifyEntryAborted: async () => {},
+      notifyError: async () => {},
+      notifyReconciliation: async () => {},
+    };
+
+    const result = await executeShortStraddle(mockClient, mockConfig, mockNotifier);
+
+    assert.equal(result.success, false);
+    assert.equal(result.partialFailure, true, 'entry failed after fills => partial failure');
+    assert.equal(closed.length, 2, 'both filled legs must be unwound, not left naked');
+    assert.match(result.message ?? '', /Unwound 2\/2 legs/);
   });
 });
