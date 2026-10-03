@@ -83,16 +83,32 @@ export async function runPlan(): Promise<void> {
       }
     }
 
-    // SL and PT calculation based on estimated/sample premium (e.g. 500 pts each or live mark)
-    let callEst = 350;
-    let putEst = 350;
+    // SL / PT levels require a REAL premium. Never invent one: a fabricated mark
+    // produces confident-looking numbers (a fictional credit, and therefore
+    // fictional stop/target levels) that the user would reasonably act on.
+    let callEst = 0;
+    let putEst = 0;
     try {
       const c = await client.getContractPrice(legs.callSymbol);
       if (c > 0) callEst = c;
       const p = await client.getContractPrice(legs.putSymbol);
       if (p > 0) putEst = p;
     } catch {
-      // Keep illustrative defaults if token is expired or feed unavailable
+      // Feed unavailable (e.g. expired session token) — handled below.
+    }
+
+    if (callEst <= 0 || putEst <= 0) {
+      console.log('\n--- Projected Straddle Levels: UNAVAILABLE ---');
+      console.log(
+        '• No live premium could be read for both legs, so stop-loss and profit-target'
+      );
+      console.log(
+        '  levels cannot be projected. Fix the session token (refresh it from the'
+      );
+      console.log('  browser) and re-run — do not trade on invented levels.');
+      console.log('------------------------------------------------------------------------\n');
+      console.log('✅ [Plan] Plan execution complete. NO ORDERS were placed.');
+      return;
     }
 
     const totalEstCredit = callEst + putEst;
