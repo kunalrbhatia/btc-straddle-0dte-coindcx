@@ -101,44 +101,59 @@ export interface OrderPlacementOutcome {
 
 export interface StraddleExecutionResult {
   readonly executedAt: Date;
+  readonly success: boolean;
+  readonly partialFailure: boolean;
   readonly atmStrike: number;
   readonly spotPrice: number;
   readonly callOutcome: OrderPlacementOutcome;
   readonly putOutcome: OrderPlacementOutcome;
+  readonly message?: string;
+  readonly unwoundLeg?: string;
 }
 
 export type LegStatus = 'open' | 'closed';
 
-export type LegCloseReason = 'SL_HIT' | 'PROFIT_TARGET_HIT' | 'MANUAL';
+export type LegCloseReason = 'SL_HIT' | 'PROFIT_TARGET_HIT' | 'MANUAL' | 'UNWOUND_PARTIAL' | 'EXPIRED';
 
 export type TradeScenario =
   | 'PROFIT_TARGET_REACHED'
   | 'ONE_LEG_SL_OTHER_COVERED'
-  | 'BOTH_LEGS_SL';
+  | 'BOTH_LEGS_SL'
+  | 'MAX_TIME_REACHED';
+
+export type EntryPriceSource = 'fill' | 'mark';
 
 export interface ActiveLeg {
   readonly legType: 'CALL' | 'PUT';
   readonly symbol: string;
   readonly entryPrice: number;
+  readonly entryPriceSource: EntryPriceSource;
   readonly stopLossPrice: number;
   readonly quantity: number;
+  readonly orderId?: string;
+  readonly confirmedOpen: boolean;
   status: LegStatus;
   currentPrice: number;
   exitPrice?: number;
   closeReason?: LegCloseReason;
+  exitOrderId?: string;
 }
 
 export interface RiskManagementConfig {
   readonly stopLossMultiplier: number; // 2.0 = 100% SL (sold at 100 -> SL at 200)
   readonly profitTargetRatio: number; // 0.55 = 55% of combined credit
   readonly pollIntervalMs: number;
+  readonly maxMonitorMinutes?: number; // End-of-life cutoff for monitor
 }
 
 export interface StraddlePositionState {
+  readonly date: string;
+  readonly entryExecuted: boolean;
   readonly callLeg: ActiveLeg;
   readonly putLeg: ActiveLeg;
   readonly totalCreditReceived: number;
   readonly targetProfitPoints: number;
   combinedPnLPoints: number;
   resolvedScenario?: TradeScenario;
+  updatedAt?: string;
 }

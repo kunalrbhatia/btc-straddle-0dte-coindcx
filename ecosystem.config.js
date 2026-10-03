@@ -7,7 +7,7 @@ module.exports = {
       exec_mode: 'fork',
       node_args: '--max-old-space-size=512',
       autorestart: true,
-      cron_restart: '0 12 * * *', // Daily fresh restart at 12:00 UTC (5:30 PM IST), 45m before 6:15 PM IST execution
+      cron_restart: '30 17 * * *', // fresh process 45 min before the 18:15 IST entry (PM2 cron uses LOCAL time = IST)
       stop_exit_codes: [0],
       exp_backoff_restart_delay: 100,
       watch: false,
