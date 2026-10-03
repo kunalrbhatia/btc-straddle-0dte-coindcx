@@ -432,24 +432,101 @@ export class CoinDCXClient {
     }
   }
 
+  private hasLoggedOpenOrdersSample = false;
+
+  /**
+   * Fetches open options orders via /api/v1/options/orders.
+   * Logs sample raw row once defensively to record actual field names in logs.
+   */
+  public async getOpenOptionsOrders(): Promise<readonly Record<string, unknown>[]> {
+    if (this.dryRun) {
+      return [];
+    }
+
+    const token = this.getBearerToken();
+    if (!token) {
+      const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+      appendAlert('auth_error', msg);
+      throw new SessionTokenExpiredError(msg);
+    }
+
+    const endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.orders}`;
+    try {
+      const response = await fetch(endpoint, {
+        method: 'GET',
+        headers: this.getOptionsHeaders(token),
+      });
+
+      if (response.status === 401) {
+        const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+        console.error(`[CoinDCXClient] 401 Unauthorized fetching options orders: ${msg}`);
+        appendAlert('auth_error', msg);
+        throw new SessionTokenExpiredError(msg);
+      }
+
+      if (!response.ok) {
+        return [];
+      }
+
+      const json = (await response.json()) as unknown;
+      let rows: Record<string, unknown>[] = [];
+      if (Array.isArray(json)) {
+        rows = json as Record<string, unknown>[];
+      } else if (typeof json === 'object' && json !== null) {
+        const rec = json as Record<string, unknown>;
+        if (Array.isArray(rec.data)) {
+          rows = rec.data as Record<string, unknown>[];
+        } else if (Array.isArray(rec.orders)) {
+          rows = rec.orders as Record<string, unknown>[];
+        }
+      }
+
+      if (!this.hasLoggedOpenOrdersSample && rows.length > 0) {
+        this.hasLoggedOpenOrdersSample = true;
+        console.log(`[CoinDCXClient] Sample options orders response row:`, JSON.stringify(rows[0]));
+      }
+
+      return rows;
+    } catch (err) {
+      if (err instanceof SessionTokenExpiredError) {
+        throw err;
+      }
+      return [];
+    }
+  }
+
   /**
    * Places an order via the native CoinDCX Options API (/api/v2/options/order/create).
+   * Matches the CoinDCX web app create payload byte-for-byte:
+   * { symbol, side, orderType, qty, price, stopLoss, takeProfit }
+   * Note: conversionRate is omitted completely from the request body.
    */
   public async placeOptionsOrder(
     symbol: string,
     side: 'buy' | 'sell',
     qty: number,
-    orderType: 'Limit' | 'Market' = 'Market',
-    price?: number,
-    conversionRate = '102'
+    orderType: 'Limit' | 'Market' = 'Limit',
+    price?: number | string,
+    stopLoss = '',
+    takeProfit = ''
   ): Promise<OrderPlacementOutcome> {
+    const numPrice =
+      typeof price === 'number'
+        ? price
+        : price !== undefined && Number.isFinite(Number(price))
+        ? Number(price)
+        : undefined;
+
     if (this.dryRun) {
-      console.log(`[CoinDCXClient] [DRY RUN] Simulating placeOptionsOrder: ${side} ${qty} ${symbol} @ ${price ?? 'Market'}`);
+      console.log(
+        `[CoinDCXClient] [DRY RUN] Simulating placeOptionsOrder: ${side} ${qty} ${symbol} @ ${price ?? 'Market'} | stopLoss: ${stopLoss || 'none'}`
+      );
       return {
         symbol,
         side,
         success: true,
         orderId: `sim-options-${Date.now()}`,
+        limitPrice: numPrice,
         rawResponse: { dryRun: true },
       };
     }
@@ -462,15 +539,25 @@ export class CoinDCXClient {
     }
 
     const endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.orderCreate}`;
-    const body = {
+
+    const priceStr =
+      price !== undefined && price !== null
+        ? typeof price === 'string'
+          ? price
+          : price.toFixed(2)
+        : orderType === 'Limit'
+        ? '0.00'
+        : '0';
+
+    // The app sends exactly: symbol, side, orderType, qty, price, stopLoss, takeProfit
+    const body: Record<string, string> = {
       symbol,
       side,
       orderType,
       qty: String(qty),
-      takeProfit: '',
-      stopLoss: '',
-      conversionRate,
-      price: price ? String(price) : '0',
+      price: priceStr,
+      stopLoss: stopLoss || '',
+      takeProfit: takeProfit || '',
     };
 
     try {
@@ -487,16 +574,63 @@ export class CoinDCXClient {
         throw new SessionTokenExpiredError(msg);
       }
 
-      const data = (await response.json()) as Record<string, unknown>;
+      const rawText = await response.text();
+      let data: Record<string, unknown> = {};
+      try {
+        data = JSON.parse(rawText) as Record<string, unknown>;
+      } catch {
+        data = { rawText };
+      }
 
-      if (response.ok && data.status === 'success') {
-        const orderData = data.data as Record<string, unknown> | undefined;
-        const orderId = typeof orderData?.orderId === 'string' ? orderData.orderId : undefined;
+      // Log raw response body (never token)
+      console.log(`[CoinDCXClient] v2 order create raw response (${symbol}): ${rawText}`);
+
+      // Extract order ID defensively from common candidate fields
+      const orderData = data.data as Record<string, unknown> | undefined;
+      let orderId: string | undefined;
+      let matchedField: string | undefined;
+
+      const candidates: readonly [string, unknown][] = [
+        ['data.order_id', orderData?.order_id],
+        ['data.orderId', orderData?.orderId],
+        ['data.id', orderData?.id],
+        ['data.client_order_id', orderData?.client_order_id],
+        ['order_id', data.order_id],
+        ['orderId', data.orderId],
+        ['id', data.id],
+        ['client_order_id', data.client_order_id],
+      ];
+
+      for (const [key, val] of candidates) {
+        if (typeof val === 'string' && val.length > 0) {
+          orderId = val;
+          matchedField = key;
+          break;
+        }
+        if (typeof val === 'number') {
+          orderId = String(val);
+          matchedField = key;
+          break;
+        }
+      }
+
+      if (orderId && matchedField) {
+        console.log(`[CoinDCXClient] Extracted order ID (${orderId}) from response field '${matchedField}'`);
+      }
+
+      const isSuccess =
+        response.ok &&
+        (data.status === 'success' ||
+          data.success === true ||
+          (Boolean(orderId) && !data.error && response.status < 400));
+
+      if (isSuccess) {
         return {
           symbol,
           side,
           success: true,
           orderId,
+          limitPrice: numPrice,
           rawResponse: data,
         };
       }
@@ -513,6 +647,8 @@ export class CoinDCXClient {
         symbol,
         side,
         success: false,
+        orderId,
+        limitPrice: numPrice,
         message: errorMsg,
         rawResponse: data,
       };
@@ -525,6 +661,7 @@ export class CoinDCXClient {
         symbol,
         side,
         success: false,
+        limitPrice: numPrice,
         message: msg,
         rawResponse: {},
       };

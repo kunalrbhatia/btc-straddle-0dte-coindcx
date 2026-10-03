@@ -18,10 +18,17 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
    - Session tokens are valid for **~36 hours**.
    - The token can be refreshed automatically via `npm run refresh-session` or set statically via `COINDCX_SESSION_TOKEN` in `.env` or `session.token`. The bot dynamically re-reads `session.token` on every request so a refreshed token takes effect immediately without restarting the bot.
    - On HTTP 401, the bot logs an error, journals an alert, and refuses to enter retry storms.
-4. **Options Price Feed & Mark Resolution**:
+4. **Options Price Feed & Marketable Limit Orders**:
    - Live mark prices, LTP, bid/ask are queried directly from CoinDCX's public options ticker (`https://public.coindcx.com/api/v1/options/ticker?baseCurrency=BTC&expiryTime=...`) and open positions (`GET /api/v1/options/positions`).
-   - If the price feed is unavailable, the bot will never fabricate arbitrary prices; it alerts and halts.
-5. **Margin Currency & Precision**:
+   - **Marketable Limit Entries**: The bot prices SELL entries from the public ticker's live `bidPrice` and places `Limit` orders (matching the CoinDCX web application). Selling directly into the bid ensures immediate marketable execution while eliminating undefined fill prices.
+   - **Quote Validation & Fail-Safe Abort**: If `bidPrice` is missing, zero, or non-numeric for either leg, the bot refuses to fabricate prices: entry aborts immediately with zero orders sent and an alert is raised.
+   - **Fill Confirmation & Unwind**: The bot polls `GET /api/v1/options/orders` (timeout configured via `ENTRY_FILL_TIMEOUT_MS`, default 15s). If neither leg fills, both are cancelled. If only one leg fills (partial fill timeout), the unfilled leg is cancelled and the filled leg is unwound immediately to avoid naked risk.
+   - **Escape Hatch**: `ENTRY_ORDER_TYPE=Market` can be configured if needed, which skips price quotes but logs loudly that exchange-side stops are disabled.
+5. **Exchange-Side Stop Loss & Bot-Side Profit Target**:
+   - **Exchange-Side Stop Loss**: Along with the Limit order, the bot sends `stopLoss = limitPrice * SL_MULTIPLIER` (2 decimals, e.g. `416.00 -> 832.00`) directly in the order creation payload (`POST /api/v2/options/order/create`). This provides primary exchange-level stop protection even if the bot process or network drops.
+   - **Bot-Side Profit Target**: The combined +55% profit target is a portfolio-level condition across both legs that exchange single-leg orders cannot express. Thus, `takeProfit: ''` is sent on order creation, and the bot's risk monitor manages the profit target and serves as secondary stop protection.
+   - **Payload Match**: Order create payload matches the CoinDCX web application byte-for-byte (`{ symbol, side, orderType, qty, price, stopLoss, takeProfit }`), omitting `conversionRate`.
+6. **Margin Currency & Precision**:
    - Options are quoted on a **250 strike step grid** (e.g. 84750, 85000).
    - Position sizing: 0.01 BTC per leg at 10x leverage.
    - Note on balance: verify whether margin is held in USDT or INR before enabling live ordering.
@@ -109,6 +116,8 @@ CONVERSION_RATE=102
 STRIKE_STEP=250
 EXECUTION_HOUR_IST=18
 EXECUTION_MINUTE_IST=15
+ENTRY_ORDER_TYPE=Limit
+ENTRY_FILL_TIMEOUT_MS=15000
 
 # Risk Management
 SL_MULTIPLIER=2.0

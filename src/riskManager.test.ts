@@ -25,6 +25,8 @@ const mockConfig: AppConfig = {
   marginCurrency: 'USDT',
   dryRun: false,
   conversionRate: '102',
+  entryOrderType: 'Limit',
+  entryFillTimeoutMs: 15000,
   riskConfig: {
     stopLossMultiplier: 2.0,
     profitTargetRatio: 0.55,
@@ -101,7 +103,26 @@ describe('Risk Manager Unit Tests', () => {
       assert.equal(result?.source, 'mark');
     });
 
-    it('returns null and NEVER falls back to 100 when neither raw nor mark price is available', async () => {
+    it('falls back to outcome.limitPrice when rawResponse lacks execution price', async () => {
+      const outcome: OrderPlacementOutcome = {
+        symbol: 'BTC-3OCT26-85000-C-USDT',
+        side: 'sell',
+        success: true,
+        orderId: 'ord-limit-1',
+        limitPrice: 416.0,
+        rawResponse: {},
+      };
+      const mockClient = {
+        getContractPrice: async () => 390.0, // should not be used because limitPrice takes priority
+      } as unknown as CoinDCXClient;
+
+      const result = await resolveEntryPrice(outcome, mockClient, outcome.symbol);
+      assert.notEqual(result, null);
+      assert.equal(result?.price, 416.0);
+      assert.equal(result?.source, 'fill');
+    });
+
+    it('returns null and NEVER falls back to 100 when neither raw, limit, nor mark price is available', async () => {
       const outcome: OrderPlacementOutcome = {
         symbol: 'BTC-3OCT26-85000-C-USDT',
         side: 'sell',

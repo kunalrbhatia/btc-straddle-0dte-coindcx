@@ -56,7 +56,6 @@ export interface OptionsOrderRequest {
   readonly price?: string;
   readonly takeProfit?: string;
   readonly stopLoss?: string;
-  readonly conversionRate?: string;
 }
 
 export interface OptionsPosition {
@@ -134,6 +133,7 @@ export interface OrderPlacementOutcome {
   readonly side: OrderSide;
   readonly success: boolean;
   readonly orderId?: string;
+  readonly limitPrice?: number;
   readonly message?: string;
   readonly rawResponse: Record<string, unknown>;
 }

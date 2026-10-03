@@ -170,4 +170,103 @@ describe('CoinDCXClient Options Unit Tests', () => {
     const notListed = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
     assert.equal(await notListed.isContractListed('BTC-9DEC26-99999-C-USDT'), false);
   });
+
+  describe('placeOptionsOrder & payload verification', () => {
+    it('creates Limit order payload matching app schema exactly without conversionRate', async () => {
+      let interceptedUrl = '';
+      let interceptedBody: Record<string, unknown> = {};
+
+      global.fetch = async (url: string | URL | Request, init?: RequestInit) => {
+        interceptedUrl = String(url);
+        if (init?.body && typeof init.body === 'string') {
+          interceptedBody = JSON.parse(init.body) as Record<string, unknown>;
+        }
+        return new Response(
+          JSON.stringify({ status: 'success', data: { id: 'ord-v2-100', status: 'filled' } }),
+          { status: 200 }
+        );
+      };
+
+      const client = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+      const outcome = await client.placeOptionsOrder(
+        'BTC-4OCT26-85000-C-USDT',
+        'sell',
+        0.01,
+        'Limit',
+        416.0,
+        '832.00',
+        ''
+      );
+
+      assert.equal(interceptedUrl, 'https://api.coindcx.com/api/v2/options/order/create');
+      assert.equal(interceptedBody.symbol, 'BTC-4OCT26-85000-C-USDT');
+      assert.equal(interceptedBody.side, 'sell');
+      assert.equal(interceptedBody.orderType, 'Limit');
+      assert.equal(interceptedBody.qty, '0.01');
+      assert.equal(interceptedBody.price, '416.00');
+      assert.equal(interceptedBody.stopLoss, '832.00');
+      assert.equal(interceptedBody.takeProfit, '');
+      assert.equal('conversionRate' in interceptedBody, false, 'conversionRate MUST NOT be present in body');
+
+      assert.equal(outcome.success, true);
+      assert.equal(outcome.orderId, 'ord-v2-100');
+      assert.equal(outcome.limitPrice, 416.0);
+    });
+
+    it('defensively extracts order ID from various nested response candidate shapes', async () => {
+      const client = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+
+      // Candidate 1: data.order_id
+      global.fetch = async () =>
+        new Response(JSON.stringify({ status: 'success', data: { order_id: 'cand-1' } }), {
+          status: 200,
+        });
+      const o1 = await client.placeOptionsOrder('BTC-4OCT26-85000-C-USDT', 'sell', 0.01, 'Limit', 400);
+      assert.equal(o1.orderId, 'cand-1');
+
+      // Candidate 2: data.orderId
+      global.fetch = async () =>
+        new Response(JSON.stringify({ status: 'success', data: { orderId: 'cand-2' } }), {
+          status: 200,
+        });
+      const o2 = await client.placeOptionsOrder('BTC-4OCT26-85000-C-USDT', 'sell', 0.01, 'Limit', 400);
+      assert.equal(o2.orderId, 'cand-2');
+
+      // Candidate 3: root id
+      global.fetch = async () =>
+        new Response(JSON.stringify({ status: 'success', id: 9988 }), { status: 200 });
+      const o3 = await client.placeOptionsOrder('BTC-4OCT26-85000-C-USDT', 'sell', 0.01, 'Limit', 400);
+      assert.equal(o3.orderId, '9988');
+    });
+
+    it('DRY_RUN=true returns simulated outcome without network calls', async () => {
+      let networkCalled = false;
+      global.fetch = async () => {
+        networkCalled = true;
+        return new Response('{}', { status: 200 });
+      };
+
+      const dryClient = new CoinDCXClient(
+        'key',
+        'secret',
+        'https://api.coindcx.com',
+        'token',
+        undefined,
+        true
+      );
+      const outcome = await dryClient.placeOptionsOrder(
+        'BTC-4OCT26-85000-C-USDT',
+        'sell',
+        0.01,
+        'Limit',
+        416.0,
+        '832.00'
+      );
+
+      assert.equal(networkCalled, false, 'DRY_RUN must not invoke network');
+      assert.equal(outcome.success, true);
+      assert.equal(outcome.limitPrice, 416.0);
+      assert.match(outcome.orderId ?? '', /^sim-options-/);
+    });
+  });
 });
