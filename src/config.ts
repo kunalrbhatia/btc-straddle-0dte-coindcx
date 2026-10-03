@@ -45,6 +45,7 @@ export const config: AppConfig = {
     stopLossMultiplier: getEnvNumber('SL_MULTIPLIER', 2.0), // 100% loss (entry * 2.0)
     profitTargetRatio: getEnvNumber('PROFIT_TARGET_RATIO', 0.55), // 55% of total credit
     pollIntervalMs: getEnvNumber('POLL_INTERVAL_MS', 2000), // Check positions every 2 seconds
+    maxMonitorMinutes: getEnvNumber('MAX_MONITOR_MINUTES', 720), // 12 hours cutoff by default
   },
   customCallSymbol: process.env.CUSTOM_CALL_SYMBOL || undefined,
   customPutSymbol: process.env.CUSTOM_PUT_SYMBOL || undefined,

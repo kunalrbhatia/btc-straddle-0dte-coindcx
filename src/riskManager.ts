@@ -1,59 +1,118 @@
 import { CoinDCXClient } from './client';
 import { AppConfig } from './config';
+import { Notifier } from './notifier';
+import { saveStraddleState } from './stateStore';
 import {
   ActiveLeg,
+  EntryPriceSource,
   LegCloseReason,
   OrderPlacementOutcome,
   StraddlePositionState,
   TradeScenario,
 } from './types';
 
+export class MissingFillPriceError extends Error {
+  constructor(symbol: string) {
+    super(`Unable to resolve a valid fill or contract mark price for symbol: ${symbol}. Refusing to invent entry price.`);
+    this.name = 'MissingFillPriceError';
+  }
+}
+
 /**
- * Parses execution fill price from the order outcome or falls back to latest contract price.
+ * Resolves the entry price for a filled leg.
+ * Never invents or fabricates a fallback price.
+ * 1. Checks order outcome rawResponse (avg_price, then price).
+ * 2. If unavailable, falls back to live contract price ONLY if > 0.
+ * 3. Returns null if no valid positive price is found.
  */
-function extractFillPrice(
+export async function resolveEntryPrice(
   outcome: OrderPlacementOutcome,
-  fallbackPrice = 100
-): number {
+  client: CoinDCXClient,
+  symbol: string
+): Promise<{ readonly price: number; readonly source: EntryPriceSource } | null> {
   const raw = outcome.rawResponse;
 
-  if (typeof raw.avg_price === 'number' && raw.avg_price > 0) {
-    return raw.avg_price;
+  if (typeof raw.avg_price === 'number' && Number.isFinite(raw.avg_price) && raw.avg_price > 0) {
+    return { price: raw.avg_price, source: 'fill' };
   }
-  if (typeof raw.price === 'number' && raw.price > 0) {
-    return raw.price;
+  if (typeof raw.price === 'number' && Number.isFinite(raw.price) && raw.price > 0) {
+    return { price: raw.price, source: 'fill' };
   }
   if (typeof raw.price === 'string') {
     const parsed = Number(raw.price);
-    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return { price: parsed, source: 'fill' };
+    }
   }
 
-  // If order placement was in dry-run or mock mode, use a realistic fallback baseline (e.g. 100 points)
-  return fallbackPrice;
+  // Fallback: poll live contract price via public/authenticated ticker
+  try {
+    const contractPrice = await client.getContractPrice(symbol);
+    if (Number.isFinite(contractPrice) && contractPrice > 0) {
+      return { price: contractPrice, source: 'mark' };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[Risk Manager] Failed to fetch contract mark price fallback for ${symbol}: ${msg}`);
+  }
+
+  return null;
 }
 
 /**
  * Initializes the live tracking state for a Short Straddle.
+ * Throws MissingFillPriceError if entry price cannot be resolved.
  */
-export function initializeStraddleState(
+export async function initializeStraddleState(
   callOutcome: OrderPlacementOutcome,
   putOutcome: OrderPlacementOutcome,
+  client: CoinDCXClient,
   config: AppConfig,
   callFillPrice?: number,
-  putFillPrice?: number
-): StraddlePositionState {
-  const callEntry = callFillPrice ?? extractFillPrice(callOutcome, 100);
-  const putEntry = putFillPrice ?? extractFillPrice(putOutcome, 100);
+  putFillPrice?: number,
+  dateStr = new Date().toISOString().slice(0, 10)
+): Promise<StraddlePositionState> {
+  let callEntry: number;
+  let callSource: EntryPriceSource = 'fill';
+  if (callFillPrice !== undefined && Number.isFinite(callFillPrice) && callFillPrice > 0) {
+    callEntry = callFillPrice;
+  } else {
+    const resolved = await resolveEntryPrice(callOutcome, client, callOutcome.symbol);
+    if (!resolved) {
+      throw new MissingFillPriceError(callOutcome.symbol);
+    }
+    callEntry = resolved.price;
+    callSource = resolved.source;
+  }
+
+  let putEntry: number;
+  let putSource: EntryPriceSource = 'fill';
+  if (putFillPrice !== undefined && Number.isFinite(putFillPrice) && putFillPrice > 0) {
+    putEntry = putFillPrice;
+  } else {
+    const resolved = await resolveEntryPrice(putOutcome, client, putOutcome.symbol);
+    if (!resolved) {
+      throw new MissingFillPriceError(putOutcome.symbol);
+    }
+    putEntry = resolved.price;
+    putSource = resolved.source;
+  }
 
   const callSL = callEntry * config.riskConfig.stopLossMultiplier;
   const putSL = putEntry * config.riskConfig.stopLossMultiplier;
+
+  console.log(`[Risk Manager] Call entry resolved: $${callEntry.toFixed(2)} (source: ${callSource})`);
+  console.log(`[Risk Manager] Put entry resolved: $${putEntry.toFixed(2)} (source: ${putSource})`);
 
   const callLeg: ActiveLeg = {
     legType: 'CALL',
     symbol: callOutcome.symbol,
     entryPrice: callEntry,
+    entryPriceSource: callSource,
     stopLossPrice: callSL,
     quantity: config.orderQuantity,
+    orderId: callOutcome.orderId,
+    confirmedOpen: true,
     status: 'open',
     currentPrice: callEntry,
   };
@@ -62,8 +121,11 @@ export function initializeStraddleState(
     legType: 'PUT',
     symbol: putOutcome.symbol,
     entryPrice: putEntry,
+    entryPriceSource: putSource,
     stopLossPrice: putSL,
     quantity: config.orderQuantity,
+    orderId: putOutcome.orderId,
+    confirmedOpen: true,
     status: 'open',
     currentPrice: putEntry,
   };
@@ -72,11 +134,14 @@ export function initializeStraddleState(
   const targetProfitPoints = totalCreditReceived * config.riskConfig.profitTargetRatio;
 
   return {
+    date: dateStr,
+    entryExecuted: true,
     callLeg,
     putLeg,
     totalCreditReceived,
     targetProfitPoints,
     combinedPnLPoints: 0,
+    updatedAt: new Date().toISOString(),
   };
 }
 
@@ -84,7 +149,7 @@ export function initializeStraddleState(
  * Calculates the current points PnL for a leg.
  * For sold options: Profit = Entry Price - Current Price (or Exit Price)
  */
-function calculateLegPnL(leg: ActiveLeg): number {
+export function calculateLegPnL(leg: ActiveLeg): number {
   if (leg.status === 'closed') {
     return leg.entryPrice - (leg.exitPrice ?? leg.stopLossPrice);
   }
@@ -93,14 +158,25 @@ function calculateLegPnL(leg: ActiveLeg): number {
 
 /**
  * Closes an individual active leg.
+ * Guarded against closing unconfirmed or already closed legs.
  */
-async function closeLeg(
+export async function closeLeg(
   client: CoinDCXClient,
   leg: ActiveLeg,
   currentPrice: number,
   reason: LegCloseReason,
-  config: AppConfig
+  config: AppConfig,
+  notifier?: Notifier
 ): Promise<void> {
+  if (!leg.confirmedOpen) {
+    console.warn(`[Risk Manager] ⚠️ Refusing to close leg ${leg.symbol} because confirmedOpen is false.`);
+    return;
+  }
+  if (leg.status === 'closed') {
+    console.warn(`[Risk Manager] ⚠️ Leg ${leg.symbol} is already closed.`);
+    return;
+  }
+
   leg.status = 'closed';
   leg.exitPrice = currentPrice;
   leg.closeReason = reason;
@@ -118,6 +194,7 @@ async function closeLeg(
   );
 
   if (result.success) {
+    leg.exitOrderId = result.orderId;
     console.log(
       `[Risk Manager] ✅ ${leg.legType} buy-to-close order placed. Order ID: ${result.orderId || 'N/A'}`
     );
@@ -126,31 +203,91 @@ async function closeLeg(
       `[Risk Manager] ⚠️ ${leg.legType} close order response: ${result.message || 'Check terminal'}`
     );
   }
+
+  if (notifier) {
+    const runningPnL = calculateLegPnL(leg);
+    void notifier.notifyLegClosed({
+      legType: leg.legType,
+      symbol: leg.symbol,
+      reason,
+      exitPrice: currentPrice,
+      runningPnL,
+    });
+  }
 }
 
 /**
- * Monitors the short straddle position until one of the 3 scenarios resolves:
+ * Monitors the short straddle position until one of the scenarios resolves:
  * 1. 55% Profit Target reached (both legs closed in profit)
  * 2. One leg hits 100% SL, other leg continues and covers target
  * 3. Both legs hit 100% SL
+ * 4. Max monitoring duration reached (end-of-life cutoff)
  */
 export async function monitorStraddleRisk(
   client: CoinDCXClient,
   state: StraddlePositionState,
-  config: AppConfig
+  config: AppConfig,
+  notifier?: Notifier
 ): Promise<TradeScenario> {
   console.log('\n==================================================');
   console.log('       STRADDLE RISK MONITORING ACTIVE            ');
   console.log('==================================================');
-  console.log(`[Config] Call Entry : $${state.callLeg.entryPrice.toFixed(2)} | SL: $${state.callLeg.stopLossPrice.toFixed(2)} (+100%)`);
-  console.log(`[Config] Put Entry  : $${state.putLeg.entryPrice.toFixed(2)} | SL: $${state.putLeg.stopLossPrice.toFixed(2)} (+100%)`);
+  console.log(`[Config] Call Entry : $${state.callLeg.entryPrice.toFixed(2)} (${state.callLeg.entryPriceSource}) | SL: $${state.callLeg.stopLossPrice.toFixed(2)} (+100%)`);
+  console.log(`[Config] Put Entry  : $${state.putLeg.entryPrice.toFixed(2)} (${state.putLeg.entryPriceSource}) | SL: $${state.putLeg.stopLossPrice.toFixed(2)} (+100%)`);
   console.log(`[Config] Total Credit: $${state.totalCreditReceived.toFixed(2)} points`);
   console.log(`[Config] Profit Target: +$${state.targetProfitPoints.toFixed(2)} points (55% of credit)`);
   console.log('==================================================\n');
 
+  const startTime = Date.now();
+  const maxMonitorMs = (config.riskConfig.maxMonitorMinutes ?? 720) * 60 * 1000;
+
   return new Promise<TradeScenario>((resolve) => {
-    const timer = setInterval(async () => {
+    let timer: NodeJS.Timeout | null = null;
+
+    const cleanupAndResolve = async (scenario: TradeScenario): Promise<void> => {
       try {
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+        state.resolvedScenario = scenario;
+        state.updatedAt = new Date().toISOString();
+        await saveStraddleState(state, state.date);
+
+        if (notifier) {
+          const summary =
+            `Scenario: ${scenario} | Final PnL: ${state.combinedPnLPoints.toFixed(2)} pts | ` +
+            `Call: $${state.callLeg.exitPrice?.toFixed(2) ?? state.callLeg.currentPrice.toFixed(2)} (${state.callLeg.status}) | ` +
+            `Put: $${state.putLeg.exitPrice?.toFixed(2) ?? state.putLeg.currentPrice.toFixed(2)} (${state.putLeg.status})`;
+          void notifier.notifyScenarioResolved({
+            scenario,
+            totalCredit: state.totalCreditReceived,
+            combinedPnL: state.combinedPnLPoints,
+            summary,
+          });
+        }
+      } catch (err) {
+        console.error('[Risk Manager] Error during monitor resolution cleanup:', err);
+      } finally {
+        resolve(scenario);
+      }
+    };
+
+    timer = setInterval(async () => {
+      try {
+        // End-of-life cutoff check
+        if (Date.now() - startTime >= maxMonitorMs) {
+          console.warn(`[Risk Manager] ⏰ Max monitor duration reached (${config.riskConfig.maxMonitorMinutes ?? 720} mins). Squaring off.`);
+          if (state.callLeg.status === 'open') {
+            await closeLeg(client, state.callLeg, state.callLeg.currentPrice, 'EXPIRED', config, notifier);
+          }
+          if (state.putLeg.status === 'open') {
+            await closeLeg(client, state.putLeg, state.putLeg.currentPrice, 'EXPIRED', config, notifier);
+          }
+          await cleanupAndResolve('MAX_TIME_REACHED');
+          return;
+        }
+
         // Fetch current prices for open legs
         if (state.callLeg.status === 'open') {
           const liveCallPrice = await client.getContractPrice(state.callLeg.symbol);
@@ -173,8 +310,11 @@ export async function monitorStraddleRisk(
             state.callLeg,
             state.callLeg.currentPrice,
             'SL_HIT',
-            config
+            config,
+            notifier
           );
+          state.updatedAt = new Date().toISOString();
+          await saveStraddleState(state, state.date);
         }
 
         if (
@@ -187,8 +327,11 @@ export async function monitorStraddleRisk(
             state.putLeg,
             state.putLeg.currentPrice,
             'SL_HIT',
-            config
+            config,
+            notifier
           );
+          state.updatedAt = new Date().toISOString();
+          await saveStraddleState(state, state.date);
         }
 
         // Calculate current Combined PnL in points
@@ -211,9 +354,6 @@ export async function monitorStraddleRisk(
             ? 'ONE_LEG_SL_OTHER_COVERED'
             : 'PROFIT_TARGET_REACHED';
 
-          state.resolvedScenario = resolvedScenario;
-          clearInterval(timer);
-
           console.log('\n🎯 ==============================================');
           console.log(`🎯 PROFIT TARGET ACHIEVED: +${state.combinedPnLPoints.toFixed(2)} points!`);
           console.log(`🎯 Scenario: ${resolvedScenario}`);
@@ -222,13 +362,13 @@ export async function monitorStraddleRisk(
 
           // Close all open remaining legs
           if (state.callLeg.status === 'open') {
-            await closeLeg(client, state.callLeg, state.callLeg.currentPrice, 'PROFIT_TARGET_HIT', config);
+            await closeLeg(client, state.callLeg, state.callLeg.currentPrice, 'PROFIT_TARGET_HIT', config, notifier);
           }
           if (state.putLeg.status === 'open') {
-            await closeLeg(client, state.putLeg, state.putLeg.currentPrice, 'PROFIT_TARGET_HIT', config);
+            await closeLeg(client, state.putLeg, state.putLeg.currentPrice, 'PROFIT_TARGET_HIT', config, notifier);
           }
 
-          resolve(resolvedScenario);
+          await cleanupAndResolve(resolvedScenario);
           return;
         }
 
@@ -239,22 +379,21 @@ export async function monitorStraddleRisk(
           state.callLeg.closeReason === 'SL_HIT' &&
           state.putLeg.closeReason === 'SL_HIT'
         ) {
-          const resolvedScenario: TradeScenario = 'BOTH_LEGS_SL';
-          state.resolvedScenario = resolvedScenario;
-          clearInterval(timer);
-
           console.log('\n🛑 ==============================================');
           console.log('🛑 BOTH LEGS STOP LOSS TRIGGERED (-100% on both)');
           console.log(`🛑 Total Points Loss: ${state.combinedPnLPoints.toFixed(2)} points`);
           console.log('🛑 Trade concluded under Scenario 3.');
           console.log('🛑 ==============================================\n');
 
-          resolve(resolvedScenario);
+          await cleanupAndResolve('BOTH_LEGS_SL');
           return;
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[Risk Manager] Error during position polling: ${message}`);
+        if (notifier) {
+          void notifier.notifyError('monitorStraddleRisk', error);
+        }
       }
     }, config.riskConfig.pollIntervalMs);
   });

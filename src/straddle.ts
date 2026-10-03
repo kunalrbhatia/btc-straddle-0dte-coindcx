@@ -7,6 +7,8 @@ import {
 } from './types';
 import { AppConfig } from './config';
 import { initializeStraddleState, monitorStraddleRisk } from './riskManager';
+import { Notifier } from './notifier';
+import { getTodayDateStringIST, saveStraddleState } from './stateStore';
 
 /**
  * Calculates the At-The-Money (ATM) strike price rounded to the nearest step.
@@ -74,10 +76,12 @@ export async function determineAtmStraddle(
 
 /**
  * Executes a Short ATM Straddle by selling ATM Call and ATM Put simultaneously.
+ * Handles partial failures by squaring off any filled leg immediately.
  */
 export async function executeShortStraddle(
   client: CoinDCXClient,
-  config: AppConfig
+  config: AppConfig,
+  notifier?: Notifier
 ): Promise<StraddleExecutionResult> {
   console.log('\n=============================================');
   console.log('[Straddle Strategy] Initiating 0DTE ATM Straddle Execution...');
@@ -98,7 +102,7 @@ export async function executeShortStraddle(
     side: 'sell',
     pair: legs.callSymbol,
     order_type: 'market_order',
-    price: '0', // Market order does not require limit price
+    price: '0',
     total_quantity: config.orderQuantity,
     leverage: config.leverage,
     notification: 'email_notification',
@@ -113,7 +117,7 @@ export async function executeShortStraddle(
     side: 'sell',
     pair: legs.putSymbol,
     order_type: 'market_order',
-    price: '0', // Market order does not require limit price
+    price: '0',
     total_quantity: config.orderQuantity,
     leverage: config.leverage,
     notification: 'email_notification',
@@ -155,17 +159,147 @@ export async function executeShortStraddle(
   logOutcome('CALL (CE)', callOutcome);
   logOutcome('PUT (PE)', putOutcome);
 
-  // Step 6: Initialize and run active Risk Management (100% SL & 55% Profit Target)
-  const state = initializeStraddleState(callOutcome, putOutcome, config);
-  void monitorStraddleRisk(client, state, config);
+  const todayStr = getTodayDateStringIST();
 
-  return {
-    executedAt: new Date(),
-    atmStrike: legs.atmStrike,
-    spotPrice: legs.spotPrice,
-    callOutcome,
-    putOutcome,
-  };
+  // Step 6: Handle execution outcome scenarios
+  // Scenario A: Both legs failed
+  if (!callOutcome.success && !putOutcome.success) {
+    const errorMsg = 'Both Call and Put entry orders failed. Aborting straddle.';
+    console.error(`[Straddle] ❌ ${errorMsg}`);
+    if (notifier) {
+      void notifier.notifyEntryAborted({
+        reason: errorMsg,
+        callSuccess: false,
+        putSuccess: false,
+      });
+    }
+    return {
+      executedAt: new Date(),
+      success: false,
+      partialFailure: false,
+      atmStrike: legs.atmStrike,
+      spotPrice: legs.spotPrice,
+      callOutcome,
+      putOutcome,
+      message: errorMsg,
+    };
+  }
+
+  // Scenario B: Partial Failure - Call succeeded, Put failed
+  if (callOutcome.success && !putOutcome.success) {
+    const errorMsg = `Partial entry failure: Call succeeded (${legs.callSymbol}) but Put failed (${putOutcome.message || 'unknown'}). Squaring off Call immediately.`;
+    console.error(`[Straddle] 🚨 ${errorMsg}`);
+
+    // Immediately unwind the filled Call leg
+    const unwindResult = await client.closePosition(legs.callSymbol, config.orderQuantity, config.leverage);
+    console.log(`[Straddle] Unwound Call leg status: ${unwindResult.success ? 'SUCCESS' : 'FAILED'}`);
+
+    if (notifier) {
+      void notifier.notifyEntryAborted({
+        reason: errorMsg,
+        callSuccess: true,
+        putSuccess: false,
+        unwoundLeg: legs.callSymbol,
+      });
+    }
+
+    return {
+      executedAt: new Date(),
+      success: false,
+      partialFailure: true,
+      atmStrike: legs.atmStrike,
+      spotPrice: legs.spotPrice,
+      callOutcome,
+      putOutcome,
+      message: errorMsg,
+      unwoundLeg: legs.callSymbol,
+    };
+  }
+
+  // Scenario C: Partial Failure - Put succeeded, Call failed
+  if (!callOutcome.success && putOutcome.success) {
+    const errorMsg = `Partial entry failure: Put succeeded (${legs.putSymbol}) but Call failed (${callOutcome.message || 'unknown'}). Squaring off Put immediately.`;
+    console.error(`[Straddle] 🚨 ${errorMsg}`);
+
+    // Immediately unwind the filled Put leg
+    const unwindResult = await client.closePosition(legs.putSymbol, config.orderQuantity, config.leverage);
+    console.log(`[Straddle] Unwound Put leg status: ${unwindResult.success ? 'SUCCESS' : 'FAILED'}`);
+
+    if (notifier) {
+      void notifier.notifyEntryAborted({
+        reason: errorMsg,
+        callSuccess: false,
+        putSuccess: true,
+        unwoundLeg: legs.putSymbol,
+      });
+    }
+
+    return {
+      executedAt: new Date(),
+      success: false,
+      partialFailure: true,
+      atmStrike: legs.atmStrike,
+      spotPrice: legs.spotPrice,
+      callOutcome,
+      putOutcome,
+      message: errorMsg,
+      unwoundLeg: legs.putSymbol,
+    };
+  }
+
+  // Scenario D: Both legs succeeded
+  console.log('[Straddle] ✅ Both legs placed successfully! Initializing risk management...');
+  try {
+    const state = await initializeStraddleState(callOutcome, putOutcome, client, config, undefined, undefined, todayStr);
+    
+    // Persist initial state
+    await saveStraddleState(state, todayStr);
+
+    if (notifier) {
+      void notifier.notifyStraddleEntered({
+        strike: legs.atmStrike,
+        callSymbol: state.callLeg.symbol,
+        callPrice: state.callLeg.entryPrice,
+        callPriceSource: state.callLeg.entryPriceSource,
+        putSymbol: state.putLeg.symbol,
+        putPrice: state.putLeg.entryPrice,
+        putPriceSource: state.putLeg.entryPriceSource,
+        totalCredit: state.totalCreditReceived,
+        callSL: state.callLeg.stopLossPrice,
+        putSL: state.putLeg.stopLossPrice,
+        targetProfit: state.targetProfitPoints,
+      });
+    }
+
+    void monitorStraddleRisk(client, state, config, notifier);
+
+    return {
+      executedAt: new Date(),
+      success: true,
+      partialFailure: false,
+      atmStrike: legs.atmStrike,
+      spotPrice: legs.spotPrice,
+      callOutcome,
+      putOutcome,
+      message: 'Straddle entered and risk monitoring active',
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[Straddle] ❌ Error initializing straddle state: ${msg}`);
+    if (notifier) {
+      void notifier.notifyError('initializeStraddleState', err);
+    }
+    return {
+      executedAt: new Date(),
+      success: false,
+      partialFailure: false,
+      atmStrike: legs.atmStrike,
+      spotPrice: legs.spotPrice,
+      callOutcome,
+      putOutcome,
+      message: `State initialization failed: ${msg}`,
+    };
+  }
 }
 
 function logOutcome(legName: string, outcome: OrderPlacementOutcome): void {
