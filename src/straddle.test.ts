@@ -39,6 +39,23 @@ describe('Straddle Execution & Unwind Tests', () => {
     assert.equal(symbols.putSymbol, 'BTC-3OCT26-84500-P-USDT');
   });
 
+  it('rolls the expiry to the NEXT day when the entry is after the daily expiry', () => {
+    // Regression for the 2026-10-03 failure: entry at 18:15 IST (12:45 UTC) is
+    // AFTER the 08:00 UTC daily expiry, so the exchange's live contract was
+    // BTC-4OCT26-..., not BTC-3OCT26-... . Asking for today's already-expired
+    // contract produced " does not exist." and wasted the entry window.
+    const entry = new Date('2026-10-03T12:45:00.000Z'); // 18:15 IST
+    const symbols = generateContractSymbols(84750, entry);
+    assert.equal(symbols.callSymbol, 'BTC-4OCT26-84750-C-USDT');
+    assert.equal(symbols.putSymbol, 'BTC-4OCT26-84750-P-USDT');
+  });
+
+  it('keeps same-day expiry when the entry is before the daily expiry', () => {
+    const beforeExpiry = new Date('2026-10-03T05:00:00.000Z'); // 10:30 IST
+    const symbols = generateContractSymbols(84750, beforeExpiry);
+    assert.equal(symbols.callSymbol, 'BTC-3OCT26-84750-C-USDT');
+  });
+
   it('aborts cleanly when both Call and Put entry orders fail', async () => {
     let callOrderPlaced = false;
     let putOrderPlaced = false;

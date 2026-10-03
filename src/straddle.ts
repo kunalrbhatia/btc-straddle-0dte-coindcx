@@ -34,16 +34,48 @@ const MONTH_NAMES = [
 ] as const;
 
 /**
- * Generates standard 0DTE contract symbols for Call (C) and Put (P).
- * e.g. BTC-3OCT26-84500-C / BTC-3OCT26-84500-P
+ * CoinDCX's BTC options expire every day at 08:00 UTC (= 13:30 IST).
+ *
+ * The bot enters at 18:15 IST — nearly five hours AFTER that day's expiry — so at
+ * entry time "today's" contract no longer exists. The live (tradeable) contract is
+ * the NEXT day's.
+ *
+ * Verified live 2026-10-03: at 18:15 IST the exchange's own order form used
+ * `BTC-4OCT26-84750-C-USDT`, while the bot asked for `BTC-3OCT26-...` and was
+ * rejected with " does not exist." — that single date error was the whole bug.
+ */
+const DAILY_EXPIRY_HOUR_UTC = 8;
+
+/** The expiry date of the contract that is actually tradeable right now. */
+export function nextExpiryDate(now = new Date()): Date {
+  const todaysExpiryMs = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    DAILY_EXPIRY_HOUR_UTC,
+    0,
+    0,
+    0
+  );
+  return now.getTime() >= todaysExpiryMs
+    ? new Date(todaysExpiryMs + 24 * 60 * 60 * 1000)
+    : new Date(todaysExpiryMs);
+}
+
+/**
+ * Generates the contract symbols for Call (C) and Put (P) at the given strike.
+ * Defaults to the NEXT tradeable expiry (see nextExpiryDate) rather than the
+ * current calendar date.
+ * e.g. BTC-4OCT26-84750-C-USDT / BTC-4OCT26-84750-P-USDT
  */
 export function generateContractSymbols(
   atmStrike: number,
   targetDate = new Date()
 ): { readonly callSymbol: string; readonly putSymbol: string } {
-  const day = targetDate.getDate();
-  const month = MONTH_NAMES[targetDate.getMonth()];
-  const yy = String(targetDate.getFullYear()).slice(-2);
+  const expiry = nextExpiryDate(targetDate);
+  const day = expiry.getUTCDate();
+  const month = MONTH_NAMES[expiry.getUTCMonth()];
+  const yy = String(expiry.getUTCFullYear()).slice(-2);
   const expiryStr = `${day}${month}${yy}`;
 
   const callSymbol = `BTC-${expiryStr}-${atmStrike}-C-USDT`;
