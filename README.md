@@ -11,16 +11,15 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
    - The bot enters at **18:15 IST** (~5 hours *after* that day's expiry). Therefore, "today's" contract no longer exists at entry time; the live tradeable contract is **tomorrow's expiry**. Contract symbol generation rolls automatically past 08:00 UTC via `nextExpiryDate()`.
 2. **Session Authentication & IP Binding**:
    - CoinDCX options endpoints (`https://api.coindcx.com/api/v1/options/*`) require web session Bearer tokens (`authorization: Bearer <token>`) and the web browser session's `User-Agent`.
-   - Standard API Key + HMAC is accepted only for spot and margin endpoints.
+   - Standard API Key + HMAC is accepted for spot and margin endpoints, but rejected with 401 on options.
    - The session token's JWT carries a source IP claim (`sip`). Requests originating from a different IP return `401 Unauthorized`.
-   - **Local execution**: The bot must run on the same machine/network as the user's browser session.
+   - **Zero-Touch Headless Automation**: The bot can run fully headlessly on remote cloud servers (e.g. Oracle Linux / Ubuntu) by running `npm run refresh-session`. It uses Playwright with stealth evasions, retrieves the 6-digit email OTP from Gmail via IMAP, computes the Google Authenticator TOTP, submits 2FA, and captures the fresh session token into `session.token`.
 3. **Session Token Lifetime & Refresh**:
    - Session tokens are valid for **~36 hours**.
-   - The token can be set via `COINDCX_SESSION_TOKEN` in `.env` or saved in `session.token` (or path via `COINDCX_SESSION_FILE`). The bot dynamically re-reads `session.token` on every request so a refreshed token takes effect immediately without restarting the bot.
+   - The token can be refreshed automatically via `npm run refresh-session` or set statically via `COINDCX_SESSION_TOKEN` in `.env` or `session.token`. The bot dynamically re-reads `session.token` on every request so a refreshed token takes effect immediately without restarting the bot.
    - On HTTP 401, the bot logs an error, journals an alert, and refuses to enter retry storms.
 4. **Options Price Feed & Mark Resolution**:
-   - Public market data endpoints do not carry options tickers or orderbooks.
-   - Live mark prices are fetched from `GET /api/v1/options/positions` or the preview endpoint `POST /api/v1/options/margin`.
+   - Live mark prices, LTP, bid/ask are queried directly from CoinDCX's public options ticker (`https://public.coindcx.com/api/v1/options/ticker?baseCurrency=BTC&expiryTime=...`) and open positions (`GET /api/v1/options/positions`).
    - If the price feed is unavailable, the bot will never fabricate arbitrary prices; it alerts and halts.
 5. **Margin Currency & Precision**:
    - Options are quoted on a **250 strike step grid** (e.g. 84750, 85000).
@@ -31,6 +30,7 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
 
 ## Features
 
+- **Zero-Touch Headless Session Refresher**: Fully automated headless login using Playwright stealth, automated Gmail IMAP OTP extraction, and RFC 6238 Google Authenticator TOTP generation (`npm run refresh-session`).
 - **Strictly Typed**: Zero usage of the `any` keyword across the codebase (`strict: true`, `noImplicitAny: true`).
 - **Accurate IST Timing**: Automatically calculates delay to **6:15 PM IST** (`18:15:00 IST`) with daily re-arming scheduler.
 - **Dynamic Strike Selection**: Fetches live BTC price and rounds to the nearest ATM strike on CoinDCX's 250 grid.
@@ -47,14 +47,38 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
 
 ## Setup & Configuration
 
-### 1. Extracting CoinDCX Session Token
+### 1. Automated Headless Session Refresh (Recommended)
 
+To run the bot 100% autonomously without manually copying tokens from browser DevTools:
+
+1. Create a 16-character **Google App Password** at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) for your Gmail account.
+2. In your `.env`, configure:
+   ```env
+   COINDCX_WEB_EMAIL="your_email@gmail.com"
+   COINDCX_WEB_PASSWORD="your_coindcx_password"
+   COINDCX_TOTP_SECRET="your_authenticator_export_or_base32_secret"
+   GMAIL_USER="your_email@gmail.com"
+   GMAIL_APP_PASSWORD="your_16_char_app_password"
+   ```
+3. Run the automated session refresher:
+   ```bash
+   npm run refresh-session
+   ```
+   *(This automatically launches headless stealth Chromium, authenticates, polls Gmail for the 2FA email OTP, generates the Authenticator TOTP, logs in, and saves `session.token`).*
+
+4. Optional Cron on Linux / Oracle Cloud (runs daily at 6:00 AM IST / 00:30 UTC):
+   ```cron
+   30 0 * * * cd /path/to/straddle-btc-0dte && npm run refresh-session >> logs/refresh.log 2>&1
+   ```
+
+### 2. Manual DevTools Fallback (Alternative)
+
+If you prefer extracting manually:
 1. Open [CoinDCX](https://coindcx.com) in Google Chrome and log in.
 2. Open Chrome DevTools (`F12` or `Ctrl+Shift+I`) and navigate to the **Network** tab.
 3. Filter requests by `options` or visit the Options trading page.
 4. Click on any request to `https://api.coindcx.com/api/v1/options/...` (e.g. `positions` or `margin`).
-5. In the **Headers** panel under **Request Headers**, copy the value of the `authorization` header (omitting `Bearer ` or keeping the whole token).
-6. Save this token into a file named `session.token` in the project root:
+5. Copy the `authorization` header value and save it to `session.token`:
    ```bash
    echo "your_token_here" > session.token
    ```

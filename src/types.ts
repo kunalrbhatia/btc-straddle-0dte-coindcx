@@ -99,6 +99,16 @@ export interface OptionsMarginResponse {
   readonly [key: string]: unknown;
 }
 
+export interface OptionsTickerItem {
+  readonly symbol: string;
+  readonly markPrice?: string | number;
+  readonly lastPrice?: string | number;
+  readonly ltp?: string | number;
+  readonly bidPrice?: string | number;
+  readonly askPrice?: string | number;
+  readonly [key: string]: unknown;
+}
+
 
 export interface TickerItem {
   readonly market: string;

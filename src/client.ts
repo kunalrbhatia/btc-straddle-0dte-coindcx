@@ -9,6 +9,7 @@ import {
   OptionsMarginRequest,
   OptionsMarginResponse,
   OptionsPosition,
+  OptionsTickerItem,
   TickerItem,
 } from './types';
 
@@ -213,15 +214,51 @@ export class CoinDCXClient {
   }
 
   /**
+   * Fetches the options ticker from public.coindcx.com/api/v1/options/ticker
+   */
+  public async getOptionsTicker(baseCurrency = 'BTC', expiryTime?: number): Promise<readonly OptionsTickerItem[]> {
+    try {
+      let url = `https://public.coindcx.com/api/v1/options/ticker?baseCurrency=${encodeURIComponent(baseCurrency)}`;
+      if (expiryTime) {
+        url += `&expiryTime=${expiryTime}`;
+      }
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        },
+      });
+      if (!response.ok) {
+        return [];
+      }
+      const json = (await response.json()) as unknown;
+      if (Array.isArray(json)) {
+        return json as readonly OptionsTickerItem[];
+      }
+      if (typeof json === 'object' && json !== null) {
+        const rec = json as Record<string, unknown>;
+        if (Array.isArray(rec.data)) {
+          return rec.data as readonly OptionsTickerItem[];
+        }
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Fetches current market price / mark price for a specific contract symbol.
    * Priority:
    * 1. GET /api/v1/options/positions -> match symbol and extract markPrice/currentPrice/entryPrice/ltp.
-   * 2. POST /api/v1/options/margin -> preview check (can return price / margin calculation).
-   * 3. Fallback to public spot ticker/orderbook if derivative happens to be listed.
+   * 2. GET https://public.coindcx.com/api/v1/options/ticker -> match symbol for live mark/last price.
+   * 3. POST /api/v1/options/margin -> preview check (can return price / margin calculation).
+   * 4. Fallback to public spot ticker/orderbook if derivative happens to be listed.
    * Does NOT fabricate numbers. Returns 0 if not found.
    */
-  public async getContractPrice(symbol: string): Promise<number> {
-    // 1. Try positions feed (primary options price feed)
+  public async getContractPrice(symbol: string, expiryTime?: number): Promise<number> {
+    // 1. Try positions feed (primary options price feed for open positions)
     try {
       const positions = await this.getOptionsPositions();
       const pos = positions.find((p) => p.symbol === symbol);
@@ -238,10 +275,27 @@ export class CoinDCXClient {
       if (err instanceof SessionTokenExpiredError) {
         throw err;
       }
-      // If error fetching positions (e.g. no position exists yet during pre-flight), continue to preview
+      // If error fetching positions (e.g. no position exists yet during pre-flight), continue to ticker
     }
 
-    // 2. Try the margin preview endpoint — it can carry a real mark price.
+    // 2. Try the public options ticker endpoint (carries live markPrice and lastPrice for all strikes)
+    try {
+      const tickers = await this.getOptionsTicker('BTC', expiryTime);
+      const match = tickers.find((t) => t.symbol === symbol);
+      if (match) {
+        const candidate = match.markPrice ?? match.lastPrice ?? match.ltp ?? match.askPrice ?? match.bidPrice;
+        if (candidate !== undefined) {
+          const num = Number(candidate);
+          if (Number.isFinite(num) && num > 0) {
+            return num;
+          }
+        }
+      }
+    } catch {
+      // Continue to margin preview if ticker fetch fails
+    }
+
+    // 3. Try the margin preview endpoint — it can carry a real mark price.
     //    NEVER fabricate a price here. An invented number becomes an entry price
     //    (=> wrong SL/PT levels) or a monitor reading (=> a FALSE stop-loss that
     //    closes a healthy leg). Return 0 and let callers decide.
@@ -263,7 +317,7 @@ export class CoinDCXClient {
       }
     }
 
-    // 3. Fallback check on ticker or orderbook
+    // 4. Fallback check on spot ticker or orderbook
     try {
       const tickers = await this.getTickers();
       const match = tickers.find((t) => t.market === symbol);

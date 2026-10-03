@@ -6,3 +6,4 @@ state/
 *.log
 session.token
 session.token.*
+*.png

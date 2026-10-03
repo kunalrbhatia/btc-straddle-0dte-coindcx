@@ -89,9 +89,9 @@ export async function runPlan(): Promise<void> {
     let callEst = 0;
     let putEst = 0;
     try {
-      const c = await client.getContractPrice(legs.callSymbol);
+      const c = await client.getContractPrice(legs.callSymbol, expiry.getTime());
       if (c > 0) callEst = c;
-      const p = await client.getContractPrice(legs.putSymbol);
+      const p = await client.getContractPrice(legs.putSymbol, expiry.getTime());
       if (p > 0) putEst = p;
     } catch {
       // Feed unavailable (e.g. expired session token) — handled below.

@@ -35,30 +35,9 @@ const getEnvNumber = (key: string, defaultValue: number): number => {
  * Reads session token from environment or token file dynamically.
  */
 export function getSessionToken(explicitConfig?: Partial<AppConfig>): string {
-  if (explicitConfig?.bearerToken) {
-    return explicitConfig.bearerToken.trim();
-  }
-
-  // If a specific session token file is explicitly configured, read from it first
-  if (explicitConfig?.sessionTokenFile) {
-    try {
-      if (fs.existsSync(explicitConfig.sessionTokenFile)) {
-        const content = fs.readFileSync(explicitConfig.sessionTokenFile, 'utf8').trim();
-        if (content.length > 0) {
-          return content;
-        }
-      }
-    } catch {
-      // Ignore read failure
-    }
-  }
-
-  const envToken = process.env.COINDCX_SESSION_TOKEN || process.env.COINDCX_BEARER_TOKEN;
-  if (envToken && envToken.trim().length > 0) {
-    return envToken.trim();
-  }
-
+  // 1. Dynamic token file takes priority so automated refreshes work immediately
   const filePath =
+    explicitConfig?.sessionTokenFile ||
     process.env.COINDCX_SESSION_FILE ||
     path.resolve(process.cwd(), 'session.token');
 
@@ -70,7 +49,18 @@ export function getSessionToken(explicitConfig?: Partial<AppConfig>): string {
       }
     }
   } catch {
-    // Return empty string if unable to read
+    // Fall back if file read fails
+  }
+
+  // 2. Explicit config if supplied
+  if (explicitConfig?.bearerToken && explicitConfig.bearerToken.trim().length > 0) {
+    return explicitConfig.bearerToken.trim();
+  }
+
+  // 3. Fall back to environment variable
+  const envToken = process.env.COINDCX_SESSION_TOKEN || process.env.COINDCX_BEARER_TOKEN;
+  if (envToken && envToken.trim().length > 0) {
+    return envToken.trim();
   }
 
   return '';
