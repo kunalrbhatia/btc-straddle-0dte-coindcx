@@ -16,37 +16,53 @@ export function calculateAtmStrike(spotPrice: number, strikeStep: number): numbe
   return Math.round(spotPrice / strikeStep) * strikeStep;
 }
 
+const MONTH_NAMES = [
+  'JAN',
+  'FEB',
+  'MAR',
+  'APR',
+  'MAY',
+  'JUN',
+  'JUL',
+  'AUG',
+  'SEP',
+  'OCT',
+  'NOV',
+  'DEC',
+] as const;
+
 /**
- * Generates standard 0DTE contract symbols for Call (CE) and Put (PE).
- * Supports standard derivatives naming conventions:
- * e.g. BTC-YYMMDD-84500-C / BTC-YYMMDD-84500-P or B-BTC-84500-CE / PE
+ * Generates standard 0DTE contract symbols for Call (C) and Put (P).
+ * e.g. BTC-3OCT26-84500-C / BTC-3OCT26-84500-P
  */
 export function generateContractSymbols(
   atmStrike: number,
   targetDate = new Date()
 ): { readonly callSymbol: string; readonly putSymbol: string } {
+  const day = targetDate.getDate();
+  const month = MONTH_NAMES[targetDate.getMonth()];
   const yy = String(targetDate.getFullYear()).slice(-2);
-  const mm = String(targetDate.getMonth() + 1).padStart(2, '0');
-  const dd = String(targetDate.getDate()).padStart(2, '0');
-  const dateStr = `${yy}${mm}${dd}`;
+  const expiryStr = `${day}${month}${yy}`;
 
-  // Standard crypto options contract format (e.g., BTC-261003-84500-C)
-  const callSymbol = `BTC-${dateStr}-${atmStrike}-C`;
-  const putSymbol = `BTC-${dateStr}-${atmStrike}-P`;
+  const callSymbol = `BTC-${expiryStr}-${atmStrike}-C-USDT`;
+  const putSymbol = `BTC-${expiryStr}-${atmStrike}-P-USDT`;
 
   return { callSymbol, putSymbol };
 }
 
 /**
- * Determines ATM straddle legs based on live BTC spot price
+ * Determines ATM straddle legs based on live BTC spot price or custom overrides
  */
 export async function determineAtmStraddle(
   client: CoinDCXClient,
-  strikeStep: number
+  config: AppConfig
 ): Promise<StraddleLegs> {
   const spotPrice = await client.getBtcSpotPrice();
-  const atmStrike = calculateAtmStrike(spotPrice, strikeStep);
-  const { callSymbol, putSymbol } = generateContractSymbols(atmStrike);
+  const atmStrike = calculateAtmStrike(spotPrice, config.strikeStep);
+  const generated = generateContractSymbols(atmStrike);
+
+  const callSymbol = config.customCallSymbol || generated.callSymbol;
+  const putSymbol = config.customPutSymbol || generated.putSymbol;
 
   return {
     spotPrice,
@@ -68,7 +84,7 @@ export async function executeShortStraddle(
   console.log('=============================================');
 
   // Step 1: Fetch live BTC spot price and determine ATM strike
-  const legs = await determineAtmStraddle(client, config.strikeStep);
+  const legs = await determineAtmStraddle(client, config);
 
   console.log(`[Straddle] Live BTC Spot Price: $${legs.spotPrice.toFixed(2)}`);
   console.log(`[Straddle] Selected ATM Strike : $${legs.atmStrike}`);
@@ -111,10 +127,29 @@ export async function executeShortStraddle(
 
   // Step 4: Dispatch both sell orders concurrently
   const [callOutcome, putOutcome]: [OrderPlacementOutcome, OrderPlacementOutcome] =
-    await Promise.all([
-      client.placeOrder(callOrder),
-      client.placeOrder(putOrder),
-    ]);
+    config.bearerToken
+      ? await Promise.all([
+          client.placeOptionsOrder(
+            legs.callSymbol,
+            'sell',
+            config.orderQuantity,
+            'Market',
+            undefined,
+            config.conversionRate
+          ),
+          client.placeOptionsOrder(
+            legs.putSymbol,
+            'sell',
+            config.orderQuantity,
+            'Market',
+            undefined,
+            config.conversionRate
+          ),
+        ])
+      : await Promise.all([
+          client.placeOrder(callOrder),
+          client.placeOrder(putOrder),
+        ]);
 
   // Step 5: Log order outcomes
   logOutcome('CALL (CE)', callOutcome);

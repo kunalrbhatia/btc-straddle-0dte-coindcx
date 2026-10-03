@@ -11,11 +11,18 @@ export class CoinDCXClient {
   private readonly apiKey: string;
   private readonly apiSecret: string;
   private readonly baseUrl: string;
+  private readonly bearerToken: string;
 
-  constructor(apiKey: string, apiSecret: string, baseUrl = 'https://api.coindcx.com') {
+  constructor(
+    apiKey: string,
+    apiSecret: string,
+    baseUrl = 'https://api.coindcx.com',
+    bearerToken = ''
+  ) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
     this.baseUrl = baseUrl;
+    this.bearerToken = bearerToken;
   }
 
   /**
@@ -170,13 +177,117 @@ export class CoinDCXClient {
   }
 
   /**
-   * Closes an existing short position by executing a market BUY order.
+   * Places an order via the native CoinDCX Options API (/api/v2/options/order/create).
+   */
+  public async placeOptionsOrder(
+    symbol: string,
+    side: 'buy' | 'sell',
+    qty: number,
+    orderType: 'Limit' | 'Market' = 'Market',
+    price?: number,
+    conversionRate = '102'
+  ): Promise<OrderPlacementOutcome> {
+    const endpoint = `${this.baseUrl}/api/v2/options/order/create`;
+    const body = {
+      symbol,
+      side,
+      orderType,
+      qty: String(qty),
+      takeProfit: '',
+      stopLoss: '',
+      conversionRate,
+      price: price ? String(price) : '0',
+    };
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          authorization: `Bearer ${this.bearerToken}`,
+          accept: 'application/json',
+          Referer: 'https://coindcx.com/',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36',
+        },
+        body: JSON.stringify(body),
+      });
+
+      const data = (await response.json()) as Record<string, unknown>;
+
+      if (response.ok && data.status === 'success') {
+        const orderData = data.data as Record<string, unknown> | undefined;
+        const orderId = typeof orderData?.orderId === 'string' ? orderData.orderId : undefined;
+        return {
+          symbol,
+          side,
+          success: true,
+          orderId,
+          rawResponse: data,
+        };
+      }
+
+      const errObj = data.error as Record<string, unknown> | undefined;
+      const errorMsg =
+        typeof errObj?.message === 'string'
+          ? errObj.message
+          : typeof data.message === 'string'
+          ? data.message
+          : `HTTP ${response.status}: ${response.statusText}`;
+
+      return {
+        symbol,
+        side,
+        success: false,
+        message: errorMsg,
+        rawResponse: data,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Network error';
+      return {
+        symbol,
+        side,
+        success: false,
+        message: msg,
+        rawResponse: {},
+      };
+    }
+  }
+
+  /**
+   * Cancels an open options order via /api/v1/options/order/cancel.
+   */
+  public async cancelOptionsOrder(orderId: string, symbol: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/v1/options/order/cancel`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          authorization: `Bearer ${this.bearerToken}`,
+          accept: 'application/json',
+          Referer: 'https://coindcx.com/',
+        },
+        body: JSON.stringify({ orderId, symbol }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Closes an existing short position by executing a BUY order.
    */
   public async closePosition(
     pair: string,
     quantity: number,
     leverage = 10
   ): Promise<OrderPlacementOutcome> {
+    if (this.bearerToken) {
+      // Use native Options API for options contracts
+      return this.placeOptionsOrder(pair, 'buy', quantity, 'Market');
+    }
+
     const order: OrderItem = {
       side: 'buy',
       pair,

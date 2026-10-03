@@ -48,6 +48,29 @@ export interface CreateOrderResponse {
   readonly orders?: readonly unknown[];
 }
 
+export interface OptionsOrderRequest {
+  readonly symbol: string;
+  readonly side: 'buy' | 'sell';
+  readonly orderType: 'Limit' | 'Market';
+  readonly qty: string;
+  readonly price?: string;
+  readonly takeProfit?: string;
+  readonly stopLoss?: string;
+  readonly conversionRate?: string;
+}
+
+export interface OptionsOrderResponse {
+  readonly status: string;
+  readonly data?: {
+    readonly orderId: string;
+  };
+  readonly error?: {
+    readonly code: number;
+    readonly message: string;
+    readonly errorCode: string;
+  };
+}
+
 export interface TickerItem {
   readonly market: string;
   readonly change_24_hour: string;

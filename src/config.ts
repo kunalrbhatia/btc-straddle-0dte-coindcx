@@ -6,6 +6,7 @@ dotenv.config();
 export interface AppConfig {
   readonly apiKey: string;
   readonly apiSecret: string;
+  readonly bearerToken: string;
   readonly baseUrl: string;
   readonly scheduledHourIST: number;
   readonly scheduledMinuteIST: number;
@@ -13,7 +14,10 @@ export interface AppConfig {
   readonly orderQuantity: number;
   readonly leverage: number;
   readonly marginCurrency: MarginCurrency;
+  readonly conversionRate: string;
   readonly riskConfig: RiskManagementConfig;
+  readonly customCallSymbol?: string;
+  readonly customPutSymbol?: string;
 }
 
 const getEnvNumber = (key: string, defaultValue: number): number => {
@@ -26,13 +30,15 @@ const getEnvNumber = (key: string, defaultValue: number): number => {
 export const config: AppConfig = {
   apiKey: process.env.COINDCX_API_KEY || '',
   apiSecret: process.env.COINDCX_API_SECRET || '',
+  bearerToken: process.env.COINDCX_BEARER_TOKEN || '',
   baseUrl: process.env.COINDCX_BASE_URL || 'https://api.coindcx.com',
   scheduledHourIST: getEnvNumber('EXECUTION_HOUR_IST', 18), // 6 PM
   scheduledMinuteIST: getEnvNumber('EXECUTION_MINUTE_IST', 15), // 15 mins -> 6:15 PM IST
   strikeStep: getEnvNumber('STRIKE_STEP', 500), // BTC strikes typically spaced at 500 or 1000
-  orderQuantity: getEnvNumber('ORDER_QUANTITY', 1),
+  orderQuantity: getEnvNumber('ORDER_QUANTITY', 0.01), // CoinDCX options min lot is 0.01 BTC
   leverage: getEnvNumber('LEVERAGE', 10),
   marginCurrency: (process.env.MARGIN_CURRENCY === 'INR' ? 'INR' : 'USDT') as MarginCurrency,
+  conversionRate: process.env.CONVERSION_RATE || '102',
 
   // Stop-Loss (100%) and Profit-Target (55% of combined credit)
   riskConfig: {
@@ -40,4 +46,6 @@ export const config: AppConfig = {
     profitTargetRatio: getEnvNumber('PROFIT_TARGET_RATIO', 0.55), // 55% of total credit
     pollIntervalMs: getEnvNumber('POLL_INTERVAL_MS', 2000), // Check positions every 2 seconds
   },
+  customCallSymbol: process.env.CUSTOM_CALL_SYMBOL || undefined,
+  customPutSymbol: process.env.CUSTOM_PUT_SYMBOL || undefined,
 };

@@ -15,7 +15,12 @@ async function main(): Promise<void> {
     console.warn('   Please configure them in your .env file before live trading.\n');
   }
 
-  const client = new CoinDCXClient(config.apiKey, config.apiSecret, config.baseUrl);
+  const client = new CoinDCXClient(
+    config.apiKey,
+    config.apiSecret,
+    config.baseUrl,
+    config.bearerToken
+  );
 
   // Check if user passed --now argument to run an immediate test
   const runImmediately = process.argv.includes('--now');
