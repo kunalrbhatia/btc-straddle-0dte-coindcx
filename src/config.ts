@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import dotenv from 'dotenv';
 import { MarginCurrency, RiskManagementConfig } from './types';
 
@@ -7,7 +9,9 @@ export interface AppConfig {
   readonly apiKey: string;
   readonly apiSecret: string;
   readonly bearerToken: string;
+  readonly sessionTokenFile?: string;
   readonly baseUrl: string;
+  readonly dryRun: boolean;
   readonly scheduledHourIST: number;
   readonly scheduledMinuteIST: number;
   readonly strikeStep: number;
@@ -27,14 +31,51 @@ const getEnvNumber = (key: string, defaultValue: number): number => {
   return Number.isFinite(parsed) ? parsed : defaultValue;
 };
 
+/**
+ * Reads session token from environment or token file dynamically.
+ */
+export function getSessionToken(explicitConfig?: Partial<AppConfig>): string {
+  // 1. Dynamic token file takes priority so automated refreshes work immediately
+  const filePath =
+    explicitConfig?.sessionTokenFile ||
+    process.env.COINDCX_SESSION_FILE ||
+    path.resolve(process.cwd(), 'session.token');
+
+  try {
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, 'utf8').trim();
+      if (content.length > 0) {
+        return content;
+      }
+    }
+  } catch {
+    // Fall back if file read fails
+  }
+
+  // 2. Explicit config if supplied
+  if (explicitConfig?.bearerToken && explicitConfig.bearerToken.trim().length > 0) {
+    return explicitConfig.bearerToken.trim();
+  }
+
+  // 3. Fall back to environment variable
+  const envToken = process.env.COINDCX_SESSION_TOKEN || process.env.COINDCX_BEARER_TOKEN;
+  if (envToken && envToken.trim().length > 0) {
+    return envToken.trim();
+  }
+
+  return '';
+}
+
 export const config: AppConfig = {
   apiKey: process.env.COINDCX_API_KEY || '',
   apiSecret: process.env.COINDCX_API_SECRET || '',
-  bearerToken: process.env.COINDCX_BEARER_TOKEN || '',
+  bearerToken: process.env.COINDCX_SESSION_TOKEN || process.env.COINDCX_BEARER_TOKEN || '',
+  sessionTokenFile: process.env.COINDCX_SESSION_FILE || undefined,
   baseUrl: process.env.COINDCX_BASE_URL || 'https://api.coindcx.com',
+  dryRun: process.env.DRY_RUN === 'true',
   scheduledHourIST: getEnvNumber('EXECUTION_HOUR_IST', 18), // 6 PM
   scheduledMinuteIST: getEnvNumber('EXECUTION_MINUTE_IST', 15), // 15 mins -> 6:15 PM IST
-  strikeStep: getEnvNumber('STRIKE_STEP', 500), // BTC strikes typically spaced at 500 or 1000
+  strikeStep: getEnvNumber('STRIKE_STEP', 250), // CoinDCX BTC 0DTE options grid is spaced at 250
   orderQuantity: getEnvNumber('ORDER_QUANTITY', 0.01), // CoinDCX options min lot is 0.01 BTC
   leverage: getEnvNumber('LEVERAGE', 10),
   marginCurrency: (process.env.MARGIN_CURRENCY === 'INR' ? 'INR' : 'USDT') as MarginCurrency,
@@ -50,3 +91,4 @@ export const config: AppConfig = {
   customCallSymbol: process.env.CUSTOM_CALL_SYMBOL || undefined,
   customPutSymbol: process.env.CUSTOM_PUT_SYMBOL || undefined,
 };
+

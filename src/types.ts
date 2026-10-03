@@ -59,17 +59,56 @@ export interface OptionsOrderRequest {
   readonly conversionRate?: string;
 }
 
-export interface OptionsOrderResponse {
-  readonly status: string;
+export interface OptionsPosition {
+  readonly symbol: string;
+  readonly side?: 'buy' | 'sell' | string;
+  readonly qty?: number | string;
+  readonly entryPrice?: number | string;
+  readonly markPrice?: number | string;
+  readonly currentPrice?: number | string;
+  readonly ltp?: number | string;
+  readonly pnl?: number | string;
+  readonly [key: string]: unknown;
+}
+
+export interface OptionsMarginRequest {
+  readonly symbol: string;
+  readonly qty: string;
+  readonly side: 'buy' | 'sell';
+  readonly orderType: 'Limit' | 'Market';
+  readonly price?: string;
+}
+
+export interface OptionsMarginResponse {
+  readonly status?: string;
+  readonly margin?: number | string;
+  readonly requiredMargin?: number | string;
+  readonly currency?: string;
+  readonly marginCurrency?: string;
   readonly data?: {
-    readonly orderId: string;
+    readonly margin?: number | string;
+    readonly requiredMargin?: number | string;
+    readonly currency?: string;
+    readonly marginCurrency?: string;
+    readonly [key: string]: unknown;
   };
   readonly error?: {
-    readonly code: number;
-    readonly message: string;
-    readonly errorCode: string;
+    readonly code?: number;
+    readonly message?: string;
   };
+  readonly [key: string]: unknown;
 }
+
+export interface OptionsTickerItem {
+  readonly symbol: string;
+  readonly markPrice?: string | number;
+  readonly lastPrice?: string | number;
+  readonly ltp?: string | number;
+  readonly bidPrice?: string | number;
+  readonly askPrice?: string | number;
+  readonly [key: string]: unknown;
+}
+
 
 export interface TickerItem {
   readonly market: string;

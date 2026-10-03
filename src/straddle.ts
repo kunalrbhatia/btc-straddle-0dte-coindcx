@@ -34,16 +34,48 @@ const MONTH_NAMES = [
 ] as const;
 
 /**
- * Generates standard 0DTE contract symbols for Call (C) and Put (P).
- * e.g. BTC-3OCT26-84500-C / BTC-3OCT26-84500-P
+ * CoinDCX's BTC options expire every day at 08:00 UTC (= 13:30 IST).
+ *
+ * The bot enters at 18:15 IST — nearly five hours AFTER that day's expiry — so at
+ * entry time "today's" contract no longer exists. The live (tradeable) contract is
+ * the NEXT day's.
+ *
+ * Verified live 2026-10-03: at 18:15 IST the exchange's own order form used
+ * `BTC-4OCT26-84750-C-USDT`, while the bot asked for `BTC-3OCT26-...` and was
+ * rejected with " does not exist." — that single date error was the whole bug.
+ */
+const DAILY_EXPIRY_HOUR_UTC = 8;
+
+/** The expiry date of the contract that is actually tradeable right now. */
+export function nextExpiryDate(now = new Date()): Date {
+  const todaysExpiryMs = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    DAILY_EXPIRY_HOUR_UTC,
+    0,
+    0,
+    0
+  );
+  return now.getTime() >= todaysExpiryMs
+    ? new Date(todaysExpiryMs + 24 * 60 * 60 * 1000)
+    : new Date(todaysExpiryMs);
+}
+
+/**
+ * Generates the contract symbols for Call (C) and Put (P) at the given strike.
+ * Defaults to the NEXT tradeable expiry (see nextExpiryDate) rather than the
+ * current calendar date.
+ * e.g. BTC-4OCT26-84750-C-USDT / BTC-4OCT26-84750-P-USDT
  */
 export function generateContractSymbols(
   atmStrike: number,
   targetDate = new Date()
 ): { readonly callSymbol: string; readonly putSymbol: string } {
-  const day = targetDate.getDate();
-  const month = MONTH_NAMES[targetDate.getMonth()];
-  const yy = String(targetDate.getFullYear()).slice(-2);
+  const expiry = nextExpiryDate(targetDate);
+  const day = expiry.getUTCDate();
+  const month = MONTH_NAMES[expiry.getUTCMonth()];
+  const yy = String(expiry.getUTCFullYear()).slice(-2);
   const expiryStr = `${day}${month}${yy}`;
 
   const callSymbol = `BTC-${expiryStr}-${atmStrike}-C-USDT`;
@@ -97,6 +129,62 @@ export async function executeShortStraddle(
   console.log(`[Straddle] Order Quantity      : ${config.orderQuantity}`);
   console.log(`[Straddle] Leverage            : ${config.leverage}x`);
 
+  // Step 1b: PRE-FLIGHT instrument validation.
+  // CoinDCX rejects unknown symbols with a blank-symbol error (" does not exist."),
+  // which is undiagnosable and wastes the (once-daily) entry window. Verify both
+  // contracts are actually listed on the exchange BEFORE sending any order:
+  // a doomed order is useless, and a single filled leg is a naked short.
+  //
+  // Existence is checked via the margin preview (isContractListed), NOT via a price:
+  // a contract can be listed while its mark is unavailable, and inferring existence
+  // from a price is what previously led to a fabricated number.
+  const [callListed, putListed] = await Promise.all([
+    client.isContractListed(legs.callSymbol, String(config.orderQuantity)),
+    client.isContractListed(legs.putSymbol, String(config.orderQuantity)),
+  ]);
+
+  if (!callListed || !putListed) {
+    const errorMsg =
+      `Pre-flight failed: contract not listed on CoinDCX — ` +
+      `CALL ${legs.callSymbol} [${callListed ? 'listed' : 'NOT FOUND'}], ` +
+      `PUT ${legs.putSymbol} [${putListed ? 'listed' : 'NOT FOUND'}]. ` +
+      `NO orders were sent. Verify the 0DTE expiry date and symbol format.`;
+    console.error(`[Straddle] 🚫 ${errorMsg}`);
+    if (notifier) {
+      void notifier.notifyEntryAborted({
+        reason: errorMsg,
+        callSuccess: false,
+        putSuccess: false,
+      });
+    }
+    return {
+      executedAt: new Date(),
+      success: false,
+      partialFailure: false,
+      atmStrike: legs.atmStrike,
+      spotPrice: legs.spotPrice,
+      callOutcome: {
+        symbol: legs.callSymbol,
+        side: 'sell',
+        success: false,
+        message: 'pre-flight: contract not listed',
+        rawResponse: {},
+      },
+      putOutcome: {
+        symbol: legs.putSymbol,
+        side: 'sell',
+        success: false,
+        message: 'pre-flight: contract not listed',
+        rawResponse: {},
+      },
+      message: errorMsg,
+    };
+  }
+
+  console.log(
+    `[Straddle] Pre-flight OK       : both contracts listed (CALL ${legs.callSymbol}, PUT ${legs.putSymbol})`
+  );
+
   // Step 2: Build Sell Order for Call Leg
   const callOrder: OrderItem = {
     side: 'sell',
@@ -130,8 +218,9 @@ export async function executeShortStraddle(
   console.log('[Straddle] Sending Sell orders for both legs concurrently...');
 
   // Step 4: Dispatch both sell orders concurrently
+  const hasToken = typeof client.getBearerToken === 'function' ? Boolean(client.getBearerToken()) : Boolean(config.bearerToken);
   const [callOutcome, putOutcome]: [OrderPlacementOutcome, OrderPlacementOutcome] =
-    config.bearerToken
+    hasToken
       ? await Promise.all([
           client.placeOptionsOrder(
             legs.callSymbol,
@@ -286,18 +375,53 @@ export async function executeShortStraddle(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[Straddle] ❌ Error initializing straddle state: ${msg}`);
+
+    // CRITICAL: both legs were SOLD successfully, so we are short and — because
+    // state init failed — completely unmonitored. Leaving them open would be a
+    // naked, unwatched straddle. Unwind both legs immediately.
+    console.error('[Straddle] 🚨 Unwinding both filled legs (state init failed after entry)');
+    const unwound: string[] = [];
+    const unwindFailed: string[] = [];
+    for (const symbol of [legs.callSymbol, legs.putSymbol]) {
+      try {
+        const unwind = await client.closePosition(symbol, config.orderQuantity, config.leverage);
+        if (unwind.success) {
+          unwound.push(symbol);
+          console.log(`[Straddle] ✅ Unwound ${symbol}`);
+        } else {
+          unwindFailed.push(symbol);
+          console.error(`[Straddle] ❌ Unwind failed for ${symbol}: ${unwind.message ?? 'unknown'}`);
+        }
+      } catch (unwindErr) {
+        const uMsg = unwindErr instanceof Error ? unwindErr.message : String(unwindErr);
+        unwindFailed.push(symbol);
+        console.error(`[Straddle] ❌ Unwind threw for ${symbol}: ${uMsg}`);
+      }
+    }
+
     if (notifier) {
       void notifier.notifyError('initializeStraddleState', err);
+      void notifier.notifyEntryAborted({
+        reason:
+          `State initialization failed AFTER both legs filled: ${msg}. ` +
+          `Unwound: ${unwound.join(', ') || 'none'}. ` +
+          `${unwindFailed.length ? `⚠️ STILL OPEN — MANUAL ACTION NEEDED: ${unwindFailed.join(', ')}` : ''}`,
+        callSuccess: true,
+        putSuccess: true,
+      });
     }
+
     return {
       executedAt: new Date(),
       success: false,
-      partialFailure: false,
+      partialFailure: true,
       atmStrike: legs.atmStrike,
       spotPrice: legs.spotPrice,
       callOutcome,
       putOutcome,
-      message: `State initialization failed: ${msg}`,
+      message:
+        `State initialization failed: ${msg}. Unwound ${unwound.length}/2 legs` +
+        `${unwindFailed.length ? ` — STILL OPEN: ${unwindFailed.join(', ')}` : ''}`,
     };
   }
 }

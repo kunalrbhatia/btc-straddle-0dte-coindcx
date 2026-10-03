@@ -292,12 +292,20 @@ export async function monitorStraddleRisk(
         // Fetch current prices for open legs
         if (state.callLeg.status === 'open') {
           const liveCallPrice = await client.getContractPrice(state.callLeg.symbol);
-          if (liveCallPrice > 0) state.callLeg.currentPrice = liveCallPrice;
+          if (liveCallPrice > 0) {
+            state.callLeg.currentPrice = liveCallPrice;
+          } else {
+            console.warn(`[Risk Manager] ⚠️ Price feed unavailable for CALL ${state.callLeg.symbol}. Retaining last known price: $${state.callLeg.currentPrice.toFixed(2)}`);
+          }
         }
 
         if (state.putLeg.status === 'open') {
           const livePutPrice = await client.getContractPrice(state.putLeg.symbol);
-          if (livePutPrice > 0) state.putLeg.currentPrice = livePutPrice;
+          if (livePutPrice > 0) {
+            state.putLeg.currentPrice = livePutPrice;
+          } else {
+            console.warn(`[Risk Manager] ⚠️ Price feed unavailable for PUT ${state.putLeg.symbol}. Retaining last known price: $${state.putLeg.currentPrice.toFixed(2)}`);
+          }
         }
 
         // Check Individual Leg Stop Losses (100% SL)

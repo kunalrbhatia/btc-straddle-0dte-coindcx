@@ -68,19 +68,40 @@ export function calculateNextOccurrenceIST(
 }
 
 /**
- * Schedules a callback to trigger at the designated IST time
+ * Schedules a callback to trigger at the designated IST time — and RE-ARMS
+ * itself for the next occurrence after every run.
+ *
+ * The re-arm matters: this was previously a one-shot setTimeout, so the bot
+ * only traded once per process start and relied entirely on the daily PM2
+ * `cron_restart` to arm the next day's entry. If that restart is ever removed
+ * or retimed, the bot would silently stop trading after day one.
  */
 export function scheduleAtIST(
   targetHourIST: number,
   targetMinuteIST: number,
   callback: () => Promise<void>
-): NodeJS.Timeout {
-  const scheduleInfo = calculateNextOccurrenceIST(targetHourIST, targetMinuteIST);
+): void {
+  const arm = (): void => {
+    const scheduleInfo = calculateNextOccurrenceIST(targetHourIST, targetMinuteIST);
 
-  console.log(`[Scheduler] Next execution set for: ${scheduleInfo.istTargetFormatted}`);
-  console.log(`[Scheduler] Waiting ${Math.round(scheduleInfo.delayMs / 1000)} seconds...`);
+    console.log(`[Scheduler] Next execution set for: ${scheduleInfo.istTargetFormatted}`);
+    console.log(`[Scheduler] Waiting ${Math.round(scheduleInfo.delayMs / 1000)} seconds...`);
 
-  return setTimeout(() => {
-    void callback();
-  }, scheduleInfo.delayMs);
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await callback();
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          console.error(`[Scheduler] Scheduled run failed: ${msg}`);
+        } finally {
+          // Re-arm for the next occurrence (typically tomorrow, if today's
+          // target time has already passed).
+          arm();
+        }
+      })();
+    }, scheduleInfo.delayMs);
+  };
+
+  arm();
 }

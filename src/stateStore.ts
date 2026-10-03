@@ -2,7 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import { StraddlePositionState } from './types';
 
-const STATE_DIR = path.resolve(process.cwd(), 'state');
+// Overridable (BTC_STATE_DIR) so test runs cannot write a fake position into
+// the live state directory that the bot reconciles against at startup.
+const STATE_DIR = process.env.BTC_STATE_DIR
+  ? path.resolve(process.env.BTC_STATE_DIR)
+  : path.resolve(process.cwd(), 'state');
 
 export function getTodayDateStringIST(now = new Date()): string {
   // IST is UTC + 5:30 (330 minutes)

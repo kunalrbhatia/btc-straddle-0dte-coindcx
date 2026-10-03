@@ -2,7 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import { getTodayDateStringIST } from './stateStore';
 
-const LOGS_DIR = path.resolve(process.cwd(), 'logs');
+// Overridable (BTC_LOGS_DIR) so test runs cannot append fake MTM lines into the
+// live logs directory that the Hermes watch banner reads.
+const LOGS_DIR = process.env.BTC_LOGS_DIR
+  ? path.resolve(process.env.BTC_LOGS_DIR)
+  : path.resolve(process.cwd(), 'logs');
 
 export function ensureLogsDirectory(): void {
   if (!fs.existsSync(LOGS_DIR)) {

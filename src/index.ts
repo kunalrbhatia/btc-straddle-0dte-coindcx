@@ -5,17 +5,32 @@ import { scheduleAtIST } from './scheduler';
 import { getTodayDateStringIST, hasTodayExecuted, loadStraddleState } from './stateStore';
 import { executeShortStraddle } from './straddle';
 import { monitorStraddleRisk } from './riskManager';
+import { acquireInstanceLock, InstanceLock } from './instanceLock';
 
 async function main(): Promise<void> {
   console.log('==================================================');
   console.log('  CoinDCX BTC 0DTE ATM Straddle Automated Bot    ');
   console.log('==================================================');
 
+  // Acquire single-instance lock to ensure only one bot instance manages positions
+  let lock: InstanceLock;
+  try {
+    lock = acquireInstanceLock();
+    console.log(`[Runner] Acquired instance lock (PID: ${lock.pid}, ID: ${lock.instanceId})`);
+  } catch (lockErr) {
+    console.error(`[Runner] 🛑 ${(lockErr as Error).message}`);
+    process.exit(1);
+  }
+
   if (!config.apiKey || !config.apiSecret) {
     console.warn(
       '⚠️  WARNING: COINDCX_API_KEY or COINDCX_API_SECRET is missing in environment.'
     );
     console.warn('   Please configure them in your .env file before live trading.\n');
+  }
+
+  if (config.dryRun) {
+    console.log('🛡️  DRY_RUN=true is enabled! All order placement and cancellations will be simulated.\n');
   }
 
   console.log(`[Config] Scheduled Time : ${config.scheduledHourIST}:${String(config.scheduledMinuteIST).padStart(2, '0')} IST`);
@@ -36,7 +51,9 @@ async function main(): Promise<void> {
     config.apiKey,
     config.apiSecret,
     config.baseUrl,
-    config.bearerToken
+    config.bearerToken,
+    config.sessionTokenFile,
+    config.dryRun
   );
 
   const todayStr = getTodayDateStringIST();
@@ -63,36 +80,40 @@ async function main(): Promise<void> {
     console.error(`[Startup Reconciliation] Error checking existing state: ${msg}`);
   }
 
-  // Check if user passed --now argument to run an immediate execution
-  const runImmediately = process.argv.includes('--now');
+  // Check if user passed --now argument or RUN_ONCE=true to run a single cycle
+  const runImmediately = process.argv.includes('--now') || process.env.RUN_ONCE === 'true';
 
   if (runImmediately) {
-    console.log('[Runner] "--now" argument detected.');
+    console.log('[Runner] Single cycle execution mode detected.');
     
-    // Safety check: require explicit ALLOW_INSTANT_EXECUTION=true flag
-    if (process.env.ALLOW_INSTANT_EXECUTION !== 'true') {
-      const refusalMsg = 'Refusing --now execution: ALLOW_INSTANT_EXECUTION=true is not set in environment. Set it explicitly to permit immediate manual execution.';
+    // Safety check: require explicit ALLOW_INSTANT_EXECUTION=true flag (unless dryRun is active)
+    if (!config.dryRun && process.env.ALLOW_INSTANT_EXECUTION !== 'true') {
+      const refusalMsg = 'Refusing immediate execution: ALLOW_INSTANT_EXECUTION=true is not set in environment. Set it explicitly or use DRY_RUN=true.';
       console.error(`[Runner] 🛑 ${refusalMsg}`);
-      void notifier.notifyError('--now execution guard', refusalMsg);
+      void notifier.notifyError('Execution guard', refusalMsg);
+      lock.release();
       return;
     }
 
-    // Idempotency check: refuse if today has already executed
+    // Idempotency check: refuse if today has already executed (bypassable if dryRun)
     const alreadyRun = await hasTodayExecuted(todayStr);
-    if (alreadyRun) {
-      const skipMsg = `Refusing --now execution: Straddle for today (${todayStr}) has already been executed!`;
+    if (alreadyRun && !config.dryRun) {
+      const skipMsg = `Refusing execution: Straddle for today (${todayStr}) has already been executed!`;
       console.warn(`[Runner] ⚠️ ${skipMsg}`);
-      void notifier.notifyError('--now idempotency guard', skipMsg);
+      void notifier.notifyError('Idempotency guard', skipMsg);
+      lock.release();
       return;
     }
 
-    console.log('[Runner] ALLOW_INSTANT_EXECUTION=true confirmed and today has not yet executed. Executing straddle immediately...');
+    console.log('[Runner] Executing straddle cycle...');
     try {
       await executeShortStraddle(client, config, notifier);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`[Runner] Execution error: ${msg}`);
-      void notifier.notifyError('Immediate execution', error);
+      void notifier.notifyError('Single cycle execution', error);
+    } finally {
+      lock.release();
     }
     return;
   }
@@ -124,11 +145,14 @@ async function main(): Promise<void> {
 
   const handleShutdown = (signal: string): void => {
     console.log(`\n[Runner] Received ${signal}. Shutting down safely.`);
+    lock.release();
     process.exit(0);
   };
 
   process.on('SIGINT', () => handleShutdown('SIGINT'));
   process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+  process.on('exit', () => lock.release());
 }
 
 void main();
+

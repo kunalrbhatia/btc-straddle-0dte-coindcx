@@ -4,64 +4,89 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
 
 ---
 
+## Verified Exchange Mechanics & Architecture
+
+1. **Option Expiry Timing**:
+   - CoinDCX BTC options expire daily at **08:00 UTC (13:30 IST)**.
+   - The bot enters at **18:15 IST** (~5 hours *after* that day's expiry). Therefore, "today's" contract no longer exists at entry time; the live tradeable contract is **tomorrow's expiry**. Contract symbol generation rolls automatically past 08:00 UTC via `nextExpiryDate()`.
+2. **Session Authentication & IP Binding**:
+   - CoinDCX options endpoints (`https://api.coindcx.com/api/v1/options/*`) require web session Bearer tokens (`authorization: Bearer <token>`) and the web browser session's `User-Agent`.
+   - Standard API Key + HMAC is accepted for spot and margin endpoints, but rejected with 401 on options.
+   - The session token's JWT carries a source IP claim (`sip`). Requests originating from a different IP return `401 Unauthorized`.
+   - **Zero-Touch Headless Automation**: The bot can run fully headlessly on remote cloud servers (e.g. Oracle Linux / Ubuntu) by running `npm run refresh-session`. It uses Playwright with stealth evasions, retrieves the 6-digit email OTP from Gmail via IMAP, computes the Google Authenticator TOTP, submits 2FA, and captures the fresh session token into `session.token`.
+3. **Session Token Lifetime & Refresh**:
+   - Session tokens are valid for **~36 hours**.
+   - The token can be refreshed automatically via `npm run refresh-session` or set statically via `COINDCX_SESSION_TOKEN` in `.env` or `session.token`. The bot dynamically re-reads `session.token` on every request so a refreshed token takes effect immediately without restarting the bot.
+   - On HTTP 401, the bot logs an error, journals an alert, and refuses to enter retry storms.
+4. **Options Price Feed & Mark Resolution**:
+   - Live mark prices, LTP, bid/ask are queried directly from CoinDCX's public options ticker (`https://public.coindcx.com/api/v1/options/ticker?baseCurrency=BTC&expiryTime=...`) and open positions (`GET /api/v1/options/positions`).
+   - If the price feed is unavailable, the bot will never fabricate arbitrary prices; it alerts and halts.
+5. **Margin Currency & Precision**:
+   - Options are quoted on a **250 strike step grid** (e.g. 84750, 85000).
+   - Position sizing: 0.01 BTC per leg at 10x leverage.
+   - Note on balance: verify whether margin is held in USDT or INR before enabling live ordering.
+
+---
+
 ## Features
-- **Strictly Typed**: Zero usage of the `any` keyword across the entire codebase (`strict: true`, `noImplicitAny: true`).
-- **Accurate IST Timing**: Automatically calculates the exact delay until **6:15 PM IST** (`18:15:00 IST`) and executes daily.
-- **Dynamic ATM Strike Selection**: Fetches live BTC price and rounds to the nearest ATM strike (e.g. $500 strike increments).
-- **Concurrent Order Dispatch**: Sells both Call (CE) and Put (PE) simultaneously using `Promise.all`.
-- **Fail-Safe Entry & Unwind**: If both orders fail, entry is aborted without fabricating prices. If only one leg fills (partial failure), the bot immediately places a buy-to-close order to unwind the filled leg, preventing naked exposure.
-- **No Fabricated Prices**: Fill prices are parsed strictly from actual execution responses or validated live contract mark prices; never defaults to arbitrary numbers.
-- **Defense in Depth**: Leg close commands will never fire without confirmation that the position was successfully opened.
-- **State Persistence & Recovery**: Atomic disk writes to `state/straddle-state-<YYYY-MM-DD>.json` on every state transition. Automatically reconciles and resumes monitoring of open positions upon crash or restart.
-- **MTM Watcher Logging**: Real-time tick-by-tick mark-to-market PnL tracking appended to daily log files (`logs/mtm-<YYYY-MM-DD>.log`) formatted with timestamp and current MTM.
-- **Idempotency Guard**: Guarantees that today's entry is executed only once, skipping duplicate runs.
-- **Telegram Alerting**: Integrated Telegram notifications for entries, stop-loss hits, profit target exits, partial failures, and startup reconciliation (gracefully disables if credentials are not provided).
-- **Execution Safeguards**: The `--now` flag requires `ALLOW_INSTANT_EXECUTION=true` in environment to prevent unintentional manual live orders.
+
+- **Zero-Touch Headless Session Refresher**: Fully automated headless login using Playwright stealth, automated Gmail IMAP OTP extraction, and RFC 6238 Google Authenticator TOTP generation (`npm run refresh-session`).
+- **Strictly Typed**: Zero usage of the `any` keyword across the codebase (`strict: true`, `noImplicitAny: true`).
+- **Accurate IST Timing**: Automatically calculates delay to **6:15 PM IST** (`18:15:00 IST`) with daily re-arming scheduler.
+- **Dynamic Strike Selection**: Fetches live BTC price and rounds to the nearest ATM strike on CoinDCX's 250 grid.
+- **Fail-Safe Entry & Unwind**: If both legs fail, entry aborts cleanly. If only one leg fills (partial failure), the bot immediately unwinds the filled leg via buy-to-close to avoid naked exposure.
+- **Single-Instance Process Lock**: Exclusive PID lock file prevents duplicate local or PM2 instances from racing or cancelling each other's orders.
+- **Safe Development Modes**:
+  - `npm run plan`: Read-only inspection mode. Fetches spot, calculates strikes, validates contracts via margin preview, and displays projected SL/PT levels without placing any orders.
+  - `DRY_RUN=true`: Simulates all order placements and cancellations without sending order network requests.
+  - `npm run run-once`: Executes a single cycle.
+- **MTM Watcher Logging**: Appends tick-by-tick mark-to-market PnL tracking to `logs/mtm-<YYYY-MM-DD>.log`.
+- **Local Alert Journal**: Writes every alert to `logs/alerts-<YYYY-MM-DD>.jsonl` so local watch banners forward notifications even without Telegram bot credentials.
 
 ---
 
-## Project Structure
-```
-straddle-btc-0dte/
-├── src/
-│   ├── client.ts         # CoinDCX API client & HMAC signing
-│   ├── config.ts         # Environment & strategy configuration
-│   ├── index.ts          # App entry point, startup reconciliation & scheduler
-│   ├── mtmWatcher.ts     # Real-time MTM logging by date
-│   ├── notifier.ts       # Telegram bot alerting module
-│   ├── riskManager.ts    # Fill price resolution, SL/PT tracking & leg closure
-│   ├── scheduler.ts      # Indian Standard Time (IST) timing engine
-│   ├── stateStore.ts     # Atomic state persistence & idempotency checks
-│   ├── straddle.ts       # ATM calculation, execution & partial entry unwinding
-│   └── types.ts          # Strongly-typed interfaces (no `any`)
-├── logs/                 # Daily MTM logs (logs/mtm-YYYY-MM-DD.log) & PM2 logs
-├── state/                # Ignored directory for persisted daily state files
-├── .env.example          # Environment variable template
-├── ecosystem.config.js   # PM2 process supervisor configuration
-├── package.json
-└── tsconfig.json
-```
+## Setup & Configuration
 
----
+### 1. Automated Headless Session Refresh (Recommended)
 
-## Risk Management & Exit Logic
-- **Individual Leg Stop Loss (100% SL)**: If a leg was sold at 100 points, it is closed immediately via market buy when its market price touches or exceeds 200 points (2x entry).
-- **Combined Profit Target (55% of Total Credit)**:
-  - Total Credit = `Call Entry Price + Put Entry Price`.
-  - Profit Target (Points) = `0.55 * Total Credit` (e.g. 100 + 100 = 200 pts credit -> 110 pts target profit).
-  - When combined PnL across both legs reaches or exceeds +55% of credit, all remaining open legs are closed.
-- **Three Resolution Scenarios Handled**:
-  1. **Scenario 1 (`PROFIT_TARGET_REACHED`)**: Combined PnL hits 55% profit target with both legs riding; books profit and closes both.
-  2. **Scenario 2 (`ONE_LEG_SL_OTHER_COVERED`)**: One leg triggers 100% SL, the remaining leg continues to decay and covers the loss to achieve the 55% net trade profit target.
-  3. **Scenario 3 (`BOTH_LEGS_SL`)**: Extreme market move hits 100% SL on both legs; both positions are closed.
-- **Max Duration Timeout**: Position is automatically squared off if monitoring exceeds configured cutoff (default: 12 hours).
+To run the bot 100% autonomously without manually copying tokens from browser DevTools:
 
----
+1. Create a 16-character **Google App Password** at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) for your Gmail account.
+2. In your `.env`, configure:
+   ```env
+   COINDCX_WEB_EMAIL="your_email@gmail.com"
+   COINDCX_WEB_PASSWORD="your_coindcx_password"
+   COINDCX_TOTP_SECRET="your_authenticator_export_or_base32_secret"
+   GMAIL_USER="your_email@gmail.com"
+   GMAIL_APP_PASSWORD="your_16_char_app_password"
+   ```
+3. Run the automated session refresher:
+   ```bash
+   npm run refresh-session
+   ```
+   *(This automatically launches headless stealth Chromium, authenticates, polls Gmail for the 2FA email OTP, generates the Authenticator TOTP, logs in, and saves `session.token`).*
 
-## Setup & Running
+4. Optional Cron on Linux / Oracle Cloud (runs daily at 6:00 AM IST / 00:30 UTC):
+   ```cron
+   30 0 * * * cd /path/to/straddle-btc-0dte && npm run refresh-session >> logs/refresh.log 2>&1
+   ```
 
-### 1. Configure Credentials
-Copy `.env.example` to `.env` and fill in your CoinDCX API credentials:
+### 2. Manual DevTools Fallback (Alternative)
+
+If you prefer extracting manually:
+1. Open [CoinDCX](https://coindcx.com) in Google Chrome and log in.
+2. Open Chrome DevTools (`F12` or `Ctrl+Shift+I`) and navigate to the **Network** tab.
+3. Filter requests by `options` or visit the Options trading page.
+4. Click on any request to `https://api.coindcx.com/api/v1/options/...` (e.g. `positions` or `margin`).
+5. Copy the `authorization` header value and save it to `session.token`:
+   ```bash
+   echo "your_token_here" > session.token
+   ```
+   *(Note: `session.token` and `.env` are gitignored).*
+
+### 2. Configure Environment (`.env`)
+
+Copy `.env.example` to `.env`:
 ```bash
 cp .env.example .env
 ```
@@ -71,14 +96,17 @@ Edit `.env`:
 # CoinDCX API Credentials
 COINDCX_API_KEY=your_api_key_here
 COINDCX_API_SECRET=your_api_secret_here
-COINDCX_BEARER_TOKEN=your_jwt_bearer_token_here
+
+# Options Web Session Token (or leave blank to read from session.token)
+COINDCX_SESSION_TOKEN=
+COINDCX_SESSION_FILE=./session.token
 
 # Strategy Settings
 ORDER_QUANTITY=0.01
 LEVERAGE=10
 MARGIN_CURRENCY=USDT
 CONVERSION_RATE=102
-STRIKE_STEP=500
+STRIKE_STEP=250
 EXECUTION_HOUR_IST=18
 EXECUTION_MINUTE_IST=15
 
@@ -88,33 +116,51 @@ PROFIT_TARGET_RATIO=0.55
 POLL_INTERVAL_MS=2000
 MAX_MONITOR_MINUTES=720
 
-# Optional Telegram Notifications
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
-
-# Safety guard for instant manual execution
+# Safe Mode / Testing
+DRY_RUN=false
 ALLOW_INSTANT_EXECUTION=false
+
+# Optional Telegram Notifications
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
-### 2. Run the Bot
-- **Schedule for 6:15 PM IST daily**:
+---
+
+## Running the Bot
+
+- **Plan Mode (Safe Inspection — No Orders)**:
+  ```bash
+  npm run plan
+  ```
+  Validates spot price, ATM strike derivation on 250 grid, next expiry date, margin preview, and prints SL/PT levels.
+
+- **Run Single Cycle in Dry Run Mode (No Real Orders)**:
+  ```bash
+  DRY_RUN=true npm run run-once
+  ```
+
+- **Run Single Cycle Live**:
+  ```bash
+  ALLOW_INSTANT_EXECUTION=true npm run run-once
+  ```
+
+- **Start Daily Scheduler (6:15 PM IST)**:
   ```bash
   npm start
   ```
-- **Instant Test / Manual Execution (`--now`)**:
-  > **Note**: Requires setting `ALLOW_INSTANT_EXECUTION=true` in your environment or `.env` file to prevent accidental real orders.
-  ```bash
-  ALLOW_INSTANT_EXECUTION=true npx ts-node src/index.ts --now
-  ```
-- **Run Test Suite**:
+
+- **Run Tests**:
   ```bash
   npm test
   ```
-- **Build Production JavaScript**:
+
+- **Compile TypeScript**:
   ```bash
   npm run build
   ```
-- **Run with PM2**:
+
+- **Typecheck**:
   ```bash
-  pm2 start ecosystem.config.js
+  npm run typecheck
   ```
