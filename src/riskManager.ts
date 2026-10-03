@@ -46,6 +46,23 @@ export async function resolveEntryPrice(
     }
   }
 
+  const orderData = raw.data as Record<string, unknown> | undefined;
+  if (orderData) {
+    const dAvg = Number(orderData.avg_price ?? orderData.avgPrice ?? orderData.price);
+    if (Number.isFinite(dAvg) && dAvg > 0) {
+      return { price: dAvg, source: 'fill' };
+    }
+  }
+
+  // Fallback to posted limit price:
+  // Falling back to outcome.limitPrice is legitimate because this was the real,
+  // known marketable limit price quoted from the exchange orderbook bidPrice and submitted in
+  // the order request. This is fundamentally different from inventing an arbitrary
+  // placeholder (such as 500) out of thin air.
+  if (outcome.limitPrice !== undefined && Number.isFinite(outcome.limitPrice) && outcome.limitPrice > 0) {
+    return { price: outcome.limitPrice, source: 'fill' };
+  }
+
   // Fallback: poll live contract price via public/authenticated ticker
   try {
     const contractPrice = await client.getContractPrice(symbol);

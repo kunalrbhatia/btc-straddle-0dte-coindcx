@@ -18,6 +18,8 @@ const mockConfig: AppConfig = {
   marginCurrency: 'USDT',
   dryRun: false,
   conversionRate: '102',
+  entryOrderType: 'Limit',
+  entryFillTimeoutMs: 15000,
   riskConfig: {
     stopLossMultiplier: 2.0,
     profitTargetRatio: 0.55,
@@ -344,5 +346,189 @@ describe('Straddle Execution & Unwind Tests', () => {
     assert.equal(result.partialFailure, true, 'entry failed after fills => partial failure');
     assert.equal(closed.length, 2, 'both filled legs must be unwound, not left naked');
     assert.match(result.message ?? '', /Unwound 2\/2 legs/);
+  });
+
+  describe('Limit Orders & Live Bid Pricing Tests', () => {
+    it('prices Limit orders from live bidPrice and sends stopLoss = 2 * price', async () => {
+      let callOrderPlaced: Record<string, unknown> | undefined;
+      let putOrderPlaced: Record<string, unknown> | undefined;
+
+      const mockClient = {
+        getBearerToken: () => 'valid-bearer-token',
+        getBtcSpotPrice: async () => 84750,
+        isContractListed: async () => true,
+        getOptionsTicker: async () => [
+          { symbol: 'BTC-4OCT26-84750-C-USDT', bidPrice: '416.00', askPrice: '418.00' },
+          { symbol: 'BTC-4OCT26-84750-P-USDT', bidPrice: '380.50', askPrice: '382.00' },
+        ],
+        placeOptionsOrder: async (
+          symbol: string,
+          side: 'buy' | 'sell',
+          qty: number,
+          orderType: 'Limit' | 'Market',
+          price?: number | string,
+          stopLoss?: string,
+          takeProfit?: string
+        ) => {
+          if (symbol.includes('-C-')) {
+            callOrderPlaced = { symbol, side, qty, orderType, price, stopLoss, takeProfit };
+            return { symbol, side, success: true, orderId: 'call-1', limitPrice: Number(price), rawResponse: { status: 'filled' } };
+          } else {
+            putOrderPlaced = { symbol, side, qty, orderType, price, stopLoss, takeProfit };
+            return { symbol, side, success: true, orderId: 'put-1', limitPrice: Number(price), rawResponse: { status: 'filled' } };
+          }
+        },
+        getOpenOptionsOrders: async () => [],
+        getContractPrice: async () => 10, // Drives monitor immediately to terminal profit target
+        closePosition: async () => ({ symbol: 'x', side: 'buy', success: true, rawResponse: {} }),
+      } as unknown as CoinDCXClient;
+
+      const fastConfig = { ...mockConfig, riskConfig: { ...mockConfig.riskConfig, pollIntervalMs: 20 } };
+      const result = await executeShortStraddle(mockClient, fastConfig);
+
+      assert.equal(result.success, true);
+      assert.equal(callOrderPlaced?.orderType, 'Limit');
+      assert.equal(callOrderPlaced?.price, 416.0);
+      assert.equal(callOrderPlaced?.stopLoss, '832.00'); // 416 * 2.0
+      assert.equal(callOrderPlaced?.takeProfit, '');
+
+      assert.equal(putOrderPlaced?.orderType, 'Limit');
+      assert.equal(putOrderPlaced?.price, 380.5);
+      assert.equal(putOrderPlaced?.stopLoss, '761.00'); // 380.5 * 2.0
+      assert.equal(putOrderPlaced?.takeProfit, '');
+    });
+
+    it('aborts entry with zero orders sent if bidPrice is missing or <= 0', async () => {
+      let ordersSent = 0;
+      let alertMsg = '';
+
+      const mockClient = {
+        getBearerToken: () => 'valid-bearer-token',
+        getBtcSpotPrice: async () => 84750,
+        isContractListed: async () => true,
+        getOptionsTicker: async () => [
+          { symbol: 'BTC-4OCT26-84750-C-USDT', bidPrice: '0', askPrice: '418.00' }, // bid is 0!
+          { symbol: 'BTC-4OCT26-84750-P-USDT', bidPrice: '380.50', askPrice: '382.00' },
+        ],
+        placeOptionsOrder: async () => {
+          ordersSent++;
+          return { symbol: 'x', side: 'sell', success: true, rawResponse: {} };
+        },
+      } as unknown as CoinDCXClient;
+
+      const mockNotifier: Notifier = {
+        isEnabled: true,
+        notifyStraddleEntered: async () => {},
+        notifyLegClosed: async () => {},
+        notifyScenarioResolved: async () => {},
+        notifyEntryAborted: async (p) => {
+          alertMsg = p.reason;
+        },
+        notifyError: async () => {},
+        notifyReconciliation: async () => {},
+      };
+
+      const result = await executeShortStraddle(mockClient, mockConfig, mockNotifier);
+
+      assert.equal(ordersSent, 0, 'ZERO orders must be sent when a leg lacks a usable bid quote');
+      assert.equal(result.success, false);
+      assert.match(alertMsg, /Missing or invalid bidPrice quote/);
+    });
+
+    it('cancels both orders and aborts with zero exposure if neither fills within timeout', async () => {
+      const cancelled: string[] = [];
+
+      const mockClient = {
+        getBearerToken: () => 'valid-bearer-token',
+        getBtcSpotPrice: async () => 84750,
+        isContractListed: async () => true,
+        getOptionsTicker: async () => [
+          { symbol: 'BTC-4OCT26-84750-C-USDT', bidPrice: '416.00' },
+          { symbol: 'BTC-4OCT26-84750-P-USDT', bidPrice: '380.50' },
+        ],
+        placeOptionsOrder: async (symbol: string) => ({
+          symbol,
+          side: 'sell' as const,
+          success: true,
+          orderId: `ord-${symbol}`,
+          limitPrice: 400,
+          rawResponse: { status: 'open' },
+        }),
+        getOpenOptionsOrders: async () => [
+          { id: 'ord-BTC-4OCT26-84750-C-USDT', status: 'open' },
+          { id: 'ord-BTC-4OCT26-84750-P-USDT', status: 'open' },
+        ],
+        cancelOptionsOrder: async (orderId: string) => {
+          cancelled.push(orderId);
+          return true;
+        },
+        closePosition: async () => ({ symbol: 'x', side: 'buy', success: true, rawResponse: {} }),
+      } as unknown as CoinDCXClient;
+
+      const customConfig = { ...mockConfig, entryFillTimeoutMs: 50 };
+      const result = await executeShortStraddle(mockClient, customConfig);
+
+      assert.equal(result.success, false);
+      assert.equal(cancelled.length, 2, 'both unfilled orders must be cancelled');
+      assert.match(result.message ?? '', /Neither Call nor Put limit order filled within/);
+    });
+
+    it('cancels unfilled leg and immediately unwinds filled leg upon partial fill timeout', async () => {
+      const cancelled: string[] = [];
+      const unwound: string[] = [];
+
+      const mockClient = {
+        getBearerToken: () => 'valid-bearer-token',
+        getBtcSpotPrice: async () => 84750,
+        isContractListed: async () => true,
+        getOptionsTicker: async () => [
+          { symbol: 'BTC-4OCT26-84750-C-USDT', bidPrice: '416.00' },
+          { symbol: 'BTC-4OCT26-84750-P-USDT', bidPrice: '380.50' },
+        ],
+        placeOptionsOrder: async (symbol: string) => {
+          if (symbol.includes('-C-')) {
+            // Call is filled immediately
+            return {
+              symbol,
+              side: 'sell' as const,
+              success: true,
+              orderId: 'call-filled-1',
+              limitPrice: 416,
+              rawResponse: { status: 'filled' },
+            };
+          } else {
+            // Put remains open in orderbook
+            return {
+              symbol,
+              side: 'sell' as const,
+              success: true,
+              orderId: 'put-unfilled-1',
+              limitPrice: 380.5,
+              rawResponse: { status: 'open' },
+            };
+          }
+        },
+        getOpenOptionsOrders: async () => [
+          { id: 'put-unfilled-1', status: 'open' },
+        ],
+        cancelOptionsOrder: async (orderId: string) => {
+          cancelled.push(orderId);
+          return true;
+        },
+        closePosition: async (symbol: string) => {
+          unwound.push(symbol);
+          return { symbol, side: 'buy', success: true, rawResponse: {} };
+        },
+      } as unknown as CoinDCXClient;
+
+      const customConfig = { ...mockConfig, entryFillTimeoutMs: 50 };
+      const result = await executeShortStraddle(mockClient, customConfig);
+
+      assert.equal(result.success, false);
+      assert.equal(result.partialFailure, true);
+      assert.equal(cancelled.includes('put-unfilled-1'), true, 'unfilled put must be cancelled');
+      assert.equal(unwound.length, 1);
+      assert.match(unwound[0], /-C-/, 'filled call must be unwound immediately');
+    });
   });
 });

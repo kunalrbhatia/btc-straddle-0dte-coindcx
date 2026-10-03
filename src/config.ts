@@ -19,6 +19,8 @@ export interface AppConfig {
   readonly leverage: number;
   readonly marginCurrency: MarginCurrency;
   readonly conversionRate: string;
+  readonly entryOrderType: 'Limit' | 'Market';
+  readonly entryFillTimeoutMs: number;
   readonly riskConfig: RiskManagementConfig;
   readonly customCallSymbol?: string;
   readonly customPutSymbol?: string;
@@ -80,6 +82,8 @@ export const config: AppConfig = {
   leverage: getEnvNumber('LEVERAGE', 10),
   marginCurrency: (process.env.MARGIN_CURRENCY === 'INR' ? 'INR' : 'USDT') as MarginCurrency,
   conversionRate: process.env.CONVERSION_RATE || '102',
+  entryOrderType: (process.env.ENTRY_ORDER_TYPE === 'Market' ? 'Market' : 'Limit'),
+  entryFillTimeoutMs: getEnvNumber('ENTRY_FILL_TIMEOUT_MS', 15000),
 
   // Stop-Loss (100%) and Profit-Target (55% of combined credit)
   riskConfig: {

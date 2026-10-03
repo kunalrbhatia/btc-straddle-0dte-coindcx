@@ -83,40 +83,70 @@ export async function runPlan(): Promise<void> {
       }
     }
 
-    // SL / PT levels require a REAL premium. Never invent one: a fabricated mark
-    // produces confident-looking numbers (a fictional credit, and therefore
-    // fictional stop/target levels) that the user would reasonably act on.
+    // Price the entry from live options ticker (bidPrice) as in execution mode
+    let callBid = 0;
+    let putBid = 0;
     let callEst = 0;
     let putEst = 0;
+
     try {
-      const c = await client.getContractPrice(legs.callSymbol, expiry.getTime());
-      if (c > 0) callEst = c;
-      const p = await client.getContractPrice(legs.putSymbol, expiry.getTime());
-      if (p > 0) putEst = p;
+      const tickers = await client.getOptionsTicker('BTC', expiry.getTime());
+      const callTicker = tickers.find((t) => t.symbol === legs.callSymbol);
+      const putTicker = tickers.find((t) => t.symbol === legs.putSymbol);
+
+      const cb = Number(callTicker?.bidPrice);
+      const pb = Number(putTicker?.bidPrice);
+      if (Number.isFinite(cb) && cb > 0) callBid = cb;
+      if (Number.isFinite(pb) && pb > 0) putBid = pb;
+
+      const cm = Number(callTicker?.markPrice ?? callTicker?.lastPrice);
+      const pm = Number(putTicker?.markPrice ?? putTicker?.lastPrice);
+      if (Number.isFinite(cm) && cm > 0) callEst = cm;
+      if (Number.isFinite(pm) && pm > 0) putEst = pm;
     } catch {
-      // Feed unavailable (e.g. expired session token) — handled below.
+      // Feed unavailable
     }
 
     if (callEst <= 0 || putEst <= 0) {
+      try {
+        const c = await client.getContractPrice(legs.callSymbol, expiry.getTime());
+        if (c > 0) callEst = c;
+        const p = await client.getContractPrice(legs.putSymbol, expiry.getTime());
+        if (p > 0) putEst = p;
+      } catch {
+        // Feed unavailable
+      }
+    }
+
+    const effectiveCallPrice = callBid > 0 ? callBid : callEst;
+    const effectivePutPrice = putBid > 0 ? putBid : putEst;
+
+    if (effectiveCallPrice <= 0 || effectivePutPrice <= 0) {
       console.log('\n--- Projected Straddle Levels: UNAVAILABLE ---');
       console.log(
-        '• No live premium could be read for both legs, so stop-loss and profit-target'
+        '• No live quotes could be read for both legs, so stop-loss and profit-target'
       );
       console.log(
-        '  levels cannot be projected. Fix the session token (refresh it from the'
+        '  levels cannot be projected. Fix the session token / public ticker feed'
       );
-      console.log('  browser) and re-run — do not trade on invented levels.');
+      console.log('  and re-run — do not trade on invented levels.');
       console.log('------------------------------------------------------------------------\n');
       console.log('✅ [Plan] Plan execution complete. NO ORDERS were placed.');
       return;
     }
 
-    const totalEstCredit = callEst + putEst;
-    const callSL = callEst * config.riskConfig.stopLossMultiplier;
-    const putSL = putEst * config.riskConfig.stopLossMultiplier;
+    const totalEstCredit = effectiveCallPrice + effectivePutPrice;
+    const callSL = effectiveCallPrice * config.riskConfig.stopLossMultiplier;
+    const putSL = effectivePutPrice * config.riskConfig.stopLossMultiplier;
     const targetProfit = totalEstCredit * config.riskConfig.profitTargetRatio;
 
-    console.log('\n--- Projected Straddle Levels (Mark: $' + callEst + ' / $' + putEst + ') ---');
+    console.log(`\n--- Projected Straddle Levels (Order Type: ${config.entryOrderType}) ---`);
+    if (callBid > 0 && putBid > 0) {
+      console.log(`• Marketable Limit Quote (Bid): CALL $${callBid.toFixed(2)} | PUT $${putBid.toFixed(2)}`);
+      console.log(`• Exchange Stop-Loss Sent: CALL $${callSL.toFixed(2)} | PUT $${putSL.toFixed(2)}`);
+    } else {
+      console.log(`• Fallback Mark Price: CALL $${callEst.toFixed(2)} | PUT $${putEst.toFixed(2)}`);
+    }
     console.log(`• Estimated Combined Credit: $${totalEstCredit.toFixed(2)} pts`);
     console.log(`• Call Leg Stop Loss (+100%): $${callSL.toFixed(2)}`);
     console.log(`• Put Leg Stop Loss (+100%) : $${putSL.toFixed(2)}`);
