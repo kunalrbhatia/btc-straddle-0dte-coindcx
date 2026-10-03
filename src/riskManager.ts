@@ -2,6 +2,7 @@ import { CoinDCXClient } from './client';
 import { AppConfig } from './config';
 import { Notifier } from './notifier';
 import { saveStraddleState } from './stateStore';
+import { recordMtmLog } from './mtmWatcher';
 import {
   ActiveLeg,
   EntryPriceSource,
@@ -338,6 +339,9 @@ export async function monitorStraddleRisk(
         const callPnL = calculateLegPnL(state.callLeg);
         const putPnL = calculateLegPnL(state.putLeg);
         state.combinedPnLPoints = callPnL + putPnL;
+
+        // Record MTM to daily log file
+        void recordMtmLog(state.combinedPnLPoints, new Date(), state.date);
 
         console.log(
           `[Monitor] CALL: $${state.callLeg.currentPrice.toFixed(2)} (${state.callLeg.status}) | ` +

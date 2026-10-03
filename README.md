@@ -13,6 +13,7 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
 - **No Fabricated Prices**: Fill prices are parsed strictly from actual execution responses or validated live contract mark prices; never defaults to arbitrary numbers.
 - **Defense in Depth**: Leg close commands will never fire without confirmation that the position was successfully opened.
 - **State Persistence & Recovery**: Atomic disk writes to `state/straddle-state-<YYYY-MM-DD>.json` on every state transition. Automatically reconciles and resumes monitoring of open positions upon crash or restart.
+- **MTM Watcher Logging**: Real-time tick-by-tick mark-to-market PnL tracking appended to daily log files (`logs/mtm-<YYYY-MM-DD>.log`) formatted with timestamp and current MTM.
 - **Idempotency Guard**: Guarantees that today's entry is executed only once, skipping duplicate runs.
 - **Telegram Alerting**: Integrated Telegram notifications for entries, stop-loss hits, profit target exits, partial failures, and startup reconciliation (gracefully disables if credentials are not provided).
 - **Execution Safeguards**: The `--now` flag requires `ALLOW_INSTANT_EXECUTION=true` in environment to prevent unintentional manual live orders.
@@ -26,12 +27,14 @@ straddle-btc-0dte/
 │   ├── client.ts         # CoinDCX API client & HMAC signing
 │   ├── config.ts         # Environment & strategy configuration
 │   ├── index.ts          # App entry point, startup reconciliation & scheduler
+│   ├── mtmWatcher.ts     # Real-time MTM logging by date
 │   ├── notifier.ts       # Telegram bot alerting module
 │   ├── riskManager.ts    # Fill price resolution, SL/PT tracking & leg closure
 │   ├── scheduler.ts      # Indian Standard Time (IST) timing engine
 │   ├── stateStore.ts     # Atomic state persistence & idempotency checks
 │   ├── straddle.ts       # ATM calculation, execution & partial entry unwinding
 │   └── types.ts          # Strongly-typed interfaces (no `any`)
+├── logs/                 # Daily MTM logs (logs/mtm-YYYY-MM-DD.log) & PM2 logs
 ├── state/                # Ignored directory for persisted daily state files
 ├── .env.example          # Environment variable template
 ├── ecosystem.config.js   # PM2 process supervisor configuration
