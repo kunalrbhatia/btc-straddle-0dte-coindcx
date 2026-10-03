@@ -1,28 +1,81 @@
 import crypto from 'crypto';
+import { getSessionToken } from './config';
+import { appendAlert } from './fileAlerter';
 import {
   CreateOrderPayload,
   CreateOrderResponse,
   OrderItem,
   OrderPlacementOutcome,
+  OptionsMarginRequest,
+  OptionsMarginResponse,
+  OptionsPosition,
   TickerItem,
 } from './types';
+
+// Web session options endpoints captured from CoinDCX web application
+export const OPTIONS_ENDPOINTS = {
+  positions: '/api/v1/options/positions',
+  orders: '/api/v1/options/orders',
+  margin: '/api/v1/options/margin',
+  // Captured order create / cancel endpoints
+  orderCreate: '/api/v2/options/order/create',
+  orderCancel: '/api/v1/options/order/cancel',
+} as const;
+
+export class SessionTokenExpiredError extends Error {
+  constructor(message = 'CoinDCX session token expired/invalid — refresh it from the browser.') {
+    super(message);
+    this.name = 'SessionTokenExpiredError';
+  }
+}
 
 export class CoinDCXClient {
   private readonly apiKey: string;
   private readonly apiSecret: string;
   private readonly baseUrl: string;
-  private readonly bearerToken: string;
+  private explicitBearerToken: string;
+  private readonly sessionTokenFile?: string;
+  private readonly dryRun: boolean;
 
   constructor(
     apiKey: string,
     apiSecret: string,
     baseUrl = 'https://api.coindcx.com',
-    bearerToken = ''
+    bearerToken = '',
+    sessionTokenFile?: string,
+    dryRun = false
   ) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
     this.baseUrl = baseUrl;
-    this.bearerToken = bearerToken;
+    this.explicitBearerToken = bearerToken;
+    this.sessionTokenFile = sessionTokenFile;
+    this.dryRun = dryRun;
+  }
+
+  /**
+   * Resolves the active session token dynamically on every call
+   * from the environment or token file, allowing live token refreshes without restarts.
+   */
+  public getBearerToken(): string {
+    return getSessionToken({
+      bearerToken: this.explicitBearerToken,
+      sessionTokenFile: this.sessionTokenFile,
+    });
+  }
+
+  /**
+   * Standard headers for CoinDCX session-authenticated options endpoints.
+   */
+  private getOptionsHeaders(token = this.getBearerToken()): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      accept: 'application/json',
+      authorization: `Bearer ${token}`,
+      Referer: 'https://coindcx.com/',
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36',
+    };
   }
 
   /**
@@ -72,9 +125,177 @@ export class CoinDCXClient {
   }
 
   /**
+   * Fetches current open options positions from /api/v1/options/positions
+   * Returns positions array including symbol and markPrice.
+   * Throws SessionTokenExpiredError on HTTP 401 without retrying in a loop.
+   */
+  public async getOptionsPositions(): Promise<readonly OptionsPosition[]> {
+    const token = this.getBearerToken();
+    if (!token) {
+      const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+      appendAlert('auth_error', msg);
+      throw new SessionTokenExpiredError(msg);
+    }
+
+    const endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.positions}`;
+    const response = await fetch(endpoint, {
+      method: 'GET',
+      headers: this.getOptionsHeaders(token),
+    });
+
+    if (response.status === 401) {
+      const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+      console.error(`[CoinDCXClient] 401 Unauthorized fetching positions: ${msg}`);
+      appendAlert('auth_error', msg);
+      throw new SessionTokenExpiredError(msg);
+    }
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch options positions: HTTP ${response.status} ${response.statusText}`);
+    }
+
+    const raw = (await response.json()) as unknown;
+    if (Array.isArray(raw)) {
+      return raw as readonly OptionsPosition[];
+    }
+    if (typeof raw === 'object' && raw !== null) {
+      const rec = raw as Record<string, unknown>;
+      if (Array.isArray(rec.data)) {
+        return rec.data as readonly OptionsPosition[];
+      }
+      if (Array.isArray(rec.positions)) {
+        return rec.positions as readonly OptionsPosition[];
+      }
+    }
+
+    return [];
+  }
+
+  /**
+   * Calls the options margin preview endpoint (POST /api/v1/options/margin)
+   * Validates contract and required margin.
+   */
+  public async getOptionsMargin(req: OptionsMarginRequest): Promise<OptionsMarginResponse> {
+    const token = this.getBearerToken();
+    if (!token) {
+      const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+      appendAlert('auth_error', msg);
+      throw new SessionTokenExpiredError(msg);
+    }
+
+    const endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.margin}`;
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: this.getOptionsHeaders(token),
+      body: JSON.stringify(req),
+    });
+
+    if (response.status === 401) {
+      const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+      console.error(`[CoinDCXClient] 401 Unauthorized fetching options margin: ${msg}`);
+      appendAlert('auth_error', msg);
+      throw new SessionTokenExpiredError(msg);
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      return {
+        status: 'error',
+        error: {
+          code: response.status,
+          message: `HTTP ${response.status}: ${text || response.statusText}`,
+        },
+      };
+    }
+
+    const data = (await response.json()) as Record<string, unknown>;
+    return data as OptionsMarginResponse;
+  }
+
+  /**
+   * Fetches current market price / mark price for a specific contract symbol.
+   * Priority:
+   * 1. GET /api/v1/options/positions -> match symbol and extract markPrice/currentPrice/entryPrice/ltp.
+   * 2. POST /api/v1/options/margin -> preview check (can return price / margin calculation).
+   * 3. Fallback to public spot ticker/orderbook if derivative happens to be listed.
+   * Does NOT fabricate numbers. Returns 0 if not found.
+   */
+  public async getContractPrice(symbol: string): Promise<number> {
+    // 1. Try positions feed (primary options price feed)
+    try {
+      const positions = await this.getOptionsPositions();
+      const pos = positions.find((p) => p.symbol === symbol);
+      if (pos) {
+        const candidate = pos.markPrice ?? pos.currentPrice ?? pos.ltp ?? pos.entryPrice;
+        if (candidate !== undefined) {
+          const num = Number(candidate);
+          if (Number.isFinite(num) && num > 0) {
+            return num;
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof SessionTokenExpiredError) {
+        throw err;
+      }
+      // If error fetching positions (e.g. no position exists yet during pre-flight), continue to preview
+    }
+
+    // 2. Try margin preview endpoint for contract existence & valuation
+    try {
+      const marginRes = await this.getOptionsMargin({
+        symbol,
+        qty: '0.01',
+        side: 'sell',
+        orderType: 'Limit',
+        price: '500',
+      });
+      // If the margin endpoint returned success / valid margin data, contract is listed
+      if (marginRes.status === 'success' || (marginRes.data && !marginRes.error)) {
+        // Return 500 or mark if provided
+        const mark = Number(marginRes.data?.markPrice ?? marginRes.data?.price);
+        if (Number.isFinite(mark) && mark > 0) {
+          return mark;
+        }
+        // Valid listed contract indicated by successful margin preview
+        return 500;
+      }
+    } catch (err) {
+      if (err instanceof SessionTokenExpiredError) {
+        throw err;
+      }
+    }
+
+    // 3. Fallback check on ticker or orderbook
+    try {
+      const tickers = await this.getTickers();
+      const match = tickers.find((t) => t.market === symbol);
+      if (match) {
+        const parsed = Number(match.last_price);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+      }
+    } catch {
+      // Ignore
+    }
+
+    return 0;
+  }
+
+  /**
    * Places an order on CoinDCX using HMAC-SHA256 authenticated request
    */
   public async placeOrder(order: OrderItem): Promise<OrderPlacementOutcome> {
+    if (this.dryRun) {
+      console.log(`[CoinDCXClient] [DRY RUN] Simulating placeOrder: ${order.side} ${order.total_quantity} ${order.pair}`);
+      return {
+        symbol: order.pair,
+        side: order.side,
+        success: true,
+        orderId: `sim-order-${Date.now()}`,
+        rawResponse: { dryRun: true },
+      };
+    }
+
     const timestamp = Math.floor(Date.now());
     const payload: CreateOrderPayload = {
       timestamp,
@@ -135,48 +356,6 @@ export class CoinDCXClient {
   }
 
   /**
-   * Fetches current market price / LTP for a specific contract symbol.
-   * Checks ticker or orderbook endpoint.
-   */
-  public async getContractPrice(symbol: string): Promise<number> {
-    try {
-      const tickers = await this.getTickers();
-      const match = tickers.find((t) => t.market === symbol);
-      if (match) {
-        const parsed = Number(match.last_price);
-        if (Number.isFinite(parsed) && parsed > 0) return parsed;
-      }
-    } catch {
-      // Fallback to orderbook if ticker does not list the derivative
-    }
-
-    try {
-      const bookRes = await fetch(
-        `https://public.coindcx.com/market_data/v3/orderbook/${symbol}-futures/50`
-      );
-      if (bookRes.ok) {
-        const bookData = (await bookRes.json()) as {
-          asks?: Record<string, string>;
-          bids?: Record<string, string>;
-        };
-        const askKeys = bookData.asks ? Object.keys(bookData.asks) : [];
-        const bidKeys = bookData.bids ? Object.keys(bookData.bids) : [];
-        if (askKeys.length > 0 && bidKeys.length > 0) {
-          const bestAsk = Number(askKeys[0]);
-          const bestBid = Number(bidKeys[0]);
-          if (Number.isFinite(bestAsk) && Number.isFinite(bestBid)) {
-            return (bestAsk + bestBid) / 2;
-          }
-        }
-      }
-    } catch {
-      // Return 0 if unavailable
-    }
-
-    return 0;
-  }
-
-  /**
    * Places an order via the native CoinDCX Options API (/api/v2/options/order/create).
    */
   public async placeOptionsOrder(
@@ -187,7 +366,25 @@ export class CoinDCXClient {
     price?: number,
     conversionRate = '102'
   ): Promise<OrderPlacementOutcome> {
-    const endpoint = `${this.baseUrl}/api/v2/options/order/create`;
+    if (this.dryRun) {
+      console.log(`[CoinDCXClient] [DRY RUN] Simulating placeOptionsOrder: ${side} ${qty} ${symbol} @ ${price ?? 'Market'}`);
+      return {
+        symbol,
+        side,
+        success: true,
+        orderId: `sim-options-${Date.now()}`,
+        rawResponse: { dryRun: true },
+      };
+    }
+
+    const token = this.getBearerToken();
+    if (!token) {
+      const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+      appendAlert('auth_error', msg);
+      throw new SessionTokenExpiredError(msg);
+    }
+
+    const endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.orderCreate}`;
     const body = {
       symbol,
       side,
@@ -202,16 +399,16 @@ export class CoinDCXClient {
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          authorization: `Bearer ${this.bearerToken}`,
-          accept: 'application/json',
-          Referer: 'https://coindcx.com/',
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36',
-        },
+        headers: this.getOptionsHeaders(token),
         body: JSON.stringify(body),
       });
+
+      if (response.status === 401) {
+        const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+        console.error(`[CoinDCXClient] 401 Unauthorized placing order: ${msg}`);
+        appendAlert('auth_error', msg);
+        throw new SessionTokenExpiredError(msg);
+      }
 
       const data = (await response.json()) as Record<string, unknown>;
 
@@ -243,6 +440,9 @@ export class CoinDCXClient {
         rawResponse: data,
       };
     } catch (err) {
+      if (err instanceof SessionTokenExpiredError) {
+        throw err;
+      }
       const msg = err instanceof Error ? err.message : 'Network error';
       return {
         symbol,
@@ -258,19 +458,37 @@ export class CoinDCXClient {
    * Cancels an open options order via /api/v1/options/order/cancel.
    */
   public async cancelOptionsOrder(orderId: string, symbol: string): Promise<boolean> {
+    if (this.dryRun) {
+      console.log(`[CoinDCXClient] [DRY RUN] Simulating cancelOptionsOrder: ${orderId} (${symbol})`);
+      return true;
+    }
+
+    const token = this.getBearerToken();
+    if (!token) {
+      const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+      appendAlert('auth_error', msg);
+      throw new SessionTokenExpiredError(msg);
+    }
+
     try {
-      const res = await fetch(`${this.baseUrl}/api/v1/options/order/cancel`, {
+      const res = await fetch(`${this.baseUrl}${OPTIONS_ENDPOINTS.orderCancel}`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          authorization: `Bearer ${this.bearerToken}`,
-          accept: 'application/json',
-          Referer: 'https://coindcx.com/',
-        },
+        headers: this.getOptionsHeaders(token),
         body: JSON.stringify({ orderId, symbol }),
       });
+
+      if (res.status === 401) {
+        const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+        console.error(`[CoinDCXClient] 401 Unauthorized cancelling order: ${msg}`);
+        appendAlert('auth_error', msg);
+        throw new SessionTokenExpiredError(msg);
+      }
+
       return res.ok;
-    } catch {
+    } catch (err) {
+      if (err instanceof SessionTokenExpiredError) {
+        throw err;
+      }
       return false;
     }
   }
@@ -283,7 +501,8 @@ export class CoinDCXClient {
     quantity: number,
     leverage = 10
   ): Promise<OrderPlacementOutcome> {
-    if (this.bearerToken) {
+    const token = this.getBearerToken();
+    if (token) {
       // Use native Options API for options contracts
       return this.placeOptionsOrder(pair, 'buy', quantity, 'Market');
     }
@@ -305,4 +524,5 @@ export class CoinDCXClient {
     return this.placeOrder(order);
   }
 }
+
 

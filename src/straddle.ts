@@ -216,8 +216,9 @@ export async function executeShortStraddle(
   console.log('[Straddle] Sending Sell orders for both legs concurrently...');
 
   // Step 4: Dispatch both sell orders concurrently
+  const hasToken = typeof client.getBearerToken === 'function' ? Boolean(client.getBearerToken()) : Boolean(config.bearerToken);
   const [callOutcome, putOutcome]: [OrderPlacementOutcome, OrderPlacementOutcome] =
-    config.bearerToken
+    hasToken
       ? await Promise.all([
           client.placeOptionsOrder(
             legs.callSymbol,
