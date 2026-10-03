@@ -1,0 +1,29 @@
+{
+  "name": "straddle-btc-0dte",
+  "version": "1.0.0",
+  "description": "CoinDCX BTC 0DTE ATM Straddle Automated Seller",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "coindcx",
+    "bitcoin",
+    "straddle",
+    "0dte",
+    "options",
+    "crypto"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}
