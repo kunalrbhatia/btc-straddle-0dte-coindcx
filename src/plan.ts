@@ -27,7 +27,10 @@ export async function runPlan(): Promise<void> {
   );
 
   console.log(`[Plan] Using Strike Step: ${config.strikeStep} (CoinDCX 250-strike grid)`);
-  console.log(`[Plan] Target Execution Time: ${config.scheduledHourIST}:${String(config.scheduledMinuteIST).padStart(2, '0')} IST`);
+  console.log(
+    `[Plan] Target Execution Time: ${config.scheduledHourIST}:${String(config.scheduledMinuteIST).padStart(2, '0')} IST`
+  );
+  console.log(`[Plan] Conversion Rate: ${await client.resolveConversionRate()} (live USDT/INR)`);
   console.log(`[Plan] Margin Currency: ${config.marginCurrency}`);
   console.log(`[Plan] Order Quantity: ${config.orderQuantity} BTC per leg`);
   console.log(`[Plan] Leverage: ${config.leverage}x\n`);

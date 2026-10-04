@@ -53,7 +53,8 @@ async function main(): Promise<void> {
     config.baseUrl,
     config.bearerToken,
     config.sessionTokenFile,
-    config.dryRun
+    config.dryRun,
+    { fallbackConversionRate: String(config.conversionRate) }
   );
 
   const todayStr = getTodayDateStringIST();

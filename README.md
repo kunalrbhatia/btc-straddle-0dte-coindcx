@@ -112,6 +112,8 @@ COINDCX_SESSION_FILE=./session.token
 ORDER_QUANTITY=0.01
 LEVERAGE=10
 MARGIN_CURRENCY=USDT
+# FALLBACK ONLY: the bot sends the live USDT/INR rate (read per entry from CoinDCX
+# public market data). This value is used solely when that lookup fails.
 CONVERSION_RATE=102
 STRIKE_STEP=250
 EXECUTION_HOUR_IST=18

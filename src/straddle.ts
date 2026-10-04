@@ -306,8 +306,7 @@ export async function executeShortStraddle(
             config.entryOrderType,
             callPrice,
             callStopLoss,
-            '',
-            String(config.conversionRate)
+            ''
           ),
           client.placeOptionsOrder(
             legs.putSymbol,
@@ -316,8 +315,7 @@ export async function executeShortStraddle(
             config.entryOrderType,
             putPrice,
             putStopLoss,
-            '',
-            String(config.conversionRate)
+            ''
           ),
         ])
       : await Promise.all([
