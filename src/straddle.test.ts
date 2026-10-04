@@ -480,10 +480,9 @@ describe('Straddle Execution & Unwind Tests', () => {
           rawResponse: { status: 'open' },
         }),
         getOpenOptionsOrders: async () => [
-          // Still resting on the book => NOT filled. Field names match the live API
-          // shape (orderId / orderStatus / cumExecValue).
-          { orderId: 'ord-resting-C', symbol: CURRENT.callSymbol, orderStatus: 'New', cumExecValue: '0' },
-          { orderId: 'ord-resting-P', symbol: CURRENT.putSymbol, orderStatus: 'New', cumExecValue: '0' },
+          // Still resting on the book => NOT filled. Order IDs match placeOptionsOrder returns.
+          { orderId: `ord-${CURRENT.callSymbol}`, symbol: CURRENT.callSymbol, orderStatus: 'New', cumExecValue: '0' },
+          { orderId: `ord-${CURRENT.putSymbol}`, symbol: CURRENT.putSymbol, orderStatus: 'New', cumExecValue: '0' },
         ],
         cancelOptionsOrder: async (orderId: string) => {
           cancelled.push(orderId);
