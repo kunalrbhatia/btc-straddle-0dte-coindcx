@@ -465,7 +465,15 @@ export class CoinDCXClient {
       }
 
       if (!response.ok) {
-        return [];
+        // NEVER return [] here. An empty list means "no open orders", and the fill
+        // poller treats absence-from-open-orders as FILLED. Returning [] for a
+        // failed request would therefore make a transient 5xx/network blip look
+        // like "both legs filled", skipping every cancel/unwind branch and
+        // starting risk management on a position that may not exist — or worse,
+        // leaving a one-sided fill unhedged. Throw so the poller retries instead.
+        throw new Error(
+          `Failed to fetch open options orders: HTTP ${response.status} ${response.statusText}`
+        );
       }
 
       const json = (await response.json()) as unknown;
@@ -491,7 +499,8 @@ export class CoinDCXClient {
       if (err instanceof SessionTokenExpiredError) {
         throw err;
       }
-      return [];
+      // Propagate the failure: "could not read open orders" is NOT "no open orders".
+      throw err instanceof Error ? err : new Error(String(err));
     }
   }
 
