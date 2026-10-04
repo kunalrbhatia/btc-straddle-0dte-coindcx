@@ -320,4 +320,72 @@ describe('Risk Manager Unit Tests', () => {
       assert.equal(notifiedClosed, true);
     });
   });
+
+  describe('monitorStraddleRisk loud feed failure check', () => {
+    it('notifies and logs loud error when price feed returns 0 (unavailable mark)', async () => {
+      let notifiedErrorContext = '';
+      const mockNotifier: Notifier = {
+        isEnabled: true,
+        notifyStraddleEntered: async () => {},
+        notifyLegClosed: async () => {},
+        notifyScenarioResolved: async () => {},
+        notifyEntryAborted: async () => {},
+        notifyError: async (context: string) => {
+          notifiedErrorContext = context;
+        },
+        notifyReconciliation: async () => {},
+      };
+
+      const failingClient = {
+        getContractPrice: async () => 0, // returns 0 when feed cannot be read
+        closePosition: async () => ({ success: true, orderId: 'test-close' }),
+      } as unknown as CoinDCXClient;
+
+      const state: StraddlePositionState = {
+        date: '2026-10-04',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: 'BTC-5OCT26-85500-C-USDT',
+          entryPrice: 320,
+          entryPriceSource: 'fill',
+          stopLossPrice: 640,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 320,
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: 'BTC-5OCT26-85500-P-USDT',
+          entryPrice: 365,
+          entryPriceSource: 'fill',
+          stopLossPrice: 730,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 365,
+        },
+        totalCreditReceived: 685,
+        targetProfitPoints: 376.75,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+
+      // Set pollIntervalMs=20 and maxMonitorMinutes ~100ms so at least one poll tick runs
+      const fastConfig = {
+        ...mockConfig,
+        riskConfig: {
+          ...mockConfig.riskConfig,
+          pollIntervalMs: 20,
+          maxMonitorMinutes: 0.002, // 120ms
+        },
+      };
+
+      const { monitorStraddleRisk } = await import('./riskManager');
+      await monitorStraddleRisk(failingClient, state, fastConfig, mockNotifier);
+
+      assert.match(notifiedErrorContext, /monitorStraddleRisk:CALL_price_feed|monitorStraddleRisk:PUT_price_feed/);
+    });
+  });
 });

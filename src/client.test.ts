@@ -52,7 +52,7 @@ describe('CoinDCXClient Options Unit Tests', () => {
     assert.equal(callCount, 1, 'Must not retry in a loop upon receiving 401');
   });
 
-  it('getOptionsPositions maps markPrice correctly', async () => {
+  it('getOptionsPositions maps markPrice correctly for flat payload', async () => {
     global.fetch = async (_url: string | URL | Request) => {
       const positionsData = [
         {
@@ -80,20 +80,63 @@ describe('CoinDCXClient Options Unit Tests', () => {
     assert.equal(positions[1].markPrice, 275);
   });
 
-  it('getContractPrice resolves mark price from positions feed', async () => {
+  it('getOptionsPositions correctly unwraps real production nested payload: { status: "success", data: { data: [...] } }', async () => {
     global.fetch = async (_url: string | URL | Request) => {
-      const positionsData = [
-        {
-          symbol: 'BTC-4OCT26-85000-C-USDT',
-          markPrice: 425.5,
+      const nestedResponse = {
+        status: 'success',
+        data: {
+          data: [
+            {
+              symbol: 'BTC-5OCT26-85500-C-USDT',
+              side: 'sell',
+              qty: '0.01',
+              avgPrice: '320.00',
+              markPrice: '394.20',
+              unrealisedPnl: '-74.20',
+            },
+            {
+              symbol: 'BTC-5OCT26-85500-P-USDT',
+              side: 'sell',
+              qty: '0.01',
+              avgPrice: '365.00',
+              markPrice: '208.20',
+              unrealisedPnl: '+156.80',
+            },
+          ],
         },
-      ];
-      return new Response(JSON.stringify(positionsData), { status: 200 });
+      };
+      return new Response(JSON.stringify(nestedResponse), { status: 200 });
     };
 
     const client = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
-    const markPrice = await client.getContractPrice('BTC-4OCT26-85000-C-USDT');
-    assert.equal(markPrice, 425.5);
+    const positions = await client.getOptionsPositions();
+    assert.equal(positions.length, 2);
+    assert.equal(positions[0].symbol, 'BTC-5OCT26-85500-C-USDT');
+    assert.equal(positions[0].markPrice, '394.20');
+    assert.equal(positions[1].symbol, 'BTC-5OCT26-85500-P-USDT');
+    assert.equal(positions[1].markPrice, '208.20');
+  });
+
+  it('getContractPrice resolves mark price from nested positions feed without falling back to entryPrice', async () => {
+    global.fetch = async (_url: string | URL | Request) => {
+      const nestedResponse = {
+        status: 'success',
+        data: {
+          data: [
+            {
+              symbol: 'BTC-5OCT26-85500-C-USDT',
+              entryPrice: 320,
+              markPrice: 394.5,
+            },
+          ],
+        },
+      };
+      return new Response(JSON.stringify(nestedResponse), { status: 200 });
+    };
+
+    const client = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+    const markPrice = await client.getContractPrice('BTC-5OCT26-85500-C-USDT');
+    assert.equal(markPrice, 394.5, 'Must return live markPrice (394.5), NOT entryPrice (320)');
   });
 
   it('DRY_RUN mode sends no real HTTP network requests for order placement', async () => {

@@ -3,6 +3,7 @@ import { AppConfig } from './config';
 import { Notifier } from './notifier';
 import { saveStraddleState } from './stateStore';
 import { recordMtmLog } from './mtmWatcher';
+import { appendAlert } from './fileAlerter';
 import {
   ActiveLeg,
   EntryPriceSource,
@@ -307,12 +308,19 @@ export async function monitorStraddleRisk(
         }
 
         // Fetch current prices for open legs
+        let anyFeedMissing = false;
         if (state.callLeg.status === 'open') {
           const liveCallPrice = await client.getContractPrice(state.callLeg.symbol);
           if (liveCallPrice > 0) {
             state.callLeg.currentPrice = liveCallPrice;
           } else {
-            console.warn(`[Risk Manager] ⚠️ Price feed unavailable for CALL ${state.callLeg.symbol}. Retaining last known price: $${state.callLeg.currentPrice.toFixed(2)}`);
+            anyFeedMissing = true;
+            const msg = `Price feed unavailable for CALL ${state.callLeg.symbol}. Live mark cannot be verified. Retaining last known: $${state.callLeg.currentPrice.toFixed(2)}`;
+            console.error(`[Risk Manager] 🚨 ${msg}`);
+            appendAlert('feed_unavailable', msg, { symbol: state.callLeg.symbol, leg: 'CALL' });
+            if (notifier) {
+              void notifier.notifyError('monitorStraddleRisk:CALL_price_feed', new Error(msg));
+            }
           }
         }
 
@@ -321,8 +329,18 @@ export async function monitorStraddleRisk(
           if (livePutPrice > 0) {
             state.putLeg.currentPrice = livePutPrice;
           } else {
-            console.warn(`[Risk Manager] ⚠️ Price feed unavailable for PUT ${state.putLeg.symbol}. Retaining last known price: $${state.putLeg.currentPrice.toFixed(2)}`);
+            anyFeedMissing = true;
+            const msg = `Price feed unavailable for PUT ${state.putLeg.symbol}. Live mark cannot be verified. Retaining last known: $${state.putLeg.currentPrice.toFixed(2)}`;
+            console.error(`[Risk Manager] 🚨 ${msg}`);
+            appendAlert('feed_unavailable', msg, { symbol: state.putLeg.symbol, leg: 'PUT' });
+            if (notifier) {
+              void notifier.notifyError('monitorStraddleRisk:PUT_price_feed', new Error(msg));
+            }
           }
+        }
+
+        if (anyFeedMissing) {
+          console.warn('[Risk Manager] ⚠️ Position valuation is degraded due to missing mark price(s).');
         }
 
         // Check Individual Leg Stop Losses (100% SL)
