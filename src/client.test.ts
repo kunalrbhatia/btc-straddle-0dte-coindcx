@@ -172,7 +172,7 @@ describe('CoinDCXClient Options Unit Tests', () => {
   });
 
   describe('placeOptionsOrder & payload verification', () => {
-    it('creates Limit order payload matching app schema exactly without conversionRate', async () => {
+    it('creates the live-verified Limit order payload including the required conversionRate', async () => {
       let interceptedUrl = '';
       let interceptedBody: Record<string, unknown> = {};
 
@@ -206,7 +206,7 @@ describe('CoinDCXClient Options Unit Tests', () => {
       assert.equal(interceptedBody.price, '416.00');
       assert.equal(interceptedBody.stopLoss, '832.00');
       assert.equal(interceptedBody.takeProfit, '');
-      assert.equal('conversionRate' in interceptedBody, false, 'conversionRate MUST NOT be present in body');
+      assert.equal(interceptedBody.conversionRate, '102', 'conversionRate IS required by the API (live-verified 400 without it)');
 
       assert.equal(outcome.success, true);
       assert.equal(outcome.orderId, 'ord-v2-100');
