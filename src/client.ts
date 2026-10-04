@@ -226,6 +226,14 @@ export class CoinDCXClient {
     }
     if (typeof raw === 'object' && raw !== null) {
       const rec = raw as Record<string, unknown>;
+      // Nested: { status: 'success', data: { data: [...] } }
+      if (rec.data && typeof rec.data === 'object' && rec.data !== null) {
+        const nested = rec.data as Record<string, unknown>;
+        if (Array.isArray(nested.data)) {
+          return nested.data as readonly OptionsPosition[];
+        }
+      }
+      // Flat or alternative wrappings: { data: [...] } or { positions: [...] }
       if (Array.isArray(rec.data)) {
         return rec.data as readonly OptionsPosition[];
       }
@@ -328,7 +336,8 @@ export class CoinDCXClient {
       const positions = await this.getOptionsPositions();
       const pos = positions.find((p) => p.symbol === symbol);
       if (pos) {
-        const candidate = pos.markPrice ?? pos.currentPrice ?? pos.ltp ?? pos.entryPrice;
+        // Prioritise live mark price and LTP over entry price
+        const candidate = pos.markPrice ?? pos.currentPrice ?? pos.ltp;
         if (candidate !== undefined) {
           const num = Number(candidate);
           if (Number.isFinite(num) && num > 0) {
@@ -345,7 +354,22 @@ export class CoinDCXClient {
 
     // 2. Try the public options ticker endpoint (carries live markPrice and lastPrice for all strikes)
     try {
-      const tickers = await this.getOptionsTicker('BTC', expiryTime);
+      let effectiveExpiryTime = expiryTime;
+      if (!effectiveExpiryTime) {
+        // Parse expiry from contract symbol, e.g. BTC-5OCT26-...
+        const m = symbol.match(/^[A-Z]+-(\d{1,2})([A-Z]{3})(\d{2})-/i);
+        if (m) {
+          const day = parseInt(m[1], 10);
+          const monStr = m[2].toUpperCase();
+          const year = 2000 + parseInt(m[3], 10);
+          const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+          const mon = months.indexOf(monStr);
+          if (mon !== -1) {
+            effectiveExpiryTime = Date.UTC(year, mon, day, 8, 0, 0, 0);
+          }
+        }
+      }
+      const tickers = await this.getOptionsTicker('BTC', effectiveExpiryTime);
       const match = tickers.find((t) => t.symbol === symbol);
       if (match) {
         const candidate = match.markPrice ?? match.lastPrice ?? match.ltp ?? match.askPrice ?? match.bidPrice;
