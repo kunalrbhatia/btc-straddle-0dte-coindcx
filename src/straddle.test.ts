@@ -480,8 +480,10 @@ describe('Straddle Execution & Unwind Tests', () => {
           rawResponse: { status: 'open' },
         }),
         getOpenOptionsOrders: async () => [
-          { id: 'ord-BTC-4OCT26-84750-C-USDT', status: 'open' },
-          { id: 'ord-BTC-4OCT26-84750-P-USDT', status: 'open' },
+          // Still resting on the book => NOT filled. Field names match the live API
+          // shape (orderId / orderStatus / cumExecValue).
+          { orderId: 'ord-resting-C', symbol: CURRENT.callSymbol, orderStatus: 'New', cumExecValue: '0' },
+          { orderId: 'ord-resting-P', symbol: CURRENT.putSymbol, orderStatus: 'New', cumExecValue: '0' },
         ],
         cancelOptionsOrder: async (orderId: string) => {
           cancelled.push(orderId);
