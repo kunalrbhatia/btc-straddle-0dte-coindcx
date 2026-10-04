@@ -30,6 +30,9 @@ export class SessionTokenExpiredError extends Error {
   }
 }
 
+/** How long a live USDT/INR rate is trusted before being re-read. */
+const LIVE_RATE_TTL_MS = 5 * 60 * 1000;
+
 export class CoinDCXClient {
   private readonly apiKey: string;
   private readonly apiSecret: string;
@@ -37,6 +40,10 @@ export class CoinDCXClient {
   private explicitBearerToken: string;
   private readonly sessionTokenFile?: string;
   private readonly dryRun: boolean;
+  /** Fallback USDT/INR rate, used only when the live rate cannot be read. */
+  private readonly fallbackConversionRate: string;
+  private readonly liveConversionRate: boolean;
+  private cachedLiveRate: { value: string; at: number } | null = null;
 
   constructor(
     apiKey: string,
@@ -44,7 +51,8 @@ export class CoinDCXClient {
     baseUrl = 'https://api.coindcx.com',
     bearerToken = '',
     sessionTokenFile?: string,
-    dryRun = false
+    dryRun = false,
+    opts: { fallbackConversionRate?: string; liveConversionRate?: boolean } = {}
   ) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
@@ -52,6 +60,63 @@ export class CoinDCXClient {
     this.explicitBearerToken = bearerToken;
     this.sessionTokenFile = sessionTokenFile;
     this.dryRun = dryRun;
+    this.fallbackConversionRate = opts.fallbackConversionRate ?? '102';
+    this.liveConversionRate = opts.liveConversionRate ?? true;
+  }
+
+  /**
+   * Resolves the `conversionRate` the options order API requires (USDT -> INR).
+   *
+   * Live-first: the venue's own USDT/INR rate is read from public market data and
+   * cached briefly, because a hardcoded rate silently drifts (a stale 102 against
+   * a live 99.45 mis-states INR by ~2.5% on every order). If the rate cannot be
+   * read, the configured fallback is used and the fact is logged — an order is
+   * never blocked, and a rate is never invented.
+   */
+  public async resolveConversionRate(): Promise<string> {
+    if (!this.liveConversionRate) {
+      return this.fallbackConversionRate;
+    }
+    const now = Date.now();
+    if (this.cachedLiveRate && now - this.cachedLiveRate.at < LIVE_RATE_TTL_MS) {
+      return this.cachedLiveRate.value;
+    }
+    const live = await this.fetchUsdtInrRate();
+    if (live === null) {
+      console.warn(
+        `[CoinDCXClient] live USDT/INR unavailable — using configured fallback conversionRate ${this.fallbackConversionRate}`
+      );
+      return this.fallbackConversionRate;
+    }
+    const value = live.toFixed(2);
+    this.cachedLiveRate = { value, at: now };
+    console.log(`[CoinDCXClient] live USDT/INR conversionRate: ${value}`);
+    return value;
+  }
+
+  /** Reads the venue's own USDT/INR rate. Returns null if unavailable — never guesses. */
+  private async fetchUsdtInrRate(): Promise<number | null> {
+    try {
+      const response = await fetch('https://public.coindcx.com/market_data/current_prices', {
+        headers: { accept: 'application/json' },
+      });
+      if (!response.ok) {
+        return null;
+      }
+      const data = (await response.json()) as Record<string, unknown>;
+      for (const [key, val] of Object.entries(data ?? {})) {
+        if (key.toUpperCase().replace(/_/g, '') === 'USDTINR') {
+          const rate = Number(val);
+          // Sanity band — reject absurd quotes rather than propagate them.
+          if (Number.isFinite(rate) && rate > 40 && rate < 250) {
+            return rate;
+          }
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -528,7 +593,7 @@ export class CoinDCXClient {
     price?: number | string,
     stopLoss = '',
     takeProfit = '',
-    conversionRate = '102'
+    conversionRate?: string
   ): Promise<OrderPlacementOutcome> {
     const numPrice =
       typeof price === 'number'
@@ -570,6 +635,8 @@ export class CoinDCXClient {
         : '0';
 
     // Verified against the live API: conversionRate is REQUIRED (its absence is a 400).
+    // Resolve it live (USDT -> INR) unless the caller supplied one explicitly.
+    const resolvedConversionRate = conversionRate ?? (await this.resolveConversionRate());
     const body: Record<string, string> = {
       symbol,
       side,
@@ -578,7 +645,7 @@ export class CoinDCXClient {
       price: priceStr,
       stopLoss: stopLoss || '',
       takeProfit: takeProfit || '',
-      conversionRate: String(conversionRate || '102'),
+      conversionRate: resolvedConversionRate,
     };
 
     try {

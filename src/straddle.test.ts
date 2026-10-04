@@ -10,6 +10,16 @@ import { CoinDCXClient } from './client';
 import { AppConfig } from './config';
 import { Notifier } from './notifier';
 
+/**
+ * Contract symbols for whichever expiry the bot derives RIGHT NOW.
+ *
+ * Tests must not hardcode a date: the entry rolls to the next day once the
+ * 08:00 UTC expiry passes, so a hardcoded 'BTC-4OCT26-...' silently stops
+ * matching the bot's real symbols (and these ticker mocks) after that rollover,
+ * turning a green suite red for reasons that have nothing to do with the code.
+ */
+const CURRENT = generateContractSymbols(84750);
+
 const mockConfig: AppConfig = {
   apiKey: 'test-key',
   apiSecret: 'test-secret',
@@ -54,6 +64,7 @@ describe('Straddle Execution & Unwind Tests', () => {
     // contract produced " does not exist." and wasted the entry window.
     const entry = new Date('2026-10-03T12:45:00.000Z'); // 18:15 IST
     const symbols = generateContractSymbols(84750, entry);
+    // Fixed input date => fixed expected symbols (this test is deliberately date-pinned).
     assert.equal(symbols.callSymbol, 'BTC-4OCT26-84750-C-USDT');
     assert.equal(symbols.putSymbol, 'BTC-4OCT26-84750-P-USDT');
   });
@@ -71,6 +82,7 @@ describe('Straddle Execution & Unwind Tests', () => {
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
       isContractListed: async () => true,
+      resolveConversionRate: async () => '102',
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           callOrderPlaced = true;
@@ -111,6 +123,7 @@ describe('Straddle Execution & Unwind Tests', () => {
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
       isContractListed: async () => true,
+      resolveConversionRate: async () => '102',
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           return {
@@ -166,6 +179,7 @@ describe('Straddle Execution & Unwind Tests', () => {
     const mockClient = {
       getBtcSpotPrice: async () => 84520,
       isContractListed: async () => true,
+      resolveConversionRate: async () => '102',
       placeOrder: async (order: { pair: string }) => {
         if (order.pair.includes('-C-')) {
           return {
@@ -224,6 +238,7 @@ describe('Straddle Execution & Unwind Tests', () => {
       getBtcSpotPrice: async () => 84822,
       // CALL is listed, PUT is not => both must be listed for a straddle
       isContractListed: async (symbol: string) => symbol.includes('-C-'),
+      resolveConversionRate: async () => '102',
       placeOrder: async () => {
         anyOrderSent = true;
         return { symbol: 'x', side: 'sell', success: true, rawResponse: {} };
@@ -277,6 +292,7 @@ describe('Straddle Execution & Unwind Tests', () => {
         return priceCalls <= 4 ? 350 : 10;
       },
       isContractListed: async () => true,
+      resolveConversionRate: async () => '102',
       placeOptionsOrder: async (symbol: string) => {
         ordersSent += 1;
         return { symbol, side: 'sell', success: true, orderId: `id-${ordersSent}`, rawResponse: {} };
@@ -315,6 +331,7 @@ describe('Straddle Execution & Unwind Tests', () => {
       isContractListed: async () => true,
       // No price available anywhere => entry price is unresolvable => state init throws.
       getContractPrice: async () => 0,
+      resolveConversionRate: async () => '102',
       placeOptionsOrder: async (symbol: string) => ({
         symbol,
         side: 'sell',
@@ -363,9 +380,10 @@ describe('Straddle Execution & Unwind Tests', () => {
         getBtcSpotPrice: async () => 84750,
         isContractListed: async () => true,
         getOptionsTicker: async () => [
-          { symbol: 'BTC-4OCT26-84750-C-USDT', bidPrice: '416.00', askPrice: '418.00' },
-          { symbol: 'BTC-4OCT26-84750-P-USDT', bidPrice: '380.50', askPrice: '382.00' },
+          { symbol: CURRENT.callSymbol, bidPrice: '416.00', askPrice: '418.00' },
+          { symbol: CURRENT.putSymbol, bidPrice: '380.50', askPrice: '382.00' },
         ],
+        resolveConversionRate: async () => '102',
         placeOptionsOrder: async (
           symbol: string,
           side: 'buy' | 'sell',
@@ -412,9 +430,10 @@ describe('Straddle Execution & Unwind Tests', () => {
         getBtcSpotPrice: async () => 84750,
         isContractListed: async () => true,
         getOptionsTicker: async () => [
-          { symbol: 'BTC-4OCT26-84750-C-USDT', bidPrice: '0', askPrice: '418.00' }, // bid is 0!
-          { symbol: 'BTC-4OCT26-84750-P-USDT', bidPrice: '380.50', askPrice: '382.00' },
+          { symbol: CURRENT.callSymbol, bidPrice: '0', askPrice: '418.00' }, // bid is 0!
+          { symbol: CURRENT.putSymbol, bidPrice: '380.50', askPrice: '382.00' },
         ],
+        resolveConversionRate: async () => '102',
         placeOptionsOrder: async () => {
           ordersSent++;
           return { symbol: 'x', side: 'sell', success: true, rawResponse: {} };
@@ -448,9 +467,10 @@ describe('Straddle Execution & Unwind Tests', () => {
         getBtcSpotPrice: async () => 84750,
         isContractListed: async () => true,
         getOptionsTicker: async () => [
-          { symbol: 'BTC-4OCT26-84750-C-USDT', bidPrice: '416.00' },
-          { symbol: 'BTC-4OCT26-84750-P-USDT', bidPrice: '380.50' },
+          { symbol: CURRENT.callSymbol, bidPrice: '416.00' },
+          { symbol: CURRENT.putSymbol, bidPrice: '380.50' },
         ],
+        resolveConversionRate: async () => '102',
         placeOptionsOrder: async (symbol: string) => ({
           symbol,
           side: 'sell' as const,
@@ -487,9 +507,10 @@ describe('Straddle Execution & Unwind Tests', () => {
         getBtcSpotPrice: async () => 84750,
         isContractListed: async () => true,
         getOptionsTicker: async () => [
-          { symbol: 'BTC-4OCT26-84750-C-USDT', bidPrice: '416.00' },
-          { symbol: 'BTC-4OCT26-84750-P-USDT', bidPrice: '380.50' },
+          { symbol: CURRENT.callSymbol, bidPrice: '416.00' },
+          { symbol: CURRENT.putSymbol, bidPrice: '380.50' },
         ],
+        resolveConversionRate: async () => '102',
         placeOptionsOrder: async (symbol: string) => {
           if (symbol.includes('-C-')) {
             // Call is filled immediately

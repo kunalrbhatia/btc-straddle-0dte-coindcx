@@ -269,4 +269,35 @@ describe('CoinDCXClient Options Unit Tests', () => {
       assert.match(outcome.orderId ?? '', /^sim-options-/);
     });
   });
+
+  describe('conversionRate resolution', () => {
+    it('uses the live USDT/INR rate, and never invents one', async () => {
+      // 1. live rate available -> use it
+      global.fetch = async (url: string | URL | Request) => {
+        if (String(url).includes('current_prices')) {
+          return new Response(JSON.stringify({ USDTINR: '99.45', INRUSDT: '0.01005' }), {
+            status: 200,
+          });
+        }
+        return new Response('{}', { status: 404 });
+      };
+      const live = new CoinDCXClient('k', 's', 'https://api.coindcx.com', 'tok');
+      assert.equal(await live.resolveConversionRate(), '99.45');
+
+      // 2. rate endpoint failing -> configured fallback; the order still carries a rate
+      global.fetch = async () => new Response('nope', { status: 500 });
+      const down = new CoinDCXClient('k', 's', 'https://api.coindcx.com', 'tok', undefined, false, {
+        fallbackConversionRate: '101.50',
+      });
+      assert.equal(await down.resolveConversionRate(), '101.50');
+
+      // 3. an absurd quote is rejected rather than propagated
+      global.fetch = async () =>
+        new Response(JSON.stringify({ USDTINR: '0.01' }), { status: 200 });
+      const absurd = new CoinDCXClient('k', 's', 'https://api.coindcx.com', 'tok', undefined, false, {
+        fallbackConversionRate: '99.00',
+      });
+      assert.equal(await absurd.resolveConversionRate(), '99.00');
+    });
+  });
 });
