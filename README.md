@@ -2,6 +2,8 @@
 
 Clean and strictly-typed TypeScript application designed to execute a **Short ATM Straddle** (sell ATM Call and Put options) on Bitcoin at **6:15 PM IST** using the CoinDCX API.
 
+📺 **Strategy Video Walkthrough**: [Bitcoin Daily Straddle Option Selling Strategy in Hindi (Theta Gainers)](https://www.youtube.com/watch?v=Mt0uebHIu7s)
+
 ---
 
 ## Verified Exchange Mechanics & Architecture
