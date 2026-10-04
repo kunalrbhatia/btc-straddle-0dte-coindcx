@@ -1,6 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { executeShortStraddle, calculateAtmStrike, generateContractSymbols } from './straddle';
+import {
+  executeShortStraddle,
+  calculateAtmStrike,
+  generateContractSymbols,
+  waitForFills,
+} from './straddle';
 import { CoinDCXClient } from './client';
 import { AppConfig } from './config';
 import { Notifier } from './notifier';
@@ -529,6 +534,74 @@ describe('Straddle Execution & Unwind Tests', () => {
       assert.equal(cancelled.includes('put-unfilled-1'), true, 'unfilled put must be cancelled');
       assert.equal(unwound.length, 1);
       assert.match(unwound[0], /-C-/, 'filled call must be unwound immediately');
+    });
+  });
+
+  describe('Fill confirmation must never trust a failed feed', () => {
+    it('waitForFills reports NOT filled when the orders feed keeps failing', async () => {
+      // Regression guard for the silent-failure hole found in review: getOpenOptionsOrders
+      // used to return [] on a 5xx / network error, and "absent from open orders" means
+      // "filled" — so ONE transient blip made BOTH legs look filled, skipping every
+      // cancel/unwind branch and starting risk management on a position that might not
+      // exist (or leaving a one-sided fill unhedged). It now throws, the poller retries,
+      // and a feed that never recovers reports "not filled" so the caller cancels.
+      let polls = 0;
+      const failingClient = {
+        getOpenOptionsOrders: async () => {
+          polls += 1;
+          throw new Error('Failed to fetch open options orders: HTTP 500');
+        },
+      } as unknown as CoinDCXClient;
+
+      const outcome = {
+        symbol: 'BTC-4OCT26-85000-C-USDT',
+        side: 'sell' as const,
+        success: true,
+        orderId: 'o1',
+        rawResponse: {}, // carries no fill fields
+      };
+
+      const res = await waitForFills(
+        failingClient,
+        'BTC-4OCT26-85000-C-USDT',
+        'BTC-4OCT26-85000-P-USDT',
+        outcome,
+        outcome,
+        250,
+        50
+      );
+
+      assert.equal(res.callFilled, false, 'a failing feed must never imply a fill');
+      assert.equal(res.putFilled, false, 'a failing feed must never imply a fill');
+      assert.ok(polls > 0, 'the poller must retry rather than conclude');
+    });
+
+    it('a confirmed-empty open-orders list is still treated as filled', async () => {
+      // The healthy path must be unchanged: fetch succeeds, order is absent => filled.
+      const healthyClient = {
+        getOpenOptionsOrders: async () => [],
+      } as unknown as CoinDCXClient;
+
+      const outcome = {
+        symbol: 'BTC-4OCT26-85000-C-USDT',
+        side: 'sell' as const,
+        success: true,
+        orderId: 'o2',
+        rawResponse: {},
+      };
+
+      const res = await waitForFills(
+        healthyClient,
+        'BTC-4OCT26-85000-C-USDT',
+        'BTC-4OCT26-85000-P-USDT',
+        outcome,
+        outcome,
+        250,
+        50
+      );
+
+      assert.equal(res.callFilled, true);
+      assert.equal(res.putFilled, true);
     });
   });
 });
