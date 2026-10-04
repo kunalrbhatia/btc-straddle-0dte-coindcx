@@ -497,9 +497,19 @@ export class CoinDCXClient {
 
   /**
    * Places an order via the native CoinDCX Options API (/api/v2/options/order/create).
-   * Matches the CoinDCX web app create payload byte-for-byte:
-   * { symbol, side, orderType, qty, price, stopLoss, takeProfit }
-   * Note: conversionRate is omitted completely from the request body.
+   *
+   * Payload verified against the LIVE API on 2026-10-04 with a real (non-marketable)
+   * order that was accepted and then cancelled:
+   *
+   *   POST /api/v2/options/order/create
+   *   { symbol, side, orderType, qty, price, stopLoss, takeProfit, conversionRate }
+   *   -> 200 {"status":"success","data":{"orderId":"e77823db-…"}}
+   *
+   * ⚠️ `conversionRate` IS REQUIRED. Omitting it returns
+   *  400 {"message":"conversionRate is required"}
+   * An earlier revision of this method dropped it because the app's bundle snippet
+   * did not show it — that was wrong and would have failed every entry.
+   * The order id comes back as `data.orderId`.
    */
   public async placeOptionsOrder(
     symbol: string,
@@ -508,7 +518,8 @@ export class CoinDCXClient {
     orderType: 'Limit' | 'Market' = 'Limit',
     price?: number | string,
     stopLoss = '',
-    takeProfit = ''
+    takeProfit = '',
+    conversionRate = '102'
   ): Promise<OrderPlacementOutcome> {
     const numPrice =
       typeof price === 'number'
@@ -549,7 +560,7 @@ export class CoinDCXClient {
         ? '0.00'
         : '0';
 
-    // The app sends exactly: symbol, side, orderType, qty, price, stopLoss, takeProfit
+    // Verified against the live API: conversionRate is REQUIRED (its absence is a 400).
     const body: Record<string, string> = {
       symbol,
       side,
@@ -558,6 +569,7 @@ export class CoinDCXClient {
       price: priceStr,
       stopLoss: stopLoss || '',
       takeProfit: takeProfit || '',
+      conversionRate: String(conversionRate || '102'),
     };
 
     try {
