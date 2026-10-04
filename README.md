@@ -176,3 +176,15 @@ TELEGRAM_CHAT_ID=
   ```bash
   npm run typecheck
   ```
+
+---
+
+## CoinDCX Referral & Rewards
+
+> **Limited time: ₹10L worth of BTC rewards up for grabs!** 🚀
+> 
+> Trade Spot or Futures on CoinDCX and win assured Bitcoin rewards worth up to ₹10L.
+> Tap here to register: [CoinDCX Referral Sign Up](https://invite.coindcx.com/49594056)
+> 
+> Let's make your first step the right one! 🚀
+
