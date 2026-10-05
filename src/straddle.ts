@@ -12,6 +12,8 @@ import { Notifier } from './notifier';
 import { getTodayDateStringIST, saveStraddleState } from './stateStore';
 import { appendAlert } from './fileAlerter';
 import { classifyExitError } from './reconciliation';
+import { CycleRecordWriter } from './records/cycleRecordWriter';
+import { parseContractExpiryDate } from './reports/reportDataCollector';
 
 export interface PlacementRetryOptions {
   /** Total attempts including the first one. Default 3. */
@@ -791,6 +793,101 @@ export async function executeShortStraddle(
         targetProfit: state.targetProfitPoints,
       });
     }
+
+    // Cycle Record: Write-through logging
+    const expiryDateStr = parseContractExpiryDate(legs.callSymbol) || todayStr;
+    const recordWriter = new CycleRecordWriter(expiryDateStr);
+
+    recordWriter.appendEvent('CYCLE_START', {
+      entryDate: todayStr,
+      strike: legs.atmStrike,
+      callSymbol: legs.callSymbol,
+      putSymbol: legs.putSymbol,
+      quantity: config.orderQuantity,
+      spotPrice: legs.spotPrice,
+    });
+
+    recordWriter.appendEvent('CONFIG_SNAPSHOT', {
+      leverage: config.leverage,
+      orderType: config.entryOrderType,
+      slMultiplier: config.riskConfig.stopLossMultiplier,
+      profitTargetRatio: config.riskConfig.profitTargetRatio,
+    });
+
+    recordWriter.appendEvent('ORDER_PLACED', {
+      legType: 'CALL',
+      symbol: legs.callSymbol,
+      orderId: callOutcome.orderId,
+      limitPrice: callPrice,
+      route: callOutcome.route,
+      traceId: callOutcome.traceId,
+    });
+
+    recordWriter.appendEvent('ORDER_PLACED', {
+      legType: 'PUT',
+      symbol: legs.putSymbol,
+      orderId: putOutcome.orderId,
+      limitPrice: putPrice,
+      route: putOutcome.route,
+      traceId: putOutcome.traceId,
+    });
+
+    recordWriter.appendEvent('ORDER_FILLED', {
+      legType: 'CALL',
+      symbol: state.callLeg.symbol,
+      orderId: state.callLeg.orderId,
+      entryPrice: state.callLeg.entryPrice,
+      venueAvgPrice: state.callLeg.venueAvgPrice,
+      priceSource: state.callLeg.entryPriceSource,
+    });
+
+    recordWriter.appendEvent('ORDER_FILLED', {
+      legType: 'PUT',
+      symbol: state.putLeg.symbol,
+      orderId: state.putLeg.orderId,
+      entryPrice: state.putLeg.entryPrice,
+      venueAvgPrice: state.putLeg.venueAvgPrice,
+      priceSource: state.putLeg.entryPriceSource,
+    });
+
+    recordWriter.appendEvent('STOPS_ARMED', {
+      callStopLossPrice: state.callLeg.stopLossPrice,
+      putStopLossPrice: state.putLeg.stopLossPrice,
+    });
+
+    recordWriter.appendEvent('TARGET_ARMED', {
+      totalCreditReceived: state.totalCreditReceived,
+      targetProfitPoints: state.targetProfitPoints,
+    });
+
+    recordWriter.writeSummarySnapshot({
+      schemaVersion: 1,
+      cycle: expiryDateStr,
+      entryDate: todayStr,
+      updatedAt: new Date().toISOString(),
+      status: 'OPEN',
+      atmStrike: legs.atmStrike,
+      orderQuantity: config.orderQuantity,
+      callSymbol: state.callLeg.symbol,
+      putSymbol: state.putLeg.symbol,
+      totalCreditReceived: state.totalCreditReceived,
+      targetProfitPoints: state.targetProfitPoints,
+      callLeg: {
+        symbol: state.callLeg.symbol,
+        entryPrice: state.callLeg.entryPrice,
+        venueAvgPrice: state.callLeg.venueAvgPrice,
+        status: state.callLeg.status,
+        orderId: state.callLeg.orderId,
+      },
+      putLeg: {
+        symbol: state.putLeg.symbol,
+        entryPrice: state.putLeg.entryPrice,
+        venueAvgPrice: state.putLeg.venueAvgPrice,
+        status: state.putLeg.status,
+        orderId: state.putLeg.orderId,
+      },
+      combinedPnLPoints: 0,
+    });
 
     void monitorStraddleRisk(client, state, config, notifier);
 

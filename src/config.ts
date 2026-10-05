@@ -29,6 +29,10 @@ export interface AppConfig {
   readonly reportDelayMinutes?: number;
   readonly reportGitAuthorName?: string;
   readonly reportGitAuthorEmail?: string;
+  readonly recordDir?: string;
+  readonly verificationTolerance?: number;
+  readonly checkpointIntervalMs?: number;
+  readonly walletPageCap?: number;
 }
 
 export function parseRequiredIntInRange(key: string, min: number, max: number): number {
@@ -137,5 +141,9 @@ export const config: AppConfig = {
   reportDelayMinutes: parseOptionalIntInRange('REPORT_DELAY_MINUTES', 15, 0, 180),
   reportGitAuthorName: process.env.REPORT_GIT_AUTHOR_NAME || 'btc-straddle-0dte bot',
   reportGitAuthorEmail: process.env.REPORT_GIT_AUTHOR_EMAIL || 'bot@straddle-btc-0dte.local',
+  recordDir: process.env.RECORD_DIR || undefined,
+  verificationTolerance: getEnvNumber('VERIFICATION_TOLERANCE', 1.0),
+  checkpointIntervalMs: getEnvNumber('CHECKPOINT_INTERVAL_MS', 300_000), // 5 minutes
+  walletPageCap: parseOptionalIntInRange('WALLET_PAGE_CAP', 10, 1, 50),
 };
 

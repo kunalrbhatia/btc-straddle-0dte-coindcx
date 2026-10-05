@@ -153,6 +153,8 @@ export interface OrderPlacementOutcome {
   readonly limitPrice?: number;
   readonly message?: string;
   readonly rawResponse: Record<string, unknown>;
+  readonly route?: 'V2' | 'V1-fallback' | string;
+  readonly traceId?: string;
 }
 
 export interface StraddleExecutionResult {
@@ -189,6 +191,7 @@ export interface ActiveLeg {
   readonly legType: 'CALL' | 'PUT';
   readonly symbol: string;
   readonly entryPrice: number;
+  readonly venueAvgPrice?: number;
   readonly entryPriceSource: EntryPriceSource;
   readonly stopLossPrice: number;
   readonly quantity: number;

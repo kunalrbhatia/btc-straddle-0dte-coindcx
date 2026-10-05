@@ -11,3 +11,5 @@ __pycache__/
 *.pyc
 reports/*
 !reports/README.md
+records/*
+!records/README.md
