@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "node scripts/run-tests.cjs",
     "test:auth": "ts-node src/testAuth.ts",
-    "refresh-session": "node scripts/refresh-session.cjs"
+    "refresh-session": "node scripts/refresh-session.cjs",
+    "scan-secrets": "node scripts/pre-commit-secrets.cjs",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "keywords": [
     "coindcx",
