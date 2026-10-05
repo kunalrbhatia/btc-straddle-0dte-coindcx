@@ -19,6 +19,7 @@ const mockConfig: AppConfig = {
   baseUrl: 'https://api.coindcx.com',
   scheduledHourIST: 18,
   scheduledMinuteIST: 15,
+  dailyExpiryHourUTC: 8,
   strikeStep: 250,
   orderQuantity: 0.01,
   leverage: 10,

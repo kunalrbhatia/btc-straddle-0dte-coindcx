@@ -19,11 +19,13 @@ Behaviour: silent unless there is something to report. One alert per state
 change (deduped via marker files), plus an hourly heartbeat so silence is
 distinguishable from a dead monitor.
 
-Env overrides:  BTC_MON_DIR (state/markers), BTC_TOKEN_FILE, BTR_STRIKE
+Env overrides:  BTC_MON_DIR (state/markers), BTC_TOKEN_FILE, BTC_REPO_DIR
 """
 
 import json
 import os
+import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -31,10 +33,10 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 
 # ---------------------------------------------------------------- configuration
-TOKEN_FILE = os.environ.get(
-    "BTC_TOKEN_FILE", "/home/ubuntu/btc-straddle-0dte-coindcx/session.token"
-)
 REPO = os.environ.get("BTC_REPO_DIR", "/home/ubuntu/btc-straddle-0dte-coindcx")
+TOKEN_FILE = os.environ.get(
+    "BTC_TOKEN_FILE", os.path.join(REPO, "session.token")
+)
 STATE_DIR = os.environ.get("BTC_MON_DIR", "/home/ubuntu/.hermes/state/btc-pos-monitor")
 API = "https://api.coindcx.com/api/v1/options/positions"
 SPOT_API = "https://api.coindcx.com/exchange/ticker"
@@ -43,15 +45,84 @@ SL_MULTIPLIER = 2.0
 PT_RATIO = 0.55
 NEAR_SL_FRACTION = 0.85  # warn once a leg reaches 85% of its stop level
 
-# Expiry clock: CoinDCX BTC options expire daily at 08:00 UTC (13:30 IST).
-EXPIRY_UTC_HOUR = 8
-
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 )
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# SSL context with graceful fallback for environments where local CA certs fail verification
+_SSL_CTX = None
+try:
+    _SSL_CTX = ssl.create_default_context()
+except Exception:
+    pass
+
+
+def _fetch_urlopen(req, timeout=25):
+    global _SSL_CTX
+    try:
+        if _SSL_CTX:
+            return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX)
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as e:
+        if "CERTIFICATE_VERIFY_FAILED" in str(e):
+            ctx_no_verify = ssl.create_default_context()
+            ctx_no_verify.check_hostname = False
+            ctx_no_verify.verify_mode = ssl.CERT_NONE
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx_no_verify)
+        raise
+
+
+def load_env_expiry_utc_hour() -> int:
+    """
+    Reads DAILY_EXPIRY_HOUR_UTC from .env so the monitor and the bot cannot drift.
+    Logs which value was used, and prints a warning if .env cannot be read.
+    """
+    env_path = os.path.join(REPO, ".env")
+    val_from_env = None
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#") or not line:
+                        continue
+                    if line.startswith("DAILY_EXPIRY_HOUR_UTC="):
+                        val_str = line.split("=", 1)[1].split("#")[0].strip().strip('"').strip("'")
+                        try:
+                            val_from_env = int(val_str)
+                        except ValueError:
+                            pass
+        except Exception as e:
+            print(f"⚠️ BTC MONITOR — warning reading .env: {e}", file=sys.stderr)
+    else:
+        print(f"⚠️ BTC MONITOR — .env not found at {env_path}; using fallback", file=sys.stderr)
+
+    if val_from_env is not None and 0 <= val_from_env <= 23:
+        val = val_from_env
+        src = f"from {env_path}"
+    else:
+        env_os = os.environ.get("DAILY_EXPIRY_HOUR_UTC")
+        if env_os is not None:
+            try:
+                val = int(env_os)
+                src = "from os.environ"
+            except ValueError:
+                val = 8
+                src = "default fallback (8)"
+        else:
+            val = 8
+            src = "default fallback (8)"
+
+    # Log which value is used for visibility
+    # (stderr to keep stdout clean for notifications)
+    print(f"[Monitor Config] Using DAILY_EXPIRY_HOUR_UTC = {val} ({src})", file=sys.stderr)
+    return val
+
+
+EXPIRY_UTC_HOUR = load_env_expiry_utc_hour()
 
 
 def now_ist() -> datetime:
@@ -131,7 +202,7 @@ def new_alert_lines() -> list[str]:
 def http_json(url: str, headers: dict) -> tuple[int, object]:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=25) as r:
+        with _fetch_urlopen(req, timeout=25) as r:
             return r.status, json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         try:
@@ -173,10 +244,111 @@ def fetch_spot() -> float:
 
 
 def next_expiry() -> datetime:
-    """The expiry the open legs belong to — next 08:00 UTC boundary."""
+    """The expiry the open legs belong to — next daily expiry UTC boundary."""
     n = datetime.now(timezone.utc)
     todays = n.replace(hour=EXPIRY_UTC_HOUR, minute=0, second=0, microsecond=0)
     return todays if n < todays else todays + timedelta(days=1)
+
+
+# --------------------------------------------------------- historical artifacts
+def load_historical_position_context(expiry_date_str: str) -> dict | None:
+    """
+    Checks state/straddle-state-<date>.json and logs/ for recorded facts about the position.
+    Returns a dict with:
+      - total_credit
+      - target_profit_points
+      - call_leg: dict (entryPrice, stopLossPrice, status, exitPrice, closeReason)
+      - put_leg: dict
+      - combined_pnl_from_log: float | None
+    """
+    state_dir = os.path.join(REPO, "state")
+    logs_dir = os.path.join(REPO, "logs")
+
+    # The entry state file could be named by entry date:
+    # A position expiring on `expiry_date_str` was entered on that day or the day before.
+    candidate_dates = [expiry_date_str]
+    try:
+        exp_dt = datetime.strptime(expiry_date_str, "%Y-%m-%d")
+        candidate_dates.append((exp_dt - timedelta(days=1)).strftime("%Y-%m-%d"))
+    except Exception:
+        pass
+    candidate_dates.extend([today(), (now_ist() - timedelta(days=1)).strftime("%Y-%m-%d")])
+    # Deduplicate preserving order
+    seen_dates = set()
+    dedup_dates = []
+    for d in candidate_dates:
+        if d not in seen_dates:
+            seen_dates.add(d)
+            dedup_dates.append(d)
+
+    found_state = None
+    state_date_used = None
+    for d in dedup_dates:
+        p = os.path.join(state_dir, f"straddle-state-{d}.json")
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and data.get("entryExecuted"):
+                        found_state = data
+                        state_date_used = d
+                        break
+            except Exception:
+                continue
+
+    # Also check latest MTM log file for authorative combined PnL
+    combined_pnl_from_log = None
+    target_from_log = None
+    for d in ([state_date_used] if state_date_used else []) + dedup_dates:
+        if not d:
+            continue
+        mtm_file = os.path.join(logs_dir, f"mtm-{d}.log")
+        if os.path.exists(mtm_file):
+            try:
+                with open(mtm_file, "r", encoding="utf-8") as f:
+                    lines = [ln.strip() for ln in f if ln.strip()]
+                    for ln in reversed(lines):
+                        m = re.search(r"([\+\-]?[0-9]+(?:\.[0-9]+)?)\s+MTM", ln)
+                        if m:
+                            combined_pnl_from_log = float(m.group(1))
+                            break
+            except Exception:
+                pass
+            if combined_pnl_from_log is not None:
+                break
+
+    # Also check pm2 logs if present for latest [Monitor] line
+    if combined_pnl_from_log is None:
+        for pm2_name in ("pm2-out.log", "pm2-out-5.log"):
+            pm2_file = os.path.join(logs_dir, pm2_name)
+            if os.path.exists(pm2_file):
+                try:
+                    with open(pm2_file, "r", encoding="utf-8") as f:
+                        lines = [ln.strip() for ln in f if "[Monitor]" in ln and "Combined PnL:" in ln]
+                        if lines:
+                            last_ln = lines[-1]
+                            m = re.search(
+                                r"Combined PnL:\s*([\+\-]?[0-9]+(?:\.[0-9]+)?)\s*/\s*([\+\-]?[0-9]+(?:\.[0-9]+)?)\s*pts",
+                                last_ln,
+                            )
+                            if m:
+                                combined_pnl_from_log = float(m.group(1))
+                                target_from_log = float(m.group(2))
+                                break
+                except Exception:
+                    pass
+            if combined_pnl_from_log is not None:
+                break
+
+    if not found_state and combined_pnl_from_log is None:
+        return None
+
+    return {
+        "state": found_state,
+        "combined_pnl_from_log": combined_pnl_from_log,
+        "target_from_log": target_from_log,
+        "date": state_date_used,
+    }
 
 
 # ------------------------------------------------------------------------ main
@@ -241,22 +413,150 @@ def main() -> str:
     if not legs:
         return "\n".join(out)
 
-    credit = sum(l["avg"] for l in legs)
-    current = sum(l["mark"] for l in legs)
-    pnl_points = credit - current
-    pnl_cash = sum(l["upnl"] for l in legs)
-    pt_points = credit * PT_RATIO
+    # Extract contract identity from the first leg
+    sym_parts = legs[0]["symbol"].split("-")
+    contract_expiry_tag = sym_parts[1].upper() if len(sym_parts) > 1 else ""
+    strike = sym_parts[2] if len(sym_parts) > 2 else "0"
+
+    # Derive calendar date string of the contract expiry
+    expiry_date_str = today()
+    try:
+        # e.g. '5OCT26' or '05OCT26'
+        clean_tag = contract_expiry_tag.zfill(7)
+        parsed_dt = datetime.strptime(clean_tag, "%d%b%y")
+        expiry_date_str = parsed_dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    # Load recorded facts from bot artifacts (state store / MTM log)
+    hist_ctx = load_historical_position_context(expiry_date_str)
+    hist_state = hist_ctx.get("state") if hist_ctx else None
+
+    # Track closed legs when only 1 leg is open
+    closed_legs_info: list[dict] = []
+    realised_pnl_unknown = False
+    total_realised_pnl = 0.0
+
+    original_credit = 0.0
+    original_pt_points = 0.0
+
+    if hist_state:
+        original_credit = float(hist_state.get("totalCreditReceived") or 0.0)
+        original_pt_points = float(hist_state.get("targetProfitPoints") or 0.0)
+        call_active = hist_state.get("callLeg") or {}
+        put_active = hist_state.get("putLeg") or {}
+
+        open_kinds = {l["kind"] for l in legs}
+        # If CALL is closed
+        if "C" not in open_kinds and call_active:
+            call_exit = call_active.get("exitPrice")
+            call_entry = float(call_active.get("entryPrice") or 0.0)
+            call_sl = float(call_active.get("stopLossPrice") or call_entry * SL_MULTIPLIER)
+            call_reason = call_active.get("closeReason") or "CLOSED"
+            if call_exit is not None:
+                call_exit_val = float(call_exit)
+                call_realised = call_entry - call_exit_val
+            elif call_active.get("status") == "closed":
+                call_exit_val = call_sl
+                call_realised = call_entry - call_exit_val
+            else:
+                call_exit_val = None
+                call_realised = None
+
+            closed_legs_info.append({
+                "kind": "C",
+                "legType": "CALL",
+                "symbol": call_active.get("symbol", f"BTC-{contract_expiry_tag}-{strike}-C-USDT"),
+                "entry": call_entry,
+                "exit": call_exit_val,
+                "sl": call_sl,
+                "realised": call_realised,
+                "reason": call_reason,
+            })
+
+        # If PUT is closed
+        if "P" not in open_kinds and put_active:
+            put_exit = put_active.get("exitPrice")
+            put_entry = float(put_active.get("entryPrice") or 0.0)
+            put_sl = float(put_active.get("stopLossPrice") or put_entry * SL_MULTIPLIER)
+            put_reason = put_active.get("closeReason") or "CLOSED"
+            if put_exit is not None:
+                put_exit_val = float(put_exit)
+                put_realised = put_entry - put_exit_val
+            elif put_active.get("status") == "closed":
+                put_exit_val = put_sl
+                put_realised = put_entry - put_exit_val
+            else:
+                put_exit_val = None
+                put_realised = None
+
+            closed_legs_info.append({
+                "kind": "P",
+                "legType": "PUT",
+                "symbol": put_active.get("symbol", f"BTC-{contract_expiry_tag}-{strike}-P-USDT"),
+                "entry": put_entry,
+                "exit": put_exit_val,
+                "sl": put_sl,
+                "realised": put_realised,
+                "reason": put_reason,
+            })
+
+    # Fallback to credit/pt derivation
+    if original_credit <= 0:
+        if len(legs) == 2:
+            original_credit = sum(l["avg"] for l in legs)
+            original_pt_points = original_credit * PT_RATIO
+        elif hist_ctx and hist_ctx.get("target_from_log"):
+            original_pt_points = float(hist_ctx["target_from_log"])
+            original_credit = original_pt_points / PT_RATIO
+        else:
+            # Partial leg without recorded history
+            original_credit = sum(l["avg"] for l in legs)
+            original_pt_points = original_credit * PT_RATIO
+
+    credit = original_credit
+    pt_points = original_pt_points
+
+    # Calculate combined PnL
+    # Sum unrealised points for surviving legs: entry - mark
+    surviving_unrealised_points = sum(l["avg"] - l["mark"] for l in legs)
+    surviving_unrealised_cash = sum(l["upnl"] for l in legs)
+
+    pnl_points = None
+    if len(legs) == 2:
+        pnl_points = surviving_unrealised_points
+    elif len(legs) < 2:
+        # Check if we have authoritative MTM log
+        if hist_ctx and hist_ctx.get("combined_pnl_from_log") is not None:
+            pnl_points = float(hist_ctx["combined_pnl_from_log"])
+        else:
+            # Compute from realised + unrealised if recorded
+            all_realised_known = (
+                len(closed_legs_info) > 0 and
+                all(c["realised"] is not None for c in closed_legs_info)
+            )
+            if all_realised_known:
+                total_realised = sum(c["realised"] for c in closed_legs_info)
+                pnl_points = total_realised + surviving_unrealised_points
+            else:
+                pnl_points = None
+                realised_pnl_unknown = True
+
+    pnl_cash = surviving_unrealised_cash
     expires = next_expiry()
     hours_left = (expires - datetime.now(timezone.utc)).total_seconds() / 3600
 
     # ---- INR reporting (the user reads P&L in rupees)
-    # pnl_cash is USDT and pnl_points is premium points, so their ratio gives the
-    # points->USDT factor (= position size) without hardcoding it.
-    usd_per_point = (pnl_cash / pnl_points) if pnl_points else 0.01
+    usd_per_point = 0.01  # Standard position lot: 0.01 BTC
+    if pnl_points is not None and abs(pnl_points) > 0.001 and abs(surviving_unrealised_points) > 0.001:
+        usd_per_point = abs(surviving_unrealised_cash / surviving_unrealised_points)
+
     inr_rate = usdt_inr_rate()
 
-    def inr(points: float) -> str:
+    def inr(points: float | None) -> str:
         """Format a premium-points figure in rupees, or say so if the rate is unknown."""
+        if points is None:
+            return "Rs UNAVAILABLE"
         if not inr_rate:
             return "Rs rate N/A"
         return f"Rs {points * usd_per_point * inr_rate:,.2f}"
@@ -264,49 +564,57 @@ def main() -> str:
     def performance_block(title: str = "TRADE PERFORMANCE", note: str = "") -> str:
         """
         The house layout for performance reports: an emoji on every line, bold
-        titles, Put before Call. Used by both the entry announcement and the
-        recurring heartbeat so they can never drift apart.
+        titles, Put before Call.
         """
-        pct = (pnl_points / pt_points * 100) if pt_points else 0.0
-        remaining = max(0.0, 100.0 - pct)
-        spot = fetch_spot()  # fetched here so the block never depends on call order
-        strike = legs[0]["symbol"].split("-")[2]
-        legs_sorted = sorted(legs, key=lambda x: 0 if x["kind"] == "P" else 1)
-        strikes = "\n".join(
-            f"{'🔻 Put' if l['kind'] == 'P' else '🔺 Call'}: {strike} —> "
-            f"{l['mark']:.0f}/{l['sl']:.0f}"
-            for l in legs_sorted
-        )
+        if pnl_points is not None and pt_points > 0:
+            pct = (pnl_points / pt_points * 100)
+            remaining = max(0.0, 100.0 - pct)
+            target_line = (
+                f"🎯 **Target:** {pnl_points:+.0f}/{pt_points:.0f} pts "
+                f"({pct:.0f}% achieved), remaining {remaining:.0f}%"
+            )
+        else:
+            target_line = "🎯 **Target:** realised P&L UNAVAILABLE (partial leg set)"
+
+        spot = fetch_spot()
+
+        # Build strike display showing both legs (open or closed)
+        strikes_rows = []
+        for kind in ("P", "C"):
+            open_leg = next((l for l in legs if l["kind"] == kind), None)
+            closed_leg = next((c for c in closed_legs_info if c["kind"] == kind), None)
+            label = "🔻 Put" if kind == "P" else "🔺 Call"
+            if open_leg:
+                strikes_rows.append(f"{label}: {strike} —> {open_leg['mark']:.0f}/{open_leg['sl']:.0f}")
+            elif closed_leg:
+                exit_str = f"{closed_leg['exit']:.0f}" if closed_leg['exit'] is not None else "closed"
+                strikes_rows.append(f"{label}: {strike} —> {exit_str}/{closed_leg['sl']:.0f} (closed)")
+
+        if not strikes_rows:
+            legs_sorted = sorted(legs, key=lambda x: 0 if x["kind"] == "P" else 1)
+            strikes_rows = [
+                f"{'🔻 Put' if l['kind'] == 'P' else '🔺 Call'}: {strike} —> {l['mark']:.0f}/{l['sl']:.0f}"
+                for l in legs_sorted
+            ]
+
+        strikes_str = "\n".join(strikes_rows)
         head = f"📊 **— {title} —**" + (f" ({note})" if note else "")
         return (
             f"{head}\n"
-            f"🎯 **Target:** {pnl_points:+.0f}/{pt_points:.0f} pts "
-            f"({pct:.0f}% achieved), remaining {remaining:.0f}%\n"
+            f"{target_line}\n"
             f"💰 **Total Credit:** {credit:.0f} points ({inr(credit)})\n"
             f"📈 **Spot:** {spot:,.0f}\n"
             f"⚙️ **Strikes:**\n"
-            f"{strikes}\n"
+            f"{strikes_str}\n"
             f"⏰ {hours_left:.1f}h to expiry"
         )
 
     # ---- announce a newly seen position (entry confirmation)
-    # Own it if the bot wrote a state file — keyed by ENTRY date, and a 0DTE entered
-    # yesterday evening is still live today, so accept either day. Otherwise it was
-    # placed by hand.
-    state_dir = os.path.join(REPO, "state")
-    try:
-        yesterday = (now_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
-    except Exception:
-        yesterday = today()
-    bot_owned = any(
-        os.path.exists(os.path.join(state_dir, f"straddle-state-{d}.json"))
-        for d in (today(), yesterday)
-    )
-    # Key the "already announced" marker to the CONTRACT (expiry + legs), not the
-    # calendar day: a position opened yesterday is the same position after midnight,
-    # and re-announcing it (mis-labelled "manual") is pure noise.
-    expiry_tag = next_expiry().strftime("%d%b%y").upper()
-    open_key = "opened_" + expiry_tag + "_" + "_".join(sorted(l["kind"] for l in legs))
+    # Key the marker ONLY to the POSITION IDENTITY (contract expiry + strike),
+    # NOT the leg set and NOT the calendar day. A leg closing is a state change,
+    # not a new position.
+    bot_owned = bool(hist_state)
+    open_key = f"opened_{contract_expiry_tag}_{strike}"
     opened_now = False
     if not seen(open_key):
         mark(open_key)
@@ -314,9 +622,25 @@ def main() -> str:
         who = "bot entry ✅" if bot_owned else "external/manual position"
         out.append(performance_block("TRADE OPENED", who))
 
-    # ---- rule: per-leg stop loss
+    # ---- announce leg state transitions (e.g. stop loss hit or closed)
+    for c in closed_legs_info:
+        closed_marker = f"closed_{contract_expiry_tag}_{strike}_{c['kind']}"
+        if not seen(closed_marker):
+            mark(closed_marker)
+            exit_display = f"{c['exit']:.2f}" if c["exit"] is not None else "stop"
+            if c["realised"] is not None:
+                pnl_str = f"realised {c['realised']:+.0f} pts"
+            else:
+                pnl_str = "realised P&L UNAVAILABLE"
+            other_kind = "PUT" if c["kind"] == "C" else "CALL"
+            out.append(
+                f"🛑 {c['legType']} stopped out at {exit_display} — {pnl_str} · "
+                f"1 leg still open ({other_kind})"
+            )
+
+    # ---- rule: per-leg stop loss for surviving open legs
     for l in legs:
-        key = f"sl_{l['kind']}"
+        key = f"sl_{contract_expiry_tag}_{strike}_{l['kind']}"
         if l["mark"] >= l["sl"]:
             if not seen(key):
                 mark(key)
@@ -328,7 +652,7 @@ def main() -> str:
                     f"👉 Action: BUY TO CLOSE this leg."
                 )
         elif l["mark"] >= l["sl"] * NEAR_SL_FRACTION:
-            key = f"near_{l['kind']}"
+            key = f"near_{contract_expiry_tag}_{strike}_{l['kind']}"
             if not seen(key):
                 mark(key)
                 out.append(
@@ -338,33 +662,42 @@ def main() -> str:
                 )
 
     # ---- rule: combined profit target
-    if pnl_points >= pt_points:
-        if not seen("pt"):
-            mark("pt")
+    # CRITICAL: Never fire target alert from partial leg set when realised P&L is unknown
+    if len(legs) < 2 and (pnl_points is None or realised_pnl_unknown):
+        # Suppress alerts and state why
+        pass
+    elif pnl_points is not None and pnl_points >= pt_points:
+        if not seen(f"pt_{contract_expiry_tag}_{strike}"):
+            mark(f"pt_{contract_expiry_tag}_{strike}")
             out.append(
-                f"🎯 BTC PROFIT TARGET HIT — +{pnl_points:.1f} pts ({inr(pnl_points)}), target +{pt_points:.1f} pts ({inr(pt_points)})\n"
+                f"🎯 BTC PROFIT TARGET HIT — +{pnl_points:.1f} pts ({inr(pnl_points)}), "
+                f"target +{pt_points:.1f} pts ({inr(pt_points)})\n"
                 f"Combined unrealised {pnl_cash:+.4f} USD\n"
                 f"👉 Action: CLOSE BOTH legs."
             )
 
     # ---- expiry milestones
     for hrs, key in ((4, "exp_4h"), (1, "exp_1h")):
-        if 0 < hours_left <= hrs and not seen(key):
-            mark(key)
+        exp_marker = f"{key}_{contract_expiry_tag}_{strike}"
+        if 0 < hours_left <= hrs and not seen(exp_marker):
+            mark(exp_marker)
+            pnl_disp = f"{pnl_points:+.1f} pts" if pnl_points is not None else "UNAVAILABLE"
+            call_mark_str = next((f"{l['mark']:.0f}" for l in legs if l["kind"] == "C"), "closed")
+            put_mark_str = next((f"{l['mark']:.0f}" for l in legs if l["kind"] == "P"), "closed")
             out.append(
                 f"⏰ BTC STRADDLE — {hours_left:.1f}h to expiry "
                 f"({expires.astimezone(IST):%H:%M} IST)\n"
-                f"PnL {pnl_points:+.1f} pts of target {pt_points:.1f} · "
-                f"CE {legs[0]['mark']:.0f} · PE {legs[-1]['mark']:.0f}"
+                f"PnL {pnl_disp} of target {pt_points:.1f} · "
+                f"CE {call_mark_str} · PE {put_mark_str}"
             )
 
     # ---- hourly heartbeat
     hh = now_ist().strftime("%H")
-    # Skip the hourly performance block when we just announced this same position —
-    # otherwise the reader gets the identical table twice in one message.
-    if not opened_now and not seen(f"hb_{hh}"):
-        mark(f"hb_{hh}")
-        out.append(performance_block())
+    hb_marker = f"hb_{hh}_{contract_expiry_tag}_{strike}"
+    if not opened_now and not seen(hb_marker):
+        mark(hb_marker)
+        status_note = f"{len(legs)} of 2 legs open" if len(legs) < 2 else ""
+        out.append(performance_block(note=status_note))
 
     return "\n".join(out)
 
@@ -388,9 +721,9 @@ def usdt_inr_rate() -> float | None:
     try:
         req = urllib.request.Request(
             "https://public.coindcx.com/market_data/current_prices",
-            headers={"accept": "application/json", "User-Agent": "Mozilla/5.0"},
+            headers={"accept": "application/json", "User-Agent": UA},
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _fetch_urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
         for key, val in (data or {}).items():
             ku = str(key).upper()
@@ -416,4 +749,3 @@ if __name__ == "__main__":
     parts = alerts + ([message] if message else [])
     if parts:
         print("\n".join(parts))
-

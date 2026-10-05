@@ -14,6 +14,7 @@ export interface AppConfig {
   readonly dryRun: boolean;
   readonly scheduledHourIST: number;
   readonly scheduledMinuteIST: number;
+  readonly dailyExpiryHourUTC: number;
   readonly strikeStep: number;
   readonly orderQuantity: number;
   readonly leverage: number;
@@ -24,6 +25,39 @@ export interface AppConfig {
   readonly riskConfig: RiskManagementConfig;
   readonly customCallSymbol?: string;
   readonly customPutSymbol?: string;
+}
+
+export function parseRequiredIntInRange(key: string, min: number, max: number): number {
+  const value = process.env[key];
+  if (value === undefined || value.trim() === '') {
+    throw new Error(`Environment variable ${key} is required but missing.`);
+  }
+  const parsed = Number(value.trim());
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(
+      `Environment variable ${key} must be an integer between ${min} and ${max}, but received: "${value}"`
+    );
+  }
+  return parsed;
+}
+
+export function parseOptionalIntInRange(
+  key: string,
+  defaultValue: number,
+  min: number,
+  max: number
+): number {
+  const value = process.env[key];
+  if (value === undefined || value.trim() === '') {
+    return defaultValue;
+  }
+  const parsed = Number(value.trim());
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(
+      `Environment variable ${key} must be an integer between ${min} and ${max}, but received: "${value}"`
+    );
+  }
+  return parsed;
 }
 
 const getEnvNumber = (key: string, defaultValue: number): number => {
@@ -75,8 +109,9 @@ export const config: AppConfig = {
   sessionTokenFile: process.env.COINDCX_SESSION_FILE || undefined,
   baseUrl: process.env.COINDCX_BASE_URL || 'https://api.coindcx.com',
   dryRun: process.env.DRY_RUN === 'true',
-  scheduledHourIST: getEnvNumber('EXECUTION_HOUR_IST', 18), // 6 PM
-  scheduledMinuteIST: getEnvNumber('EXECUTION_MINUTE_IST', 15), // 15 mins -> 6:15 PM IST
+  scheduledHourIST: parseRequiredIntInRange('EXECUTION_HOUR_IST', 0, 23),
+  scheduledMinuteIST: parseRequiredIntInRange('EXECUTION_MINUTE_IST', 0, 59),
+  dailyExpiryHourUTC: parseOptionalIntInRange('DAILY_EXPIRY_HOUR_UTC', 8, 0, 23),
   strikeStep: getEnvNumber('STRIKE_STEP', 250), // CoinDCX BTC 0DTE options grid is spaced at 250
   orderQuantity: getEnvNumber('ORDER_QUANTITY', 0.01), // CoinDCX options min lot is 0.01 BTC
   leverage: getEnvNumber('LEVERAGE', 10),
