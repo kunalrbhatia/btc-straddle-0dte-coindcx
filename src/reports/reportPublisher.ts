@@ -42,6 +42,13 @@ export async function publishDailyReport(
   const repoDir = options.repoDir || process.cwd();
   const notifier = options.notifier;
 
+  // These git calls run SYNCHRONOUSLY inside the trading process (startup catch-up, then the
+  // expiry+delay timer), so they must be bounded: an unbounded execSync on a stalled network
+  // would block the event loop — and therefore the risk monitor and the entry scheduler —
+  // for as long as the socket hangs. Network calls get the full budget; local plumbing is fast.
+  const NET_TIMEOUT_MS = 60_000;
+  const LOCAL_TIMEOUT_MS = 15_000;
+
   const relReportPath = path.join('reports', `${expiryDateStr}.md`).replace(/\\/g, '/');
   const fullReportPath = path.join(getReportsDir(), `${expiryDateStr}.md`);
 
@@ -92,6 +99,8 @@ export async function publishDailyReport(
   const env = {
     ...process.env,
     GIT_INDEX_FILE: tmpIndex,
+    // Never let git stop to ask for credentials — that is another unbounded wait.
+    GIT_TERMINAL_PROMPT: '0',
     GIT_AUTHOR_NAME: authorName,
     GIT_AUTHOR_EMAIL: authorEmail,
     GIT_COMMITTER_NAME: authorName,
@@ -102,7 +111,7 @@ export async function publishDailyReport(
     // 1. Fetch latest remote reports branch if it exists, or check local branch
     let parentCommit: string | null = null;
     try {
-      execSync(`git fetch ${remote} ${branch}:${branch}`, { cwd: repoDir, env, stdio: 'pipe' });
+      execSync(`git fetch ${remote} ${branch}:${branch}`, { cwd: repoDir, env, stdio: 'pipe', timeout: NET_TIMEOUT_MS });
     } catch {
       // Branch might not exist yet on remote, which is expected for the first report
     }
@@ -112,6 +121,7 @@ export async function publishDailyReport(
         cwd: repoDir,
         env,
         stdio: 'pipe',
+        timeout: LOCAL_TIMEOUT_MS,
       })
         .toString()
         .trim();
@@ -121,9 +131,9 @@ export async function publishDailyReport(
 
     // 2. Initialise index: read existing parent tree if available, or empty tree
     if (parentCommit) {
-      execSync(`git read-tree ${parentCommit}`, { cwd: repoDir, env, stdio: 'pipe' });
+      execSync(`git read-tree ${parentCommit}`, { cwd: repoDir, env, stdio: 'pipe', timeout: LOCAL_TIMEOUT_MS });
     } else {
-      execSync('git read-tree --empty', { cwd: repoDir, env, stdio: 'pipe' });
+      execSync('git read-tree --empty', { cwd: repoDir, env, stdio: 'pipe', timeout: LOCAL_TIMEOUT_MS });
     }
 
     // 3. Stage the report file into the isolated index using git add
@@ -135,6 +145,7 @@ export async function publishDailyReport(
       input: reportData,
       env,
       stdio: 'pipe',
+      timeout: LOCAL_TIMEOUT_MS,
     })
       .toString()
       .trim();
@@ -143,10 +154,11 @@ export async function publishDailyReport(
       cwd: repoDir,
       env,
       stdio: 'pipe',
+      timeout: LOCAL_TIMEOUT_MS,
     });
 
     // 4. Write tree from isolated index
-    const treeHash = execSync('git write-tree', { cwd: repoDir, env, stdio: 'pipe' })
+    const treeHash = execSync('git write-tree', { cwd: repoDir, env, stdio: 'pipe', timeout: LOCAL_TIMEOUT_MS })
       .toString()
       .trim();
 
@@ -156,6 +168,7 @@ export async function publishDailyReport(
         cwd: repoDir,
         env,
         stdio: 'pipe',
+        timeout: LOCAL_TIMEOUT_MS,
       })
         .toString()
         .trim();
@@ -175,7 +188,7 @@ export async function publishDailyReport(
       ? `git commit-tree ${treeHash} -p ${parentCommit} -m "${commitMsg}"`
       : `git commit-tree ${treeHash} -m "${commitMsg}"`;
 
-    const commitHash = execSync(commitArgs, { cwd: repoDir, env, stdio: 'pipe' })
+    const commitHash = execSync(commitArgs, { cwd: repoDir, env, stdio: 'pipe', timeout: LOCAL_TIMEOUT_MS })
       .toString()
       .trim();
 
@@ -184,6 +197,7 @@ export async function publishDailyReport(
       cwd: repoDir,
       env,
       stdio: 'pipe',
+      timeout: LOCAL_TIMEOUT_MS,
     });
 
     // 7. Push to remote reports branch
@@ -191,6 +205,7 @@ export async function publishDailyReport(
       cwd: repoDir,
       env,
       stdio: 'pipe',
+      timeout: NET_TIMEOUT_MS,
     });
 
     const successMsg = `Daily trade report published: commit ${commitHash.slice(0, 7)} on branch '${branch}'`;
