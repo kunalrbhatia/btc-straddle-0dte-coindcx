@@ -74,7 +74,15 @@ export class TelegramNotifier implements Notifier {
     // Hermes watch banner (~/.hermes/scripts/btc-banner.py) tails this journal
     // and forwards alerts to Telegram, so failures are never silent — and no
     // bot token is required in .env.
-    appendAlert('notify', stripHtml(text));
+    //
+    // Identical repeats are collapsed (same text within the dedup window): a
+    // per-poll error used to relay the same sentence twice a second for hours.
+    // The first occurrence is always written, and the next emission after the
+    // window carries the suppressed count.
+    const plain = stripHtml(text);
+    appendAlert('notify', plain, undefined, {
+      dedupKey: `notify:${plain}`,
+    });
 
     if (!this.isEnabled) return;
 

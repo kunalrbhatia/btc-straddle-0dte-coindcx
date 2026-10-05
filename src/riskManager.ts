@@ -4,7 +4,7 @@ import { Notifier } from './notifier';
 import { saveStraddleState } from './stateStore';
 import { recordMtmLog } from './mtmWatcher';
 import { appendAlert } from './fileAlerter';
-import { parseContractExpiryDate, safeCloseLeg } from './reconciliation';
+import { isPositionOpenOnExchange, parseContractExpiryDate, safeCloseLeg } from './reconciliation';
 import {
   ActiveLeg,
   EntryPriceSource,
@@ -254,38 +254,107 @@ export async function monitorStraddleRisk(
       try {
         // Fetch current prices for open legs
         let anyFeedMissing = false;
-        if (state.callLeg.status === 'open') {
-          const liveCallPrice = await client.getContractPrice(state.callLeg.symbol);
-          if (liveCallPrice > 0) {
-            state.callLeg.currentPrice = liveCallPrice;
-          } else {
-            anyFeedMissing = true;
-            const msg = `Price feed unavailable for CALL ${state.callLeg.symbol}. Live mark cannot be verified. Retaining last known: $${state.callLeg.currentPrice.toFixed(2)}`;
-            console.error(`[Risk Manager] 🚨 ${msg}`);
-            appendAlert('feed_unavailable', msg, { symbol: state.callLeg.symbol, leg: 'CALL' });
-            if (notifier) {
-              void notifier.notifyError('monitorStraddleRisk:CALL_price_feed', new Error(msg));
-            }
-          }
-        }
 
-        if (state.putLeg.status === 'open') {
-          const livePutPrice = await client.getContractPrice(state.putLeg.symbol);
-          if (livePutPrice > 0) {
-            state.putLeg.currentPrice = livePutPrice;
+        for (const leg of [state.callLeg, state.putLeg]) {
+          if (leg.status !== 'open') {
+            continue;
+          }
+
+          // ── Expiry-aware handling ─────────────────────────────────────────
+          // A contract past its expiry cannot be priced any more: the venue
+          // delists it, the positions feed drops it, and the public options
+          // ticker rejects a past expiry outright ("expiry time must be greater
+          // than current time"). Polling it anyway produced a
+          // "price feed unavailable" alert on EVERY poll — twice a second for
+          // hours on 2026-10-05. So stop asking and reconcile instead.
+          const contractExpiry = parseContractExpiryDate(leg.symbol, config.dailyExpiryHourUTC);
+          const expiryPassed = contractExpiry !== null && Date.now() >= contractExpiry.getTime();
+
+          if (expiryPassed) {
+            // Tri-state: true = still listed, false = confirmed absent, null = unverifiable.
+            const stillListed = await isPositionOpenOnExchange(client, leg.symbol);
+
+            if (stillListed === false) {
+              // Confirmed gone from the exchange after expiry. The settlement value
+              // is NOT exposed by the API, so record the expiry without inventing
+              // one — never silently zero a surviving mark.
+              leg.status = 'closed';
+              leg.closeReason = 'EXPIRED';
+              state.updatedAt = new Date().toISOString();
+              await saveStraddleState(state, state.date);
+
+              const msg =
+                `${leg.legType} ${leg.symbol} expired at ${contractExpiry.toISOString()} and is no longer ` +
+                `listed on the exchange (last known mark $${leg.currentPrice.toFixed(2)}). Settlement value ` +
+                `is not exposed by the API — final P&L may differ.`;
+              console.warn(`[Risk Manager] ⏳ ${msg}`);
+              appendAlert('leg_expired', msg, { symbol: leg.symbol, leg: leg.legType }, {
+                dedupKey: `leg_expired:${leg.symbol}`,
+              });
+              if (notifier) {
+                void notifier.notifyLegClosed({
+                  legType: leg.legType,
+                  symbol: leg.symbol,
+                  reason: 'EXPIRED',
+                  exitPrice: leg.currentPrice,
+                  runningPnL: leg.entryPrice - leg.currentPrice,
+                });
+              }
+              continue;
+            }
+
+            if (stillListed === null) {
+              // Could not verify against the exchange. Keep the leg OPEN and
+              // monitored (never claim a close we cannot prove), but do not poll a
+              // price the venue is already refusing to give.
+              anyFeedMissing = true;
+              const msg =
+                `Expiry reconciliation failed for ${leg.legType} ${leg.symbol}: could not read the exchange ` +
+                `positions feed. Leg kept OPEN and monitored. Last known mark $${leg.currentPrice.toFixed(2)}.`;
+              console.error(`[Risk Manager] 🚨 ${msg}`);
+              appendAlert('feed_unavailable', msg, { symbol: leg.symbol, leg: leg.legType }, {
+                dedupKey: `feed_unavailable:${leg.symbol}`,
+              });
+              if (notifier) {
+                void notifier.notifyError(`monitorStraddleRisk:${leg.legType}_price_feed`, new Error(msg));
+              }
+              continue;
+            }
+
+            // Still listed after expiry — keep tracking it normally (fall through).
+          }
+
+          const livePrice = await client.getContractPrice(leg.symbol);
+          if (livePrice > 0) {
+            leg.currentPrice = livePrice;
           } else {
             anyFeedMissing = true;
-            const msg = `Price feed unavailable for PUT ${state.putLeg.symbol}. Live mark cannot be verified. Retaining last known: $${state.putLeg.currentPrice.toFixed(2)}`;
+            const msg = `Price feed unavailable for ${leg.legType} ${leg.symbol}. Live mark cannot be verified. Retaining last known: $${leg.currentPrice.toFixed(2)}`;
             console.error(`[Risk Manager] 🚨 ${msg}`);
-            appendAlert('feed_unavailable', msg, { symbol: state.putLeg.symbol, leg: 'PUT' });
+            appendAlert('feed_unavailable', msg, { symbol: leg.symbol, leg: leg.legType }, {
+              dedupKey: `feed_unavailable:${leg.symbol}`,
+            });
             if (notifier) {
-              void notifier.notifyError('monitorStraddleRisk:PUT_price_feed', new Error(msg));
+              void notifier.notifyError(`monitorStraddleRisk:${leg.legType}_price_feed`, new Error(msg));
             }
           }
         }
 
         if (anyFeedMissing) {
           console.warn('[Risk Manager] ⚠️ Position valuation is degraded due to missing mark price(s).');
+        }
+
+        // Both legs are gone => the cycle is over. Resolve and stop the monitor
+        // rather than polling a dead contract until the next process restart.
+        if (state.callLeg.status === 'closed' && state.putLeg.status === 'closed') {
+          state.combinedPnLPoints = calculateLegPnL(state.callLeg) + calculateLegPnL(state.putLeg);
+          void recordMtmLog(state.combinedPnLPoints, new Date(), state.date);
+          console.warn(
+            `[Risk Manager] ✅ Both legs closed (CALL: ${state.callLeg.closeReason ?? 'n/a'} | ` +
+              `PUT: ${state.putLeg.closeReason ?? 'n/a'}) — resolving cycle after expiry reconciliation.`
+          );
+          await cleanupAndResolve('MAX_TIME_REACHED');
+          return;
         }
 
         // End-of-life cutoff check

@@ -2,7 +2,7 @@ import { CoinDCXClient } from './client';
 import { config } from './config';
 import { TelegramNotifier } from './notifier';
 import { scheduleAtIST } from './scheduler';
-import { getTodayDateStringIST, hasTodayExecuted, loadStraddleState } from './stateStore';
+import { findLatestStraddleState, getTodayDateStringIST, hasTodayExecuted, hasUnresolvedOpenLeg, loadStraddleState } from './stateStore';
 import { executeShortStraddle } from './straddle';
 import { monitorStraddleRisk } from './riskManager';
 import { reconcileAndResurrectState } from './reconciliation';
@@ -62,6 +62,15 @@ async function main(): Promise<void> {
   const todayStr = getTodayDateStringIST();
 
   // Startup Reconciliation: Check if exchange or local state has an open straddle from a prior run or crash
+  //
+  // ⚠️ Resuming a position must NOT consume the day's entry. This block used to
+  // `return` after starting the monitor, so any restart landing mid-cycle left the
+  // process in monitor-only mode with the scheduler never armed — which is exactly
+  // what happened on 2026-10-05 (PM2 `cron_restart` 30 13 * * * == the 13:30 IST
+  // expiry, so the restart always lands on a live cycle) and silently cost that
+  // day's trade. We now always fall through to the scheduler; opening a second
+  // straddle is prevented by the unresolved-position guard inside the scheduled
+  // callback, not by skipping the schedule.
   try {
     const reconciled = await reconcileAndResurrectState(client, config, notifier);
     if (reconciled && reconciled.state) {
@@ -74,9 +83,9 @@ async function main(): Promise<void> {
         console.warn(`[Startup Reconciliation] ⚠️ ${reconcileMsg}`);
         void notifier.notifyReconciliation(reconcileMsg);
 
-        // Resume monitoring
+        // Resume monitoring. Deliberately no early return: the daily scheduler below
+        // still has to be armed for this process to trade again.
         void monitorStraddleRisk(client, stateToResume, config, notifier);
-        return;
       }
     } else {
       // Fallback check on today's local state file
@@ -88,9 +97,8 @@ async function main(): Promise<void> {
           console.warn(`[Startup Reconciliation] ⚠️ ${reconcileMsg}`);
           void notifier.notifyReconciliation(reconcileMsg);
 
-          // Resume monitoring
+          // Resume monitoring — scheduler stays armed (see note above).
           void monitorStraddleRisk(client, existingState, config, notifier);
-          return;
         } else {
           console.log(`[Startup Reconciliation] Position for today (${todayStr}) is already completed or resolved (${existingState.resolvedScenario || 'DONE'}).`);
         }
@@ -126,6 +134,19 @@ async function main(): Promise<void> {
       return;
     }
 
+    // Open-position guard: an unresolved live leg must not be joined by a second straddle.
+    // (This replaces the protection the removed early `return` used to give.)
+    const trackingForInstant = await findLatestStraddleState();
+    if (hasUnresolvedOpenLeg(trackingForInstant?.state)) {
+      const guardMsg =
+        `Refusing immediate execution: state (${trackingForInstant!.date}) still tracks an unresolved ` +
+        `OPEN leg. Resolve or expire it first — refusing to double exposure.`;
+      console.error(`[Runner] 🛑 ${guardMsg}`);
+      void notifier.notifyError('Open-position guard', guardMsg);
+      lock.release();
+      return;
+    }
+
     console.log('[Runner] Executing straddle cycle...');
     try {
       await executeShortStraddle(client, config, notifier);
@@ -153,6 +174,19 @@ async function main(): Promise<void> {
       const alreadyExecuted = await hasTodayExecuted(currentDayStr);
       if (alreadyExecuted) {
         console.warn(`[Scheduler] ⚠️ Straddle for today (${currentDayStr}) has already executed. Skipping duplicate entry.`);
+        return;
+      }
+
+      // Open-position guard: a resumed/restarted process may still be managing an
+      // unresolved leg. Entering now would double the exposure, so skip the day's
+      // entry and say so loudly (silence here is how 2026-10-05 was lost).
+      const tracking = await findLatestStraddleState();
+      if (hasUnresolvedOpenLeg(tracking?.state)) {
+        const guardMsg =
+          `Skipping entry for ${currentDayStr}: state (${tracking!.date}) still tracks an unresolved OPEN ` +
+          `leg that is being monitored. No new straddle opened.`;
+        console.warn(`[Scheduler] ⚠️ ${guardMsg}`);
+        void notifier.notifyError('Scheduler open-position guard', guardMsg);
         return;
       }
 

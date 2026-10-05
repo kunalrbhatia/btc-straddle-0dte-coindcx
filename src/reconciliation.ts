@@ -266,8 +266,24 @@ export async function reconcileAndResurrectState(
       const putWasOpen = latest.state.putLeg.status === 'open';
       if (callWasOpen || putWasOpen) {
         console.log(`[Reconciliation] Exchange has 0 open positions. Marking recorded state (${latest.date}) closed.`);
-        latest.state.callLeg.status = 'closed';
-        latest.state.putLeg.status = 'closed';
+        for (const leg of [latest.state.callLeg, latest.state.putLeg]) {
+          if (leg.status !== 'open') {
+            continue;
+          }
+          const expiry = parseContractExpiryDate(leg.symbol, config.dailyExpiryHourUTC);
+          leg.status = 'closed';
+          if (expiry && Date.now() >= expiry.getTime()) {
+            // Past its expiry and gone from the venue => it expired.
+            leg.closeReason = 'EXPIRED';
+          } else {
+            // Absent BEFORE expiry with no close order of ours: we cannot explain
+            // this, so we do not invent a reason for it.
+            console.warn(
+              `[Reconciliation] ⚠️ ${leg.symbol} is absent from the exchange but its expiry ` +
+                `(${expiry ? expiry.toISOString() : 'unknown'}) has not passed — no close reason recorded.`
+            );
+          }
+        }
         latest.state.resolvedScenario = 'MAX_TIME_REACHED';
         await saveStraddleState(latest.state, latest.date);
       }
