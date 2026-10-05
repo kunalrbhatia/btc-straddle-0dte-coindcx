@@ -11,6 +11,71 @@ import { initializeStraddleState, monitorStraddleRisk } from './riskManager';
 import { Notifier } from './notifier';
 import { getTodayDateStringIST, saveStraddleState } from './stateStore';
 import { appendAlert } from './fileAlerter';
+import { classifyExitError } from './reconciliation';
+
+export interface PlacementRetryOptions {
+  /** Total attempts including the first one. Default 3. */
+  readonly maxAttempts?: number;
+  /** Backoff base: attempt N waits base * N ms. Default 2000. */
+  readonly baseDelayMs?: number;
+  /** Injectable sleep so tests do not actually wait. */
+  readonly sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Places ONE leg, retrying only *transient* rejections.
+ *
+ * Why this exists: on 2026-10-05 a single exchange-side refusal cost the whole trading day. The
+ * entry placed both legs once, both came back `400 OCS-TECH-0024 "Failed to place the order.
+ * Please retry."`, and the cycle was abandoned — while the exit path has retried the same
+ * signature three times with backoff all along. The venue's own message asks for a retry; the
+ * entry should honour that.
+ *
+ * Deliberately narrow: a *permanent* rejection (unknown contract, bad quantity, insufficient
+ * margin, precision) is returned immediately and never retried, so real failures stay loud and
+ * fast — and, critically, so a doomed order is never re-sent a leg at a time.
+ */
+export async function placeLegWithRetry(
+  place: () => Promise<OrderPlacementOutcome>,
+  options: PlacementRetryOptions = {}
+): Promise<OrderPlacementOutcome> {
+  const maxAttempts = options.maxAttempts ?? 3;
+  const baseDelayMs = options.baseDelayMs ?? 2000;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  let last: OrderPlacementOutcome | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    last = await place();
+    if (last.success) {
+      if (attempt > 1) {
+        console.log(`[Straddle] ✅ ${last.symbol} accepted on attempt ${attempt}/${maxAttempts} (after transient rejection).`);
+      }
+      return last;
+    }
+
+    const { isPermanent, category } = classifyExitError(
+      last.message ?? '',
+      last.rawResponse as Record<string, unknown> | undefined
+    );
+
+    if (isPermanent) {
+      console.warn(`[Straddle] ⛔ ${last.symbol} rejected permanently (${category}) — not retrying.`);
+      return last;
+    }
+
+    if (attempt < maxAttempts) {
+      const delayMs = baseDelayMs * attempt;
+      console.warn(
+        `[Straddle] ⏳ ${last.symbol} transient rejection (${category}) — retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms.`
+      );
+      await sleep(delayMs);
+    }
+  }
+
+  // All attempts exhausted and still transient-failing.
+  return last as OrderPlacementOutcome;
+}
 
 /**
  * Calculates the At-The-Money (ATM) strike price rounded to the nearest step.
@@ -425,23 +490,29 @@ export async function executeShortStraddle(
   const [callOutcome, putOutcome]: [OrderPlacementOutcome, OrderPlacementOutcome] =
     hasToken
       ? await Promise.all([
-          client.placeOptionsOrder(
-            legs.callSymbol,
-            'sell',
-            config.orderQuantity,
-            config.entryOrderType,
-            callPrice,
-            callStopLoss,
-            ''
+          // Each leg is retried on transient rejections only (see placeLegWithRetry) — a single
+          // "Please retry." from the venue must not cost the whole day's trade.
+          placeLegWithRetry(() =>
+            client.placeOptionsOrder(
+              legs.callSymbol,
+              'sell',
+              config.orderQuantity,
+              config.entryOrderType,
+              callPrice,
+              callStopLoss,
+              ''
+            )
           ),
-          client.placeOptionsOrder(
-            legs.putSymbol,
-            'sell',
-            config.orderQuantity,
-            config.entryOrderType,
-            putPrice,
-            putStopLoss,
-            ''
+          placeLegWithRetry(() =>
+            client.placeOptionsOrder(
+              legs.putSymbol,
+              'sell',
+              config.orderQuantity,
+              config.entryOrderType,
+              putPrice,
+              putStopLoss,
+              ''
+            )
           ),
         ])
       : await Promise.all([
