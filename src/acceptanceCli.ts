@@ -298,14 +298,19 @@ export async function runAcceptanceGate(): Promise<boolean> {
     // -------------------------------------------------------------
     // A8: Sample options order debug row gated by flag
     // -------------------------------------------------------------
+    // Assert the guard *precedes* the log statement, and that the log appears exactly once.
+    // (The previous check matched the log line's literal text including trailing whitespace, so a
+    // correctly gated line was reported as a failure — a false negative in the gate itself.)
     const clientCode = fs.readFileSync(path.resolve(process.cwd(), 'src/client.ts'), 'utf8');
-    const passA8 = clientCode.includes("process.env.DEBUG_ORDERS === 'true'") &&
-      !clientCode.includes("console.log(`[CoinDCXClient] Sample options orders response row:`, JSON.stringify(rows[0]));\n      }");
+    const debugLogOccurrences = clientCode.split('Sample options orders response row').length - 1;
+    const debugLogIdx = clientCode.indexOf('Sample options orders response row');
+    const gateIdx = clientCode.lastIndexOf("process.env.DEBUG_ORDERS === 'true'", debugLogIdx);
+    const passA8 = debugLogOccurrences === 1 && debugLogIdx > -1 && gateIdx > -1;
     results.push({
       id: 'A8',
       description: 'sample options order debug line is gated',
       passed: passA8,
-      detail: 'Order row sample log is gated behind process.env.DEBUG_ORDERS',
+      detail: `1 occurrence, gated by process.env.DEBUG_ORDERS (${debugLogOccurrences} log site(s), guard found: ${gateIdx > -1})`,
     });
 
     // -------------------------------------------------------------

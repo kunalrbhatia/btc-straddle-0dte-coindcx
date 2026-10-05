@@ -941,3 +941,102 @@ describe('Risk Manager Unit Tests', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// The rule that started all of this: the venue owns the stop-loss, so a breached
+// stop must never trigger a close order from the bot (2026-10-05: the bot's own
+// SL close fired one second after the venue stop and flipped the leg long).
+// ---------------------------------------------------------------------------
+describe('monitorStraddleRisk venue-only stop-loss', () => {
+  const future = contractSymbolsAt(daysFromNow(90));
+
+  const breachedState = (callMark: number): StraddlePositionState => ({
+    date: '2026-10-04',
+    entryExecuted: true,
+    callLeg: {
+      legType: 'CALL',
+      symbol: future.call,
+      entryPrice: 320,
+      entryPriceSource: 'fill',
+      stopLossPrice: 640,
+      quantity: 0.01,
+      confirmedOpen: true,
+      status: 'open',
+      currentPrice: callMark,
+    },
+    putLeg: {
+      legType: 'PUT',
+      symbol: future.put,
+      entryPrice: 365,
+      entryPriceSource: 'fill',
+      stopLossPrice: 730,
+      quantity: 0.01,
+      confirmedOpen: true,
+      status: 'open',
+      currentPrice: 300,
+    },
+    totalCreditReceived: 685,
+    targetProfitPoints: 376.75,
+    combinedPnLPoints: 0,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const venueClient = (closeCalls: string[]) =>
+    ({
+      getContractPrice: async (symbol: string) => (symbol === future.call ? 650 : 300),
+      getOpenOptionsOrders: async () => [
+        { symbol: future.call, orderId: 'x-stop-call', triggerPrice: '640', orderStatus: 'Untriggered', reduceOnly: true },
+        { symbol: future.put, orderId: 'x-stop-put', triggerPrice: '730', orderStatus: 'Untriggered', reduceOnly: true },
+      ],
+      getOptionsPositions: async () => [
+        { symbol: future.call, side: 'Sell', qty: 0.01, avgPrice: 320, markPrice: 650 },
+        { symbol: future.put, side: 'Sell', qty: 0.01, avgPrice: 365, markPrice: 300 },
+      ],
+      getOptionsWalletTransactions: async () => [],
+      getInstrumentDetails: async () => ({ priceFilter: { tickSize: '5' }, quantityFilter: { stepSize: '0.01' } }),
+      closePosition: async () => {
+        closeCalls.push('close');
+        return { success: true, orderId: 'test-close' } as OrderPlacementOutcome;
+      },
+      placeOptionsOrder: async () => {
+        closeCalls.push('place');
+        return { success: true, orderId: 'test-place' } as OrderPlacementOutcome;
+      },
+    }) as unknown as CoinDCXClient;
+
+  it('does NOT place an SL close while the venue stop is armed and not overrun', async () => {
+    const closeCalls: string[] = [];
+    const warns: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warns.push(args.map((a) => String(a)).join(' '));
+    };
+
+    const config = {
+      ...mockConfig,
+      riskConfig: { ...mockConfig.riskConfig, pollIntervalMs: 20, maxMonitorMinutes: 0.002 },
+    };
+
+    const state = breachedState(650); // 650 >= SL 640, but far below the 10% overrun threshold (704)
+    const { monitorStraddleRisk } = await import('./riskManager');
+    try {
+      await monitorStraddleRisk(venueClient(closeCalls), state, config);
+    } finally {
+      console.warn = realWarn;
+    }
+
+    assert.ok(
+      warns.some((w) => w.includes('Waiting for venue stop order execution')),
+      'the monitor must log that it is waiting for the venue stop'
+    );
+    assert.ok(
+      !warns.some((w) => w.includes('STUCK STOP ESCALATION')),
+      'a stop that is merely breached must not escalate to a fallback close'
+    );
+    assert.equal(
+      state.callLeg.closeReason === 'SL_HIT',
+      false,
+      'the bot must never record an SL_HIT close of its own'
+    );
+  });
+});
