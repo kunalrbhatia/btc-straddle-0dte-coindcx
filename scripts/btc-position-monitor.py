@@ -21,6 +21,7 @@ distinguishable from a dead monitor.
 
 Env overrides:  BTC_MON_DIR (state/markers), BTC_TOKEN_FILE, BTC_REPO_DIR
 """
+from __future__ import annotations
 
 import json
 import os
@@ -243,8 +244,27 @@ def fetch_spot() -> float:
     return 0.0
 
 
-def next_expiry() -> datetime:
-    """The expiry the open legs belong to — next daily expiry UTC boundary."""
+def next_expiry(contract_expiry_tag: str | None = None) -> datetime:
+    """
+    The expiry the open legs belong to.
+    Derives expiry directly from the contract symbol (e.g. 5OCT26 / 09OCT26) if available,
+    falling back to next daily expiry UTC boundary arithmetic.
+    """
+    if contract_expiry_tag:
+        try:
+            # clean e.g. '5OCT26' or '05OCT26' -> '05OCT26'
+            m = re.match(r"^(\d{1,2})([A-Z]{3})(\d{2})$", contract_expiry_tag.upper())
+            if m:
+                day = int(m.group(1))
+                mon_str = m.group(2)
+                year = 2000 + int(m.group(3))
+                months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+                if mon_str in months:
+                    mon = months.index(mon_str) + 1
+                    return datetime(year, mon, day, EXPIRY_UTC_HOUR, 0, 0, tzinfo=timezone.utc)
+        except Exception:
+            pass
+
     n = datetime.now(timezone.utc)
     todays = n.replace(hour=EXPIRY_UTC_HOUR, minute=0, second=0, microsecond=0)
     return todays if n < todays else todays + timedelta(days=1)
@@ -543,7 +563,7 @@ def main() -> str:
                 realised_pnl_unknown = True
 
     pnl_cash = surviving_unrealised_cash
-    expires = next_expiry()
+    expires = next_expiry(contract_expiry_tag)
     hours_left = (expires - datetime.now(timezone.utc)).total_seconds() / 3600
 
     # ---- INR reporting (the user reads P&L in rupees)

@@ -10,6 +10,7 @@ import {
   OptionsMarginResponse,
   OptionsPosition,
   OptionsTickerItem,
+  OptionsInstrument,
   TickerItem,
 } from './types';
 
@@ -313,6 +314,40 @@ export class CoinDCXClient {
         const rec = json as Record<string, unknown>;
         if (Array.isArray(rec.data)) {
           return rec.data as readonly OptionsTickerItem[];
+        }
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Fetches listed options instruments from public.coindcx.com/api/v1/options/instruments
+   * (Public endpoint, no auth required).
+   * Returns list of instruments with symbol, displayName, expiryTime, strikePrice, optionsType, isActive, etc.
+   */
+  public async getOptionsInstruments(baseCurrency = 'BTC'): Promise<readonly OptionsInstrument[]> {
+    try {
+      const url = `https://public.coindcx.com/api/v1/options/instruments?baseCurrency=${encodeURIComponent(baseCurrency)}`;
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        },
+      });
+      if (!response.ok) {
+        return [];
+      }
+      const json = (await response.json()) as unknown;
+      if (Array.isArray(json)) {
+        return json as readonly OptionsInstrument[];
+      }
+      if (typeof json === 'object' && json !== null) {
+        const rec = json as Record<string, unknown>;
+        if (Array.isArray(rec.data)) {
+          return rec.data as readonly OptionsInstrument[];
         }
       }
       return [];
