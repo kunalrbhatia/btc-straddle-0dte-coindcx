@@ -54,12 +54,17 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
   }
 
   // Known live facts for 2026-10-05 cycle if state is available or fallback
-  const callSymbol = stateObj?.callLeg?.symbol || 'BTC-5OCT26-85500-C-USDT';
-  const putSymbol = stateObj?.putLeg?.symbol || 'BTC-5OCT26-85500-P-USDT';
-  const strike = 85500;
+  const is20261005 = expiryDateStr === '2026-10-05';
+  const callSymbol = is20261005
+    ? 'BTC-5OCT26-85250-C-USDT'
+    : (stateObj?.callLeg?.symbol || 'BTC-5OCT26-85500-C-USDT');
+  const putSymbol = is20261005
+    ? 'BTC-5OCT26-85250-P-USDT'
+    : (stateObj?.putLeg?.symbol || 'BTC-5OCT26-85500-P-USDT');
+  const strike = is20261005 ? 85250 : 85500;
   const quantity = stateObj?.callLeg?.quantity || 0.01;
-  const callEntry = stateObj?.callLeg?.entryPrice || 535; // CoinDCX ledger filledPrice was 535
-  const putEntry = stateObj?.putLeg?.entryPrice || 400; // CoinDCX ledger filledPrice was 400
+  const callEntry = is20261005 ? 320 : (stateObj?.callLeg?.entryPrice || 535);
+  const putEntry = is20261005 ? 365 : (stateObj?.putLeg?.entryPrice || 400);
   const totalCredit = callEntry + putEntry;
   const targetProfitPoints = totalCredit * 0.55;
 
@@ -116,8 +121,14 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
     },
   });
 
-  // Call SL hit or exit
-  const callExit = stateObj?.callLeg?.exitPrice ?? 600;
+  // Call SL hit or exit: for 2026-10-05, CALL was stopped out at 677.28
+  const callExit = is20261005
+    ? 677.28
+    : (stateObj?.callLeg?.exitPrice ?? 600);
+  const callCloseReason = is20261005
+    ? 'SL_HIT'
+    : (stateObj?.callLeg?.closeReason || 'SL_HIT');
+
   events.push({
     schemaVersion: 1,
     cycle: expiryDateStr,
@@ -128,7 +139,7 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
       reconstructed: true,
       legType: 'CALL',
       symbol: callSymbol,
-      reason: stateObj?.callLeg?.closeReason || 'SL_HIT',
+      reason: callCloseReason,
       price: callExit,
     },
   });
@@ -149,6 +160,8 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
     },
   });
 
+  const realisedPnlPoints = (callEntry - callExit) + (putEntry - 0);
+
   events.push({
     schemaVersion: 1,
     cycle: expiryDateStr,
@@ -159,7 +172,7 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
       reconstructed: true,
       closedAt: `${expiryDateStr}T13:45:00+05:30`,
       resolvedScenario: stateObj?.resolvedScenario || 'EXPIRED_SETTLED',
-      realisedPnlPoints: (callEntry - callExit) + (putEntry - 0),
+      realisedPnlPoints,
     },
   });
 
@@ -167,7 +180,10 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
   const eventLines = events.map((e) => JSON.stringify(e)).join('\n') + '\n';
   fs.writeFileSync(jsonlPath, eventLines, 'utf8');
 
-  // MTM Tape
+  // MTM Tape - clipped to [startTs, expiry + 15m]
+  const windowStartMs = Date.parse(`${entryDate}T00:00:00+05:30`);
+  const windowEndMs = Date.parse(`${expiryDateStr}T13:45:00+05:30`);
+
   const mtmSamples: MtmTapeSample[] = [];
   const mtmLogPath = `logs/mtm-${entryDate}.log`;
   if (fs.existsSync(mtmLogPath)) {
@@ -175,6 +191,11 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
     for (const line of raw) {
       const match = line.match(/^(\d{1,2}:\d{2}:\d{2}\s+(?:AM|PM)):\s*([-\d.]+)\s*MTM/i);
       if (match) {
+        const sampleMs = Date.parse(`${entryDate}T${match[1]}+05:30`);
+        // Clip to cycle window
+        if (Number.isFinite(sampleMs) && (sampleMs < windowStartMs || sampleMs > windowEndMs)) {
+          continue;
+        }
         mtmSamples.push({
           ts: `${entryDate}T${match[1]}`,
           callMark: callEntry,
@@ -206,7 +227,6 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
   // Summary Snapshot
   const callPnl = callEntry - callExit;
   const putPnl = putEntry - 0;
-  const realisedPnlPoints = callPnl + putPnl;
 
   const summary: CycleSummarySnapshot = {
     schemaVersion: 1,
@@ -229,7 +249,7 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
       venueAvgPrice: callEntry,
       status: 'closed',
       exitPrice: callExit,
-      closeReason: stateObj?.callLeg?.closeReason || 'SL_HIT',
+      closeReason: callCloseReason,
       pnlPoints: callPnl,
     },
     putLeg: {

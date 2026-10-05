@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
+import path from 'path';
 import { CycleRecordWriter, scrubCredentials } from './cycleRecordWriter';
 import { getRecordJsonlPath, getRecordMtmPath, getRecordSummaryPath } from './cycleRecordPaths';
 import { verifyCycleAgainstVenue } from './venueVerification';
@@ -202,6 +203,41 @@ test('Venue Verification — Matches, Mismatches, and Unverified Handling', asyn
     const callEntryClaim = report.claims.find((c) => c.claim.includes('CALL Entry'));
     assert.equal(callEntryClaim?.status, 'UNVERIFIED');
   });
+
+  await t.test('verifies DELIVERY row using netCashFlow (falling back to balanceChange) instead of filledPrice', async () => {
+    // Live CoinDCX shape where filledPrice is the underlying spot (~86282) but netCashFlow is 0
+    const deliveryRow = {
+      transactionType: 'DELIVERY',
+      symbol: 'BTC-2FEB99-90000-P-USDT',
+      filledPrice: '86282.52872153',
+      quantity: '0.01',
+      balanceChange: '0',
+      netCashFlow: '0',
+      grossCashFlow: '0',
+      fee: '0',
+      orderId: '',
+    };
+
+    const venueLedger = [
+      { orderId: 'call-ord-1', symbol: 'BTC-2FEB99-90000-C-USDT', transactionType: 'TRADE', filledPrice: 500, fee: 10, grossCashFlow: 510, netCashFlow: 500 },
+      { orderId: 'put-ord-1', symbol: 'BTC-2FEB99-90000-P-USDT', transactionType: 'TRADE', filledPrice: 400, fee: 10, grossCashFlow: 410, netCashFlow: 400 },
+      { orderId: 'call-close-1', symbol: 'BTC-2FEB99-90000-C-USDT', transactionType: 'TRADE', filledPrice: 300, fee: 5, grossCashFlow: -300, netCashFlow: -305 },
+      deliveryRow,
+    ];
+
+    const report = await verifyCycleAgainstVenue(cycle, {
+      snapshotOverride: mockSnapshot,
+      walletTransactionsOverride: venueLedger,
+      positionsOverride: [],
+      ordersOverride: [],
+      tolerance: 0.5,
+    });
+
+    const deliveryClaim = report.claims.find((c) => c.claim.includes('PUT Settlement at expiry'));
+    assert.ok(deliveryClaim);
+    assert.equal(deliveryClaim?.status, 'MATCH');
+    assert.equal(deliveryClaim?.venueValue, 0);
+  });
 });
 
 test('Cycle Backfill — generates reconstructed records for historical cycle', async () => {
@@ -215,4 +251,42 @@ test('Cycle Backfill — generates reconstructed records for historical cycle', 
   assert.ok(fs.existsSync(result.summaryPath));
   assert.equal(result.summary.reconstructed, true);
   assert.equal(result.summary.source, 'state+logs');
+  assert.equal(result.summary.atmStrike, 85250);
+  assert.equal(result.summary.callSymbol, 'BTC-5OCT26-85250-C-USDT');
+  assert.equal(result.summary.putSymbol, 'BTC-5OCT26-85250-P-USDT');
+  assert.equal(result.summary.callLeg?.exitPrice, 677.28);
+  assert.equal(result.summary.callLeg?.closeReason, 'SL_HIT');
+  assert.equal(result.summary.callLeg?.pnlPoints, -357.28);
+  assert.equal(result.summary.putLeg?.exitPrice, 0);
+  assert.equal(result.summary.putLeg?.pnlPoints, 365);
+  const pnl = result.summary.combinedPnLPoints ?? 0;
+  assert.equal(Math.round(pnl * 100) / 100, 7.72);
+
+  // Clean up backfill test output
+  if (fs.existsSync(result.jsonlPath)) fs.unlinkSync(result.jsonlPath);
+  if (fs.existsSync(result.mtmPath)) fs.unlinkSync(result.mtmPath);
+  if (fs.existsSync(result.summaryPath)) fs.unlinkSync(result.summaryPath);
+});
+
+test('CycleRecordWriter — RECORD_DIR isolation prevents writing outside assigned directory', () => {
+  const customDir = path.resolve(process.cwd(), 'scratch-records-test');
+  const prevEnv = process.env.RECORD_DIR;
+  try {
+    process.env.RECORD_DIR = customDir;
+    const writer = new CycleRecordWriter('2099-05-05');
+    writer.appendEvent('CYCLE_START', { test: true });
+
+    const expectedFile = path.join(customDir, '2099-05-05.jsonl');
+    assert.ok(fs.existsSync(expectedFile), 'Should write strictly into RECORD_DIR');
+    if (fs.existsSync(expectedFile)) fs.unlinkSync(expectedFile);
+  } finally {
+    process.env.RECORD_DIR = prevEnv;
+    if (fs.existsSync(customDir)) {
+      try {
+        fs.rmSync(customDir, { recursive: true, force: true });
+      } catch {
+        // Ignore
+      }
+    }
+  }
 });

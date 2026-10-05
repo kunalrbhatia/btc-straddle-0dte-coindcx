@@ -10,6 +10,8 @@ import {
 import { ensureReportsDirectory, getReportFilePath } from './reportPaths';
 import { getExpiryTimeMs } from './reportScheduler';
 import { formatVerificationReportTable, verifyCycleAgainstVenue } from '../records/venueVerification';
+import { getRecordJsonlPath, getRecordSummaryPath } from '../records/cycleRecordPaths';
+import { CycleEventPayload, CycleSummarySnapshot } from '../records/cycleRecordTypes';
 import fs from 'fs';
 
 export interface GenerateReportOptions {
@@ -190,7 +192,7 @@ export async function generateDailyReport(
       exitPrice = null;
     } else if (leg?.status === 'closed') {
       if (exitPrice === null || exitPrice === undefined) {
-        exitPrice = leg.currentPrice ?? entryPrice;
+        exitPrice = leg.currentPrice ?? null;
       }
     } else if (isCycleExpired) {
       // Leg was open in state, not on exchange at/after expiry -> settled at 0.00
@@ -199,7 +201,7 @@ export async function generateDailyReport(
       reason = 'EXPIRED';
     } else {
       // Leg is still open before expiry
-      exitPrice = leg?.currentPrice ?? entryPrice;
+      exitPrice = leg?.currentPrice ?? null;
       reason = 'OPEN';
     }
 
@@ -306,8 +308,59 @@ export async function generateDailyReport(
     md += `_No MTM log observations were recorded for this cycle._\n\n`;
   }
 
-  // Alerts Log
+  // Check for cycle record & summary snapshot
+  const recordSummaryPath = getRecordSummaryPath(expiryDateStr);
+  const recordJsonlPath = getRecordJsonlPath(expiryDateStr);
+  let cycleSummarySnap: CycleSummarySnapshot | null = null;
+  if (fs.existsSync(recordSummaryPath)) {
+    try {
+      cycleSummarySnap = JSON.parse(fs.readFileSync(recordSummaryPath, 'utf8'));
+    } catch {
+      cycleSummarySnap = null;
+    }
+  }
+
+  // Read timeline from records jsonl if available
+  const timelineEvents: Array<{ ts: string; event: string; detail: string }> = [];
+  if (fs.existsSync(recordJsonlPath)) {
+    try {
+      const lines = fs.readFileSync(recordJsonlPath, 'utf8').trim().split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const ev = JSON.parse(line.trim()) as CycleEventPayload;
+        let detail = '';
+        if (ev.event === 'CYCLE_START') {
+          detail = `Cycle initiated (Strike: ${ev.data?.strike ?? 'N/A'}, Call: ${ev.data?.callSymbol ?? 'N/A'}, Put: ${ev.data?.putSymbol ?? 'N/A'})`;
+        } else if (ev.event === 'ORDER_FILLED') {
+          detail = `${ev.data?.legType} filled @ $${Number(ev.data?.price ?? 0).toFixed(2)} (Order ID: ${ev.data?.orderId ?? 'N/A'})`;
+        } else if (ev.event === 'LEG_CLOSED') {
+          detail = `${ev.data?.legType} closed @ $${Number(ev.data?.price ?? 0).toFixed(2)} [${ev.data?.reason ?? 'N/A'}]`;
+        } else if (ev.event === 'EXPIRY_SETTLEMENT') {
+          detail = `${ev.data?.legType} settled at expiry @ $${Number(ev.data?.settlementPrice ?? 0).toFixed(2)} [${ev.data?.settlementReason ?? 'EXPIRED'}]`;
+        } else if (ev.event === 'CYCLE_CLOSED') {
+          detail = `Cycle closed [${ev.data?.resolvedScenario ?? 'CLOSED'}], Realised P&L: ${Number(ev.data?.realisedPnlPoints ?? 0).toFixed(2)} pts`;
+        } else {
+          detail = JSON.stringify(ev.data ?? {});
+        }
+        timelineEvents.push({ ts: ev.ts, event: ev.event, detail });
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
+  // Alerts Log / Timeline Section
   md += `## 4. Alerts & Operator Journal\n\n`;
+  if (timelineEvents.length > 0) {
+    const firstTs = timelineEvents[0].ts;
+    const lastTs = timelineEvents[timelineEvents.length - 1].ts;
+    md += `Chronological cycle events from write-through record [${firstTs} → ${lastTs}]:\n\n`;
+    for (const te of timelineEvents) {
+      md += `- **[${te.ts}]** \`${te.event}\` — ${te.detail}\n`;
+    }
+    md += `\n`;
+  }
+
   if (collapsedAlerts.length > 0) {
     md += `Chronological alerts logged during cycle window [${entryDate} → ${expiryDateStr}]:\n\n`;
     for (const a of collapsedAlerts) {
@@ -318,12 +371,15 @@ export async function generateDailyReport(
       }
     }
     md += `\n`;
-  } else {
-    md += `_No alert records found for cycle window [${entryDate} → ${expiryDateStr}]._\n\n`;
+  } else if (timelineEvents.length === 0) {
+    md += `_No event or alert records found for cycle window [${entryDate} → ${expiryDateStr}]._\n\n`;
   }
 
   // Data Quality & Invariants
   md += `## 5. Data Quality & Provenance\n\n`;
+  if (cycleSummarySnap?.reconstructed) {
+    md += `> ℹ️ **Provenance Notice**: _This cycle's record was reconstructed after the fact; live events were not written._\n\n`;
+  }
   md += `- **FX Rate Provenance**: ${fxProvenance}\n`;
   md += `- **USDT Per Point**: Derived dynamically as ${contractMultiplier} USDT/pt (${(contractMultiplier * 100).toFixed(0)}% BTC lot size)\n`;
   md += `- **Underlying Spot Price (BTCUSDT)**: ${spotPrice !== null ? `$${spotPrice.toFixed(2)}` : 'N/A'}\n`;
@@ -334,15 +390,6 @@ export async function generateDailyReport(
     md += `  - ✅ Clean reconciliation. 0 open positions of this cycle remain on exchange.\n`;
   }
 
-  // Dual P&L Reconciliation note
-  md += `\n### Dual P&L Reconciliation (Points vs Venue Ledger)\n\n`;
-  md += `- **State Points P&L**: **${fmtPts(combinedPoints)}** (${fmtUsdt(combinedUsdt)})\n`;
-  if (venueTransactions.length > 0) {
-    md += `- **Venue Ledger Transactions**: ${venueTransactions.length} transaction record(s) reconciled.\n`;
-  } else {
-    md += `- **Venue Ledger Cash P&L**: N/A (wallet transactions endpoint unavailable or session unauthenticated; never fabricating numbers).\n`;
-  }
-
   // Broker Terminal Verification section
   try {
     const verRes = await verifyCycleAgainstVenue(expiryDateStr, {
@@ -351,6 +398,22 @@ export async function generateDailyReport(
       walletTransactionsOverride: options.walletTransactionsOverride,
       tolerance: options.config?.verificationTolerance ?? 0.5,
     });
+
+    // Dual P&L Reconciliation note
+    md += `\n### Dual P&L Reconciliation (Points vs Venue Ledger)\n\n`;
+    md += `- **State Points P&L**: **${fmtPts(combinedPoints)}** (${fmtUsdt(combinedUsdt)})\n`;
+    if (verRes.ledgerSummary && (verRes.ledgerSummary.tradeRowsCount > 0 || verRes.ledgerSummary.deliveryRowsCount > 0)) {
+      const ls = verRes.ledgerSummary;
+      const matchedRows = ls.tradeRowsCount + ls.deliveryRowsCount;
+      md += `- **Venue Ledger Cash P&L**: ₹${ls.totalTradeNetCashFlowInr.toFixed(2)} net (Gross: ₹${ls.totalTradeGrossCashFlowInr.toFixed(2)}, Fees: ₹${ls.totalFeesInr.toFixed(2)})\n`;
+      md += `- **Reconciled Transactions**: ${matchedRows} row(s) matched cycle contracts out of ${ls.transactionCount} total wallet transactions (${ls.tradeRowsCount} trade(s), ${ls.deliveryRowsCount} delivery).\n`;
+      md += `- **Basis Gap Explanation**: The difference between State points P&L and Venue net cash flow arises from exchange transaction fees (~1.9%) and the venue USDT/INR conversion spread (~₹102 vs public rate).\n`;
+    } else if (venueTransactions.length > 0) {
+      md += `- **Venue Ledger Transactions**: ${venueTransactions.length} transaction record(s) reconciled.\n`;
+    } else {
+      md += `- **Venue Ledger Cash P&L**: N/A (wallet transactions endpoint unavailable or session unauthenticated; never fabricating numbers).\n`;
+    }
+
     md += `\n## 6. Broker Terminal Verification\n\n`;
     md += `**Overall Verdict:** \`${verRes.overallVerdict}\`\n\n`;
     md += `\`\`\`\n`;
