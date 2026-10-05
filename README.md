@@ -58,6 +58,7 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
   - `npm run run-once`: Executes a single cycle.
 - **MTM Watcher Logging**: Appends tick-by-tick mark-to-market PnL tracking to `logs/mtm-<YYYY-MM-DD>.log`.
 - **Local Alert Journal**: Writes every alert to `logs/alerts-<YYYY-MM-DD>.jsonl` so local watch banners forward notifications even without Telegram bot credentials.
+- **Pre-Commit Secret Scanning**: Automated git hook (`scripts/pre-commit-secrets.cjs`) and `npm run scan-secrets` inspect staged files and git blobs for credentials, API keys, JWT session tokens, and executes TruffleHog to guarantee no secrets enter commits.
 
 ---
 
