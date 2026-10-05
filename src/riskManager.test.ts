@@ -36,6 +36,38 @@ const mockConfig: AppConfig = {
   },
 };
 
+const MONTH_ABBREVS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+
+/**
+ * Builds contract symbols for a given day, in the exchange's own format
+ * (`BTC-<d><MON><yy>-<strike>-C-USDT`, expiry 08:00 UTC).
+ *
+ * Derived, never hardcoded: a literal tag (e.g. `5OCT26`) goes stale the moment that
+ * date passes, and the test then silently exercises a different code path — this
+ * suite has been red on an untouched `main` for exactly that reason.
+ */
+function contractSymbolsAt(
+  when: Date,
+  strike = 85500
+): { call: string; put: string; expiry: Date } {
+  const expiry = new Date(
+    Date.UTC(when.getUTCFullYear(), when.getUTCMonth(), when.getUTCDate(), 8, 0, 0, 0)
+  );
+  const tag = `${expiry.getUTCDate()}${MONTH_ABBREVS[expiry.getUTCMonth()]}${String(
+    expiry.getUTCFullYear()
+  ).slice(2)}`;
+  return {
+    call: `BTC-${tag}-${strike}-C-USDT`,
+    put: `BTC-${tag}-${strike}-P-USDT`,
+    expiry,
+  };
+}
+
+/** Days from now, keeping the time-of-day irrelevant (expiry is always 08:00 UTC). */
+function daysFromNow(days: number): Date {
+  return new Date(Date.now() + days * 24 * 3600 * 1000);
+}
+
 describe('Risk Manager Unit Tests', () => {
   describe('resolveEntryPrice', () => {
     it('resolves price from rawResponse.avg_price when present and positive', async () => {
@@ -323,6 +355,9 @@ describe('Risk Manager Unit Tests', () => {
   });
 
   describe('monitorStraddleRisk loud feed failure check', () => {
+    // A future expiry: this test is about the PRICE-POLL path, not the expiry path.
+    const future = contractSymbolsAt(daysFromNow(90));
+
     it('notifies and logs loud error when price feed returns 0 (unavailable mark)', async () => {
       let notifiedErrorContext = '';
       const mockNotifier: Notifier = {
@@ -347,7 +382,7 @@ describe('Risk Manager Unit Tests', () => {
         entryExecuted: true,
         callLeg: {
           legType: 'CALL',
-          symbol: 'BTC-5OCT26-85500-C-USDT',
+          symbol: future.call,
           entryPrice: 320,
           entryPriceSource: 'fill',
           stopLossPrice: 640,
@@ -358,7 +393,7 @@ describe('Risk Manager Unit Tests', () => {
         },
         putLeg: {
           legType: 'PUT',
-          symbol: 'BTC-5OCT26-85500-P-USDT',
+          symbol: future.put,
           entryPrice: 365,
           entryPriceSource: 'fill',
           stopLossPrice: 730,
@@ -387,6 +422,109 @@ describe('Risk Manager Unit Tests', () => {
       await monitorStraddleRisk(failingClient, state, fastConfig, mockNotifier);
 
       assert.match(notifiedErrorContext, /monitorStraddleRisk:CALL_price_feed|monitorStraddleRisk:PUT_price_feed/);
+    });
+  });
+
+  describe('monitorStraddleRisk expiry reconciliation', () => {
+    const expiredLegs = (date: string): StraddlePositionState => {
+      const expired = contractSymbolsAt(daysFromNow(-2));
+      return {
+        date,
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: expired.call,
+          entryPrice: 320,
+          entryPriceSource: 'fill',
+          stopLossPrice: 640,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 320,
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: expired.put,
+          entryPrice: 365,
+          entryPriceSource: 'fill',
+          stopLossPrice: 730,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 365,
+        },
+        totalCreditReceived: 685,
+        targetProfitPoints: 376.75,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+    };
+
+    it('resolves the cycle without polling a price once an expired leg is confirmed absent', async () => {
+      // The 2026-10-05 shape: expiry (08:00 UTC) has passed, the venue delisted the
+      // contract, and the price feed can no longer answer for it. Polling it anyway
+      // produced a feed alert every 2 seconds for hours — the monitor must reconcile
+      // against the exchange instead, then stop.
+      let priceLookups = 0;
+      const flatClient = {
+        getContractPrice: async () => {
+          priceLookups += 1;
+          return 0;
+        },
+        getOptionsPositions: async () => [],
+        closePosition: async () => ({ success: true, orderId: 'test-close' }),
+      } as unknown as CoinDCXClient;
+
+      const state = expiredLegs('2099-03-03');
+      const fastConfig = {
+        ...mockConfig,
+        riskConfig: { ...mockConfig.riskConfig, pollIntervalMs: 20, maxMonitorMinutes: 60 },
+      };
+
+      const { monitorStraddleRisk } = await import('./riskManager');
+      const scenario = await monitorStraddleRisk(flatClient, state, fastConfig);
+
+      assert.equal(scenario, 'MAX_TIME_REACHED');
+      assert.equal(state.callLeg.status, 'closed');
+      assert.equal(state.putLeg.status, 'closed');
+      assert.equal(state.callLeg.closeReason, 'EXPIRED');
+      assert.equal(state.putLeg.closeReason, 'EXPIRED');
+      assert.equal(priceLookups, 0, 'an expired, delisted contract must not be polled for a price');
+    });
+
+    it('never treats an unreadable positions feed as a closed leg', async () => {
+      // Tri-state discipline: "I could not read it" must not collapse into "it is closed".
+      let priceLookups = 0;
+      let closeAttempts = 0;
+      const unreadableClient = {
+        getContractPrice: async () => {
+          priceLookups += 1;
+          return 0;
+        },
+        getOptionsPositions: async () => {
+          throw new Error('positions feed down');
+        },
+        closePosition: async () => {
+          closeAttempts += 1;
+          return { success: true, orderId: 'test-close' };
+        },
+      } as unknown as CoinDCXClient;
+
+      const state = expiredLegs('2099-03-04');
+      const fastConfig = {
+        ...mockConfig,
+        riskConfig: {
+          ...mockConfig.riskConfig,
+          pollIntervalMs: 20,
+          maxMonitorMinutes: 0.002, // ~120ms so the end-of-life window still fires
+        },
+      };
+
+      const { monitorStraddleRisk } = await import('./riskManager');
+      await monitorStraddleRisk(unreadableClient, state, fastConfig);
+
+      assert.equal(priceLookups, 0, 'no point polling a price the venue cannot give');
+      assert.ok(closeAttempts > 0, 'the leg must go through a real exit attempt, not a silent close');
     });
   });
 });

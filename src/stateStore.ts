@@ -135,3 +135,18 @@ export async function hasTodayExecuted(dateStr = getTodayDateStringIST()): Promi
   const state = await loadStraddleState(dateStr);
   return Boolean(state && state.entryExecuted);
 }
+
+/**
+ * True when the state still tracks a live leg that the bot has not resolved yet.
+ *
+ * Used as the "do not open a second straddle" guard before the daily entry. A
+ * restart that lands mid-cycle resumes monitoring an open position; without this
+ * guard the scheduler either enters again (double exposure) or — as happened on
+ * 2026-10-05 — never arms at all and silently loses the day's trade.
+ */
+export function hasUnresolvedOpenLeg(state: StraddlePositionState | null | undefined): boolean {
+  if (!state || !state.entryExecuted || state.resolvedScenario) {
+    return false;
+  }
+  return state.callLeg.status === 'open' || state.putLeg.status === 'open';
+}

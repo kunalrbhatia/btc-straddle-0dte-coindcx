@@ -7,6 +7,7 @@ import {
   saveStraddleState,
   loadStraddleState,
   hasTodayExecuted,
+  hasUnresolvedOpenLeg,
 } from './stateStore';
 import { StraddlePositionState } from './types';
 
@@ -82,5 +83,65 @@ describe('StateStore Tests', () => {
     cleanTestFile();
     const executed = await hasTodayExecuted(testDate);
     assert.equal(executed, false);
+  });
+
+  describe('hasUnresolvedOpenLeg', () => {
+    const stateWith = (
+      callStatus: 'open' | 'closed',
+      putStatus: 'open' | 'closed',
+      resolvedScenario?: StraddlePositionState['resolvedScenario']
+    ): StraddlePositionState => ({
+      date: testDate,
+      entryExecuted: true,
+      callLeg: {
+        legType: 'CALL',
+        symbol: 'BTC-1JAN99-100000-C-USDT',
+        entryPrice: 320,
+        entryPriceSource: 'fill',
+        stopLossPrice: 640,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: callStatus,
+        currentPrice: 320,
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: 'BTC-1JAN99-100000-P-USDT',
+        entryPrice: 365,
+        entryPriceSource: 'fill',
+        stopLossPrice: 730,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: putStatus,
+        currentPrice: 365,
+      },
+      totalCreditReceived: 685,
+      targetProfitPoints: 376.75,
+      combinedPnLPoints: 0,
+      resolvedScenario,
+      updatedAt: new Date().toISOString(),
+    });
+
+    it('is true while a leg is still open and the cycle is unresolved', () => {
+      assert.equal(hasUnresolvedOpenLeg(stateWith('open', 'closed')), true);
+      assert.equal(hasUnresolvedOpenLeg(stateWith('closed', 'open')), true);
+    });
+
+    it('is false once every leg is closed', () => {
+      assert.equal(hasUnresolvedOpenLeg(stateWith('closed', 'closed')), false);
+    });
+
+    it('is false once the cycle is resolved, even if a leg was left open', () => {
+      assert.equal(hasUnresolvedOpenLeg(stateWith('open', 'open', 'MAX_TIME_REACHED')), false);
+    });
+
+    it('is false for missing state or a state that never entered', () => {
+      assert.equal(hasUnresolvedOpenLeg(null), false);
+      assert.equal(hasUnresolvedOpenLeg(undefined), false);
+      assert.equal(
+        hasUnresolvedOpenLeg({ ...stateWith('open', 'open'), entryExecuted: false }),
+        false
+      );
+    });
   });
 });

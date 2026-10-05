@@ -27,6 +27,71 @@ export interface AlertRecord {
   readonly meta?: Record<string, unknown>;
 }
 
+/**
+ * Optional alert collapsing.
+ *
+ * Why: a per-poll failure (e.g. the price feed going away for an option that has
+ * already expired) used to journal one line EVERY poll — 2/second for hours — which
+ * the Hermes watch banner relays verbatim. That is not news, and it buries the
+ * alerts that are. With a `dedupKey`, the first occurrence is always written; exact
+ * repeats inside `windowMs` are counted and dropped; the next emission after the
+ * window carries the suppressed count so nothing is silently lost.
+ *
+ * Calls without `dedupKey` are unchanged (every alert still written).
+ */
+export interface AlertDedupOptions {
+  readonly dedupKey?: string;
+  /** Suppression window in ms. Defaults to 15 minutes. */
+  readonly windowMs?: number;
+}
+
+const DEFAULT_DEDUP_WINDOW_MS = 15 * 60 * 1000;
+
+interface DedupWindow {
+  lastEmittedAt: number;
+  suppressed: number;
+  windowMs: number;
+}
+
+const dedupWindows = new Map<string, DedupWindow>();
+
+/** Test/reset hook — clears all suppression state. */
+export function resetAlertDedup(): void {
+  dedupWindows.clear();
+}
+
+/**
+ * Evaluates the dedup window for a key.
+ * Returns whether this occurrence must be suppressed, and any note to append to
+ * the message being written now (the suppressed-repetition count).
+ */
+function evaluateDedup(options?: AlertDedupOptions): { suppressed: boolean; note: string } {
+  const key = options?.dedupKey;
+  if (!key) {
+    return { suppressed: false, note: '' };
+  }
+
+  const windowMs =
+    options?.windowMs !== undefined && options.windowMs > 0
+      ? options.windowMs
+      : DEFAULT_DEDUP_WINDOW_MS;
+  const now = Date.now();
+  const entry = dedupWindows.get(key);
+
+  if (!entry || now - entry.lastEmittedAt >= windowMs) {
+    const repeats = entry ? entry.suppressed : 0;
+    const note =
+      repeats > 0
+        ? ` [${repeats} repeat(s) suppressed in the previous ${Math.round(windowMs / 60000)} min]`
+        : '';
+    dedupWindows.set(key, { lastEmittedAt: now, suppressed: 0, windowMs });
+    return { suppressed: false, note };
+  }
+
+  entry.suppressed += 1;
+  return { suppressed: true, note: '' };
+}
+
 /** IST calendar date (YYYY-MM-DD) — the bot schedules everything in IST. */
 export function getIstDateString(now = new Date()): string {
   const ist = new Date(now.getTime() + IST_OFFSET_MINUTES * 60 * 1000);
@@ -61,14 +126,20 @@ export function alertFilePath(dateStr = getIstDateString()): string {
 export function appendAlert(
   kind: string,
   message: string,
-  meta?: Record<string, unknown>
+  meta?: Record<string, unknown>,
+  options?: AlertDedupOptions
 ): void {
   try {
+    const { suppressed, note } = evaluateDedup(options);
+    if (suppressed) {
+      return;
+    }
+
     fs.mkdirSync(LOGS_DIR, { recursive: true });
     const record: AlertRecord = {
       ts: getIstTimestamp(),
       kind,
-      message,
+      message: `${message}${note}`,
       ...(meta ? { meta } : {}),
     };
     fs.appendFileSync(alertFilePath(), `${JSON.stringify(record)}\n`, 'utf8');
