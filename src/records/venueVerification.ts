@@ -39,6 +39,8 @@ export interface VerifyCycleOptions {
   readonly snapshotOverride?: CycleSummarySnapshot;
 }
 
+import { getRecordSummaryPath } from './cycleRecordPaths';
+
 export async function verifyCycleAgainstVenue(
   cycleExpiryStr: string,
   options: VerifyCycleOptions = {}
@@ -58,7 +60,7 @@ export async function verifyCycleAgainstVenue(
       claims: [
         {
           claim: 'Cycle summary snapshot existence',
-          recordedValue: 'records/' + cycleExpiryStr + '.summary.json',
+          recordedValue: getRecordSummaryPath(cycleExpiryStr),
           venueValue: null,
           status: 'UNVERIFIED',
           reason: 'No record summary found on disk for this cycle',
@@ -254,14 +256,18 @@ export async function verifyCycleAgainstVenue(
     } else if (leg.status === 'closed' && leg.exitPrice !== null && leg.exitPrice !== undefined) {
       // Look for close order buy-back
       const closeOrderId = leg.closeOrderId;
-      const closeLedger = closeOrderId
+      let closeLedger = closeOrderId
         ? venueLedger.find((r) => String(r.orderId || r.order_id) === String(closeOrderId))
-        : venueLedger.find(
-            (r) =>
-              r.symbol === sym &&
-              (r.transactionType === 'TRADE' || r.type === 'TRADE') &&
-              Number(r.filledPrice) === leg.exitPrice
-          );
+        : undefined;
+
+      // Fallback: match by symbol + TRADE row in venue ledger
+      if (!closeLedger) {
+        closeLedger = venueLedger.find(
+          (r) =>
+            r.symbol === sym &&
+            (String(r.transactionType || r.type).toUpperCase() === 'TRADE')
+        );
+      }
 
       if (closeLedger && closeLedger.filledPrice !== undefined) {
         const venueFilled = Number(closeLedger.filledPrice);
@@ -282,7 +288,7 @@ export async function verifyCycleAgainstVenue(
             venueValue: venueFilled,
             delta,
             status: 'MISMATCH',
-            reason: `Recorded exit ${leg.exitPrice} differs from venue buyback ${venueFilled}`,
+            reason: `Recorded exit ${leg.exitPrice} differs from venue filledPrice ${venueFilled} by ${delta.toFixed(2)} pts`,
             rawVenueRow: closeLedger,
           });
         }

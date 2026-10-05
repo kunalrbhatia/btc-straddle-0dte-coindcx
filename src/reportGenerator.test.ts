@@ -15,10 +15,12 @@ describe('Daily Trade Report Unit Tests', () => {
   const testStateDir = path.join(tmpBase, 'state');
   const testLogsDir = path.join(tmpBase, 'logs');
   const testReportsDir = path.join(tmpBase, 'reports');
+  const testRecordsDir = path.join(tmpBase, 'records');
 
   fs.mkdirSync(testStateDir, { recursive: true });
   fs.mkdirSync(testLogsDir, { recursive: true });
   fs.mkdirSync(testReportsDir, { recursive: true });
+  fs.mkdirSync(testRecordsDir, { recursive: true });
 
   const originalEnv = { ...process.env };
 
@@ -27,6 +29,7 @@ describe('Daily Trade Report Unit Tests', () => {
     process.env.BTC_LOGS_DIR = testLogsDir;
     process.env.BTC_ALERTS_DIR = testLogsDir;
     process.env.BTC_REPORTS_DIR = testReportsDir;
+    process.env.RECORD_DIR = testRecordsDir;
   });
 
   test.after(() => {

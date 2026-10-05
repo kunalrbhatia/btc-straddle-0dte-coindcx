@@ -150,6 +150,7 @@ SL_MULTIPLIER=2.0
 PROFIT_TARGET_RATIO=0.55
 POLL_INTERVAL_MS=2000
 MAX_MONITOR_MINUTES=1380      # Optional (default 1380 = 23h): Max monitor window before cutoff
+SL_OVERRUN_TOLERANCE=0.10     # Optional (default 0.10 = 10%): Overrun tolerance beyond SL trigger before fallback close
 
 # Safe Mode / Testing
 DRY_RUN=false

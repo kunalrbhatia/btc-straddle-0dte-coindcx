@@ -2,20 +2,27 @@ import fs from 'fs';
 import path from 'path';
 import { getTodayDateStringIST } from './stateStore';
 
+import { assertSafeTestDirectory } from './testIsolationGuard';
+
 // Overridable (BTC_LOGS_DIR) so test runs cannot append fake MTM lines into the
 // live logs directory that the Hermes watch banner reads.
-const LOGS_DIR = process.env.BTC_LOGS_DIR
-  ? path.resolve(process.env.BTC_LOGS_DIR)
-  : path.resolve(process.cwd(), 'logs');
+export function getMtmLogsDir(): string {
+  const dir = process.env.BTC_LOGS_DIR
+    ? path.resolve(process.env.BTC_LOGS_DIR)
+    : path.resolve(process.cwd(), 'logs');
+  assertSafeTestDirectory(dir, 'MTM logs directory');
+  return dir;
+}
 
 export function ensureLogsDirectory(): void {
-  if (!fs.existsSync(LOGS_DIR)) {
-    fs.mkdirSync(LOGS_DIR, { recursive: true });
+  const dir = getMtmLogsDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 }
 
 export function getMtmLogFilePath(dateStr = getTodayDateStringIST()): string {
-  return path.join(LOGS_DIR, `mtm-${dateStr}.log`);
+  return path.join(getMtmLogsDir(), `mtm-${dateStr}.log`);
 }
 
 /**

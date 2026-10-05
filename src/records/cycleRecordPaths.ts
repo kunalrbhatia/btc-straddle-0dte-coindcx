@@ -1,10 +1,13 @@
 import fs from 'fs';
 import path from 'path';
+import { assertSafeTestDirectory } from '../testIsolationGuard';
 
 export function getRecordsDir(): string {
-  return process.env.RECORD_DIR
+  const dir = process.env.RECORD_DIR
     ? path.resolve(process.env.RECORD_DIR)
     : path.resolve(process.cwd(), 'records');
+  assertSafeTestDirectory(dir, 'records directory');
+  return dir;
 }
 
 export function ensureRecordsDirectory(): string {

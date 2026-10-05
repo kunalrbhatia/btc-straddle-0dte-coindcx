@@ -7,10 +7,14 @@ import path from 'path';
  * from racing against each other and placing/cancelling each other's orders.
  */
 
+import { assertSafeTestDirectory } from './testIsolationGuard';
+
 export function getLockDir(): string {
-  return process.env.BTC_LOCK_DIR
+  const dir = process.env.BTC_LOCK_DIR
     ? path.resolve(process.env.BTC_LOCK_DIR)
     : path.resolve(process.cwd(), 'state');
+  assertSafeTestDirectory(dir, 'lock directory');
+  return dir;
 }
 
 export function getLockFilePath(): string {

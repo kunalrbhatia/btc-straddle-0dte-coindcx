@@ -11,7 +11,7 @@ import { initializeStraddleState, monitorStraddleRisk } from './riskManager';
 import { Notifier } from './notifier';
 import { getTodayDateStringIST, saveStraddleState } from './stateStore';
 import { appendAlert } from './fileAlerter';
-import { classifyExitError, verifyStopOrderArmed } from './reconciliation';
+import { classifyExitError, verifyStopOrderArmed, rearmStopOrderIfMissing } from './reconciliation';
 import { CycleRecordWriter } from './records/cycleRecordWriter';
 import { parseContractExpiryDate } from './reports/reportDataCollector';
 
@@ -869,6 +869,9 @@ export async function executeShortStraddle(
           if (notifier) {
             void notifier.notifyError('Straddle Entry: CALL stop missing', new Error(alertMsg));
           }
+          if (callStopCheck.reason === 'MISSING') {
+            await rearmStopOrderIfMissing(client, state.callLeg, openOrders, config, expiryDateStr, notifier);
+          }
         }
 
         if (!putStopCheck.armed) {
@@ -882,6 +885,9 @@ export async function executeShortStraddle(
           });
           if (notifier) {
             void notifier.notifyError('Straddle Entry: PUT stop missing', new Error(alertMsg));
+          }
+          if (putStopCheck.reason === 'MISSING') {
+            await rearmStopOrderIfMissing(client, state.putLeg, openOrders, config, expiryDateStr, notifier);
           }
         }
       } catch (err) {

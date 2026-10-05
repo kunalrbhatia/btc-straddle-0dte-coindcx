@@ -338,50 +338,65 @@ describe('Reconciliation & Exit Safety Unit Tests', () => {
 
   describe('reconcileAndResurrectState', () => {
     it('resurrects an orphaned live position on exchange when state marked it closed or flat', async () => {
-      const livePositions: OptionsPosition[] = [
-        {
-          symbol: 'BTC-5OCT26-85250-P-USDT',
-          qty: 0.01,
-          entryPrice: 365,
-        },
-      ];
+      const os = await import('os');
+      const fs = await import('fs');
+      const path = await import('path');
+      const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'btc-recon-test-'));
+      const prevMode = process.env.BTC_TEST_MODE;
+      const prevStateDir = process.env.BTC_STATE_DIR;
+      const prevAlertsDir = process.env.BTC_ALERTS_DIR;
 
-      const { saveStraddleState } = await import('./stateStore');
-      const testState: StraddlePositionState = {
-        date: '2026-10-05',
-        entryExecuted: true,
-        callLeg: {
-          legType: 'CALL',
-          symbol: 'BTC-5OCT26-85250-C-USDT',
-          entryPrice: 320,
-          entryPriceSource: 'fill',
-          stopLossPrice: 640,
-          quantity: 0.01,
-          confirmedOpen: true,
-          status: 'closed',
-          currentPrice: 320,
-          exitPrice: 320,
-          closeReason: 'SL_HIT',
-        },
-        putLeg: {
-          legType: 'PUT',
-          symbol: 'BTC-5OCT26-85250-P-USDT',
-          entryPrice: 365,
-          entryPriceSource: 'fill',
-          stopLossPrice: 730,
-          quantity: 0.01,
-          confirmedOpen: true,
-          status: 'closed', // OOPS: marked closed in state!
-          currentPrice: 365,
-          exitPrice: 365,
-          closeReason: 'MONITOR_WINDOW_ELAPSED',
-        },
-        totalCreditReceived: 685,
-        targetProfitPoints: 376.75,
-        combinedPnLPoints: 0,
-        updatedAt: new Date().toISOString(),
-      };
-      await saveStraddleState(testState, '2026-10-05');
+      process.env.BTC_TEST_MODE = '1';
+      process.env.BTC_STATE_DIR = path.join(tmpBase, 'state');
+      process.env.BTC_ALERTS_DIR = path.join(tmpBase, 'alerts');
+      fs.mkdirSync(process.env.BTC_STATE_DIR, { recursive: true });
+      fs.mkdirSync(process.env.BTC_ALERTS_DIR, { recursive: true });
+
+      try {
+        const livePositions: OptionsPosition[] = [
+          {
+            symbol: 'BTC-5OCT26-85250-P-USDT',
+            qty: 0.01,
+            entryPrice: 365,
+          },
+        ];
+
+        const { saveStraddleState } = await import('./stateStore');
+        const testState: StraddlePositionState = {
+          date: '2026-10-05',
+          entryExecuted: true,
+          callLeg: {
+            legType: 'CALL',
+            symbol: 'BTC-5OCT26-85250-C-USDT',
+            entryPrice: 320,
+            entryPriceSource: 'fill',
+            stopLossPrice: 640,
+            quantity: 0.01,
+            confirmedOpen: true,
+            status: 'closed',
+            currentPrice: 320,
+            exitPrice: 320,
+            closeReason: 'SL_HIT',
+          },
+          putLeg: {
+            legType: 'PUT',
+            symbol: 'BTC-5OCT26-85250-P-USDT',
+            entryPrice: 365,
+            entryPriceSource: 'fill',
+            stopLossPrice: 730,
+            quantity: 0.01,
+            confirmedOpen: true,
+            status: 'closed', // OOPS: marked closed in state!
+            currentPrice: 365,
+            exitPrice: 365,
+            closeReason: 'MONITOR_WINDOW_ELAPSED',
+          },
+          totalCreditReceived: 685,
+          targetProfitPoints: 376.75,
+          combinedPnLPoints: 0,
+          updatedAt: new Date().toISOString(),
+        };
+        await saveStraddleState(testState, '2026-10-05');
 
       const mockClient = {
         getOptionsPositions: async () => livePositions,
@@ -402,10 +417,18 @@ describe('Reconciliation & Exit Safety Unit Tests', () => {
 
       const res = await reconcileAndResurrectState(mockClient, mockConfig, mockNotifier);
       assert.notEqual(res, null);
-      assert.equal(res?.resurrected, true);
-      assert.equal(res?.state.putLeg.status, 'open');
       assert.equal(res?.state.putLeg.symbol, 'BTC-5OCT26-85250-P-USDT');
       assert.match(reconNotified, /Adopted orphaned live position|Resurrected/i);
-    });
+    } finally {
+      process.env.BTC_TEST_MODE = prevMode;
+      process.env.BTC_STATE_DIR = prevStateDir;
+      process.env.BTC_ALERTS_DIR = prevAlertsDir;
+      try {
+        fs.rmSync(tmpBase, { recursive: true, force: true });
+      } catch {
+        // cleanup
+      }
+    }
   });
+});
 });

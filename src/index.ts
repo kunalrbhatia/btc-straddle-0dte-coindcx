@@ -5,7 +5,7 @@ import { scheduleAtIST } from './scheduler';
 import { findLatestStraddleState, getTodayDateStringIST, hasTodayExecuted, hasUnresolvedOpenLeg, loadStraddleState } from './stateStore';
 import { executeShortStraddle } from './straddle';
 import { monitorStraddleRisk } from './riskManager';
-import { reconcileAndResurrectState } from './reconciliation';
+import { reconcileAndResurrectState, rearmStopOrderIfMissing } from './reconciliation';
 import { acquireInstanceLock, InstanceLock } from './instanceLock';
 import { initReportScheduler } from './reports/reportScheduler';
 
@@ -92,6 +92,19 @@ async function main(): Promise<void> {
         console.warn(`[Startup Reconciliation] ⚠️ ${reconcileMsg}`);
         void notifier.notifyReconciliation(reconcileMsg);
 
+        // Re-arm any missing venue stop orders on startup (naked-leg risk mitigation)
+        try {
+          const openOrders = await client.getOpenOptionsOrders();
+          if (stateToResume.callLeg.status === 'open' && stateToResume.callLeg.confirmedOpen) {
+            await rearmStopOrderIfMissing(client, stateToResume.callLeg, openOrders, config, undefined, notifier);
+          }
+          if (stateToResume.putLeg.status === 'open' && stateToResume.putLeg.confirmedOpen) {
+            await rearmStopOrderIfMissing(client, stateToResume.putLeg, openOrders, config, undefined, notifier);
+          }
+        } catch (rearmErr) {
+          console.warn(`[Startup Reconciliation] Failed to verify/rearm stops on startup: ${(rearmErr as Error).message}`);
+        }
+
         // Resume monitoring. Deliberately no early return: the daily scheduler below
         // still has to be armed for this process to trade again.
         void monitorStraddleRisk(client, stateToResume, config, notifier);
@@ -105,6 +118,19 @@ async function main(): Promise<void> {
           const reconcileMsg = `Found existing OPEN position for today (${todayStr})! Resuming risk monitor without re-entering.`;
           console.warn(`[Startup Reconciliation] ⚠️ ${reconcileMsg}`);
           void notifier.notifyReconciliation(reconcileMsg);
+
+          // Re-arm any missing venue stop orders on startup
+          try {
+            const openOrders = await client.getOpenOptionsOrders();
+            if (existingState.callLeg.status === 'open' && existingState.callLeg.confirmedOpen) {
+              await rearmStopOrderIfMissing(client, existingState.callLeg, openOrders, config, undefined, notifier);
+            }
+            if (existingState.putLeg.status === 'open' && existingState.putLeg.confirmedOpen) {
+              await rearmStopOrderIfMissing(client, existingState.putLeg, openOrders, config, undefined, notifier);
+            }
+          } catch (rearmErr) {
+            console.warn(`[Startup Reconciliation] Failed to verify/rearm stops on startup: ${(rearmErr as Error).message}`);
+          }
 
           // Resume monitoring — scheduler stays armed (see note above).
           void monitorStraddleRisk(client, existingState, config, notifier);
