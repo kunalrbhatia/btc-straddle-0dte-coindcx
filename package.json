@@ -14,6 +14,7 @@
     "refresh-session": "node scripts/refresh-session.cjs",
     "scan-secrets": "node scripts/pre-commit-secrets.cjs",
     "verify:hooks": "node scripts/verify-hooks.cjs",
+    "report": "ts-node src/reportCli.ts",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "keywords": [

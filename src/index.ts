@@ -7,6 +7,7 @@ import { executeShortStraddle } from './straddle';
 import { monitorStraddleRisk } from './riskManager';
 import { reconcileAndResurrectState } from './reconciliation';
 import { acquireInstanceLock, InstanceLock } from './instanceLock';
+import { initReportScheduler } from './reports/reportScheduler';
 
 async function main(): Promise<void> {
   console.log('==================================================');
@@ -58,6 +59,13 @@ async function main(): Promise<void> {
     config.dryRun,
     { fallbackConversionRate: String(config.conversionRate) }
   );
+
+  // Initialize daily trade report scheduler (runs startup catch-up & sets expiry timer)
+  try {
+    initReportScheduler(client, config, notifier);
+  } catch (schedErr) {
+    console.error(`[Runner] Failed to initialize report scheduler: ${(schedErr as Error).message}`);
+  }
 
   const todayStr = getTodayDateStringIST();
 

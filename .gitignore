@@ -9,4 +9,5 @@ session.token.*
 *.png
 __pycache__/
 *.pyc
-
+reports/*
+!reports/README.md
