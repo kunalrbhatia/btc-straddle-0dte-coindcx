@@ -169,7 +169,13 @@ export interface StraddleExecutionResult {
 
 export type LegStatus = 'open' | 'closed';
 
-export type LegCloseReason = 'SL_HIT' | 'PROFIT_TARGET_HIT' | 'MANUAL' | 'UNWOUND_PARTIAL' | 'EXPIRED';
+export type LegCloseReason =
+  | 'SL_HIT'
+  | 'PROFIT_TARGET_HIT'
+  | 'MANUAL'
+  | 'UNWOUND_PARTIAL'
+  | 'EXPIRED'
+  | 'MONITOR_WINDOW_ELAPSED';
 
 export type TradeScenario =
   | 'PROFIT_TARGET_REACHED'
@@ -193,6 +199,7 @@ export interface ActiveLeg {
   exitPrice?: number;
   closeReason?: LegCloseReason;
   exitOrderId?: string;
+  closeAttempts?: number;
 }
 
 export interface RiskManagementConfig {

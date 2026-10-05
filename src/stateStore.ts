@@ -4,9 +4,11 @@ import { StraddlePositionState } from './types';
 
 // Overridable (BTC_STATE_DIR) so test runs cannot write a fake position into
 // the live state directory that the bot reconciles against at startup.
-const STATE_DIR = process.env.BTC_STATE_DIR
-  ? path.resolve(process.env.BTC_STATE_DIR)
-  : path.resolve(process.cwd(), 'state');
+export function getStateDir(): string {
+  return process.env.BTC_STATE_DIR
+    ? path.resolve(process.env.BTC_STATE_DIR)
+    : path.resolve(process.cwd(), 'state');
+}
 
 export function getTodayDateStringIST(now = new Date()): string {
   // IST is UTC + 5:30 (330 minutes)
@@ -19,30 +21,86 @@ export function getTodayDateStringIST(now = new Date()): string {
 }
 
 export function getStateFilePath(dateStr: string): string {
-  return path.join(STATE_DIR, `straddle-state-${dateStr}.json`);
+  return path.join(getStateDir(), `straddle-state-${dateStr}.json`);
 }
 
 export function ensureStateDirectory(): void {
-  if (!fs.existsSync(STATE_DIR)) {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
+  const dir = getStateDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 }
 
 /**
- * Saves straddle state atomically (write to temp file then rename)
+ * Searches for all straddle state files and returns the most recent one by date filename.
  */
+export async function findLatestStraddleState(): Promise<{ state: StraddlePositionState; date: string } | null> {
+  const dir = getStateDir();
+  if (!fs.existsSync(dir)) {
+    return null;
+  }
+
+  try {
+    const files = await fs.promises.readdir(dir);
+    const stateFiles = files
+      .filter((f) => f.startsWith('straddle-state-') && f.endsWith('.json'))
+      .sort()
+      .reverse();
+
+    for (const f of stateFiles) {
+      const dateMatch = f.match(/straddle-state-(\d{4}-\d{2}-\d{2})\.json/);
+      const dateStr = dateMatch ? dateMatch[1] : '';
+      const state = await loadStraddleState(dateStr);
+      if (state && state.entryExecuted) {
+        return { state, date: dateStr };
+      }
+    }
+  } catch (err) {
+    console.error(`[StateStore] Error scanning state directory: ${err}`);
+  }
+
+  return null;
+}
+
 export async function saveStraddleState(
   state: StraddlePositionState,
   dateStr = getTodayDateStringIST()
 ): Promise<void> {
   ensureStateDirectory();
   const targetPath = getStateFilePath(dateStr);
-  const tempPath = `${targetPath}.${Date.now()}.tmp`;
+  const tempPath = `${targetPath}.${Date.now()}.${Math.random().toString(36).substring(2, 7)}.tmp`;
 
   const payload = JSON.stringify(state, null, 2);
 
   await fs.promises.writeFile(tempPath, payload, 'utf8');
-  await fs.promises.rename(tempPath, targetPath);
+
+  // Atomic rename with retries for Windows file lock tolerance
+  let renamed = false;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await fs.promises.rename(tempPath, targetPath);
+      renamed = true;
+      break;
+    } catch (err: any) {
+      lastErr = err;
+      if (err && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES')) {
+        await new Promise((r) => setTimeout(r, 20 * (attempt + 1)));
+      } else {
+        break;
+      }
+    }
+  }
+
+  if (!renamed) {
+    try {
+      // Fallback direct write on persistent Windows file lock
+      await fs.promises.writeFile(targetPath, payload, 'utf8');
+      await fs.promises.unlink(tempPath).catch(() => {});
+    } catch {
+      throw lastErr;
+    }
+  }
 }
 
 /**

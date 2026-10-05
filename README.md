@@ -33,7 +33,11 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
    - **Exchange-Side Stop Loss**: Along with the Limit order, the bot sends `stopLoss = limitPrice * SL_MULTIPLIER` (2 decimals, e.g. `416.00 -> 832.00`) directly in the order creation payload (`POST /api/v2/options/order/create`). This provides primary exchange-level stop protection even if the bot process or network drops.
    - **Bot-Side Profit Target**: The combined +55% profit target is a portfolio-level condition across both legs that exchange single-leg orders cannot express. Thus, `takeProfit: ''` is sent on order creation, and the bot's risk monitor manages the profit target and serves as secondary stop protection.
    - **Payload Match**: Order create payload matches the CoinDCX web application byte-for-byte (`{ symbol, side, orderType, qty, price, stopLoss, takeProfit }`), omitting `conversionRate`.
-6. **Margin Currency & Precision**:
+6. **Exit Confirmation & State Reconciliation**:
+   - **Never Assume Closed Without Confirmation**: A leg is marked `closed` only after explicit confirmation (order return success or reconciliation check via `GET /api/v1/options/positions`). Rejection (e.g. HTTP 400 `"Please retry."`) leaves the leg open in state, retries transient failures with bounded backoff (3 attempts), and alerts loudly.
+   - **Reconcile & Resurrect**: On startup and resume, the bot reconciles stored state against live exchange positions. If an unmonitored live leg exists on the exchange (e.g. after a failed close or premature flat state), the bot adopts and resurrects it into state, resuming active monitoring and dispatching an immediate alert.
+   - **Monitor Window vs Expiry**: Distinguishes `MONITOR_WINDOW_ELAPSED` from actual contract `EXPIRED` status, preventing deceptive alerts. Default `MAX_MONITOR_MINUTES` is 1380 (23h) to allow holding until next-day settlement.
+7. **Margin Currency & Precision**:
    - Options are quoted on a **250 strike step grid** (e.g. 84750, 85000).
    - Position sizing: 0.01 BTC per leg at 10x leverage.
    - Note on balance: verify whether margin is held in USDT or INR before enabling live ordering.
@@ -137,7 +141,7 @@ ENTRY_FILL_TIMEOUT_MS=15000
 SL_MULTIPLIER=2.0
 PROFIT_TARGET_RATIO=0.55
 POLL_INTERVAL_MS=2000
-MAX_MONITOR_MINUTES=720
+MAX_MONITOR_MINUTES=1380      # Optional (default 1380 = 23h): Max monitor window before cutoff
 
 # Safe Mode / Testing
 DRY_RUN=false
