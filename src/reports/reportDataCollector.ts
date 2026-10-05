@@ -180,3 +180,108 @@ export function readCombinedAlerts(dateStrings: string[]): AlertLogItem[] {
   alerts.sort((a, b) => a.ts.localeCompare(b.ts));
   return alerts;
 }
+
+/**
+ * Parses alert ts string (e.g. "2026-10-05 10:52:46 IST" or ISO string) to epoch ms.
+ */
+export function parseAlertTimestampMs(ts: string): number | null {
+  if (!ts || typeof ts !== 'string') return null;
+  const normalized = ts.includes(' IST')
+    ? ts.replace(' IST', ' +05:30')
+    : ts;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export interface AlertFilterOptions {
+  readonly windowStartMs?: number;
+  readonly windowEndMs?: number;
+  readonly allowedSymbols?: readonly string[];
+}
+
+export interface CollapsedAlertItem {
+  readonly kind: string;
+  readonly message: string;
+  readonly count: number;
+  readonly firstTs: string;
+  readonly lastTs: string;
+  readonly firstTimeOnly: string;
+  readonly lastTimeOnly: string;
+}
+
+function extractTimePart(ts: string): string {
+  // e.g. "2026-10-05 10:52:46 IST" -> "10:52:46"
+  const m = ts.match(/\b(\d{2}:\d{2}:\d{2})\b/);
+  return m ? m[1] : ts;
+}
+
+/**
+ * Filters alerts to a cycle window and eliminates mentions of foreign cycle contracts,
+ * then collapses consecutive runs of identical (kind, message) events.
+ */
+export function filterAndCollapseAlerts(
+  alerts: readonly AlertLogItem[],
+  options: AlertFilterOptions = {}
+): CollapsedAlertItem[] {
+  const { windowStartMs, windowEndMs, allowedSymbols } = options;
+  const allowedSet = allowedSymbols && allowedSymbols.length > 0 ? new Set(allowedSymbols) : null;
+
+  // 1. Filter
+  const filtered = alerts.filter((item) => {
+    // Window filtering
+    if (windowStartMs !== undefined || windowEndMs !== undefined) {
+      const tsMs = parseAlertTimestampMs(item.ts);
+      if (tsMs !== null) {
+        if (windowStartMs !== undefined && tsMs < windowStartMs) return false;
+        if (windowEndMs !== undefined && tsMs > windowEndMs) return false;
+      }
+    }
+
+    // Symbol isolation: if allowedSymbols provided, reject any alert mentioning foreign contracts
+    if (allowedSet) {
+      const content = `${item.message} ${JSON.stringify(item.meta ?? {})}`;
+      const symbolMatches = content.match(/BTC-\d{1,2}[A-Z]{3}\d{2}-\d+-[CP]-USDT/gi);
+      if (symbolMatches && symbolMatches.length > 0) {
+        // Must contain ONLY allowed symbols
+        const hasForeignSymbol = symbolMatches.some((s) => !allowedSet.has(s.toUpperCase()));
+        if (hasForeignSymbol) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  });
+
+  // 2. Collapse consecutive identical (kind, message) runs
+  const collapsed: CollapsedAlertItem[] = [];
+
+  for (const item of filtered) {
+    const prev = collapsed[collapsed.length - 1];
+    if (prev && prev.kind === item.kind && prev.message === item.message) {
+      // Extend consecutive run
+      collapsed[collapsed.length - 1] = {
+        kind: prev.kind,
+        message: prev.message,
+        count: prev.count + 1,
+        firstTs: prev.firstTs,
+        lastTs: item.ts,
+        firstTimeOnly: prev.firstTimeOnly,
+        lastTimeOnly: extractTimePart(item.ts),
+      };
+    } else {
+      collapsed.push({
+        kind: item.kind,
+        message: item.message,
+        count: 1,
+        firstTs: item.ts,
+        lastTs: item.ts,
+        firstTimeOnly: extractTimePart(item.ts),
+        lastTimeOnly: extractTimePart(item.ts),
+      });
+    }
+  }
+
+  return collapsed;
+}
+

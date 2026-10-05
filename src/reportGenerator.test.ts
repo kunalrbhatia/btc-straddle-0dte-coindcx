@@ -297,11 +297,12 @@ describe('Daily Trade Report Unit Tests', () => {
     const result = await generateDailyReport(cycleDate, {
       usdtInrOverride: 100.0,
       positionsOverride: [],
+      now: new Date('2026-10-08T08:30:00.000Z'),
     });
 
-    assert.ok(result.content.includes('`expired (not closed by the bot)`'));
+    assert.ok(result.content.includes('`EXPIRED`'));
     // PUT entry 320 -> exit 0 = +320 pts (+ $3.20)
-    assert.ok(result.content.includes('| **PUT** | `BTC-8OCT26-85000-P-USDT` | $320.00 | $0.00 | `expired (not closed by the bot)` | +320.00 pts | +$3.20 | +₹320.00 |'));
+    assert.ok(result.content.includes('| **PUT** | `BTC-8OCT26-85000-P-USDT` | $320.00 | $0.00 | `EXPIRED` | +320.00 pts | +$3.20 | +₹320.00 |'));
   });
 
   test('startup catchup generates and publishes ungenerated past reports', async () => {
@@ -420,5 +421,90 @@ describe('Daily Trade Report Unit Tests', () => {
         // Ignore
       }
     })();
+  });
+
+  test('filters alerts by cycle window, isolates symbols, and collapses consecutive runs', async () => {
+    const cycleDate = '2026-10-05';
+    const entryDate = '2026-10-04';
+
+    const mockState: StraddlePositionState = {
+      date: entryDate,
+      entryExecuted: true,
+      callLeg: {
+        legType: 'CALL',
+        symbol: 'BTC-5OCT26-85250-C-USDT',
+        entryPrice: 320,
+        entryPriceSource: 'fill',
+        stopLossPrice: 640,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'closed',
+        currentPrice: 320,
+        exitPrice: 320,
+        closeReason: 'SL_HIT',
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        entryPrice: 365,
+        entryPriceSource: 'fill',
+        stopLossPrice: 730,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 365,
+      },
+      totalCreditReceived: 685,
+      targetProfitPoints: 376.75,
+      combinedPnLPoints: 0,
+      updatedAt: '2026-10-04T18:15:00.000Z',
+    };
+
+    fs.writeFileSync(
+      path.join(testStateDir, `straddle-state-${entryDate}.json`),
+      JSON.stringify(mockState, null, 2)
+    );
+
+    // Alerts containing:
+    // 1. Repeated auth_error (should collapse to x3)
+    // 2. Alert for this cycle's contract BTC-5OCT26-85250-P-USDT
+    // 3. Alert for a foreign cycle's contract BTC-6OCT26-85750-C-USDT (must be filtered out)
+    // 4. Alert after cycleEndMs (e.g. 15:30 IST, must be filtered out)
+    fs.writeFileSync(
+      path.join(testLogsDir, `alerts-${cycleDate}.jsonl`),
+      [
+        '{"ts":"2026-10-05 11:00:00 IST","kind":"auth_error","message":"Token expired"}',
+        '{"ts":"2026-10-05 11:01:00 IST","kind":"auth_error","message":"Token expired"}',
+        '{"ts":"2026-10-05 11:02:00 IST","kind":"auth_error","message":"Token expired"}',
+        '{"ts":"2026-10-05 12:00:00 IST","kind":"exit_failure","message":"Failed to close PUT (BTC-5OCT26-85250-P-USDT)"}',
+        '{"ts":"2026-10-05 14:00:00 IST","kind":"notify","message":"Entered next cycle BTC-6OCT26-85750-C-USDT"}',
+        '{"ts":"2026-10-05 16:00:00 IST","kind":"auth_error","message":"Token expired late"}',
+      ].join('\n') + '\n'
+    );
+
+    const result = await generateDailyReport(cycleDate, {
+      usdtInrOverride: 90,
+      positionsOverride: [
+        // Live positions on exchange right now include the next cycle's contract
+        { symbol: 'BTC-6OCT26-85750-C-USDT', qty: 0.01, entryPrice: 400 },
+      ],
+      now: new Date('2026-10-05T08:15:00.000Z'), // 13:45 IST
+    });
+
+    // Foreign contract BTC-6OCT26 must NOT appear anywhere in the report
+    assert.equal(result.content.includes('6OCT26'), false);
+    // Late alert must not appear
+    assert.equal(result.content.includes('Token expired late'), false);
+    // Collapsed consecutive auth_error alert run:
+    assert.ok(result.content.includes('`auth_error` **×3** — Token expired'));
+    // Legitimate alert for this cycle's contract appears:
+    assert.ok(result.content.includes('Failed to close PUT (BTC-5OCT26-85250-P-USDT)'));
+    // Open position from next cycle is not counted as an orphan for this cycle:
+    assert.ok(result.content.includes('0 position(s) of this cycle remain open on exchange'));
+    assert.equal(result.content.includes('Active orphan position detected'), false);
+    // Dual P&L block appears:
+    assert.ok(result.content.includes('Dual P&L Reconciliation'));
+    assert.ok(result.content.includes('State Points P&L'));
+    assert.ok(result.content.includes('Venue Ledger Cash P&L'));
   });
 });

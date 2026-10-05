@@ -57,7 +57,7 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
   - `DRY_RUN=true`: Simulates all order placements and cancellations without sending order network requests.
   - `npm run run-once`: Executes a single cycle.
 - **MTM Watcher Logging**: Appends tick-by-tick mark-to-market PnL tracking to `logs/mtm-<YYYY-MM-DD>.log`.
-- **Daily Trade Reports & Git Publishing**: Automatically generates a detailed markdown report at contract expiry + 15 min (`REPORT_DELAY_MINUTES`, default 15m) and publishes it exclusively to the bot-owned `reports` branch via isolated git plumbing without touching `main` or active worktrees (`npm run report`).
+- **Daily Trade Reports & Git Publishing**: Automatically generates a detailed markdown report at contract expiry + 15 min (`REPORT_DELAY_MINUTES`, default 15m) and publishes it exclusively to the bot-owned `reports` branch via isolated git plumbing without touching `main` or active worktrees (`npm run report`). Reports are cycle-accurate: operator journal is scoped to the cycle window with consecutive alert collapsing (`×N`), exchange positions are filtered to cycle contracts, expired legs without fills settle at $0.00 (`EXPIRED`), and dual P&L reconciles state points vs venue ledger cash.
 - **Pre-Commit Secret Scanning & Hook Verification**: Automated git hook (`scripts/pre-commit-secrets.cjs`), `npm run scan-secrets`, and verification command `npm run verify:hooks`. Detects three-part base64url JWT/Bearer tokens and sensitive repository variables (`COINDCX_BEARER_TOKEN`, `COINDCX_API_SECRET`, etc.) without printing secret values, while allowing placeholders and test fixtures. Supports `SKIP_SECRET_SCAN=1` override and optional TruffleHog deep scans.
 
 ---

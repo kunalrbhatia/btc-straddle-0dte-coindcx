@@ -28,6 +28,7 @@ export const OPTIONS_ENDPOINTS = {
   // cancelled). Try V2 first, fall back here on exactly that signature.
   orderCreateFallback: '/api/v1/options/order/create',
   orderCancel: '/api/v1/options/order/cancel',
+  walletTransactions: '/api/v1/options/wallet/transactions',
 } as const;
 
 export class SessionTokenExpiredError extends Error {
@@ -250,6 +251,60 @@ export class CoinDCXClient {
     }
 
     return [];
+  }
+
+  /**
+   * Fetches options wallet transactions from /api/v1/options/wallet/transactions.
+   * Used for venue ledger cash flow reconciliation (trade settlements, deliveries, fees).
+   * Returns empty array if session is invalid or endpoint returns an error.
+   */
+  public async getOptionsWalletTransactions(
+    params: { page?: number; size?: number } = {}
+  ): Promise<readonly Record<string, unknown>[]> {
+    const token = this.getBearerToken();
+    if (!token) {
+      return [];
+    }
+
+    try {
+      const page = params.page ?? 1;
+      const size = params.size ?? 50;
+      const endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.walletTransactions}?page=${page}&size=${size}`;
+      const response = await fetch(endpoint, {
+        method: 'GET',
+        headers: this.getOptionsHeaders(token),
+      });
+
+      if (!response.ok) {
+        return [];
+      }
+
+      const raw = (await response.json()) as unknown;
+      if (Array.isArray(raw)) {
+        return raw as readonly Record<string, unknown>[];
+      }
+      if (typeof raw === 'object' && raw !== null) {
+        const rec = raw as Record<string, unknown>;
+        if (Array.isArray(rec.data)) {
+          return rec.data as readonly Record<string, unknown>[];
+        }
+        if (rec.data && typeof rec.data === 'object') {
+          const nested = rec.data as Record<string, unknown>;
+          if (Array.isArray(nested.data)) {
+            return nested.data as readonly Record<string, unknown>[];
+          }
+          if (Array.isArray(nested.transactions)) {
+            return nested.transactions as readonly Record<string, unknown>[];
+          }
+        }
+        if (Array.isArray(rec.transactions)) {
+          return rec.transactions as readonly Record<string, unknown>[];
+        }
+      }
+      return [];
+    } catch {
+      return [];
+    }
   }
 
   /**

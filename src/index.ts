@@ -43,6 +43,7 @@ async function main(): Promise<void> {
   console.log(`[Config] Margin Currency: ${config.marginCurrency}`);
   console.log(`[Config] Stop Loss Mult : ${config.riskConfig.stopLossMultiplier}x (+100%)`);
   console.log(`[Config] Profit Target  : ${config.riskConfig.profitTargetRatio * 100}% of combined credit`);
+  console.log(`[Config] Report Delay   : ${config.reportDelayMinutes ?? 15} min post-expiry (target: ${(config.dailyExpiryHourUTC ?? 8) + 5}:30 + ${config.reportDelayMinutes ?? 15}m IST)`);
   console.log('==================================================\n');
 
   const notifier = new TelegramNotifier(
