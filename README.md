@@ -119,8 +119,14 @@ MARGIN_CURRENCY=USDT
 # public market data). This value is used solely when that lookup fails.
 CONVERSION_RATE=102
 STRIKE_STEP=250
-EXECUTION_HOUR_IST=18
-EXECUTION_MINUTE_IST=15
+
+# Schedule & Expiry (Single Source of Truth: .env)
+# Changing these here and restarting moves the entry time, PM2 restart, contract rollover, and monitor together.
+EXECUTION_HOUR_IST=18        # Required (0-23): Entry hour in IST
+EXECUTION_MINUTE_IST=15      # Required (0-59): Entry minute in IST
+RESTART_LEAD_MINUTES=45      # Optional (default 45): PM2 pre-entry restart lead time
+DAILY_EXPIRY_HOUR_UTC=8      # Optional (default 8 = 13:30 IST): 0DTE daily options expiry boundary in UTC
+
 ENTRY_ORDER_TYPE=Limit
 ENTRY_FILL_TIMEOUT_MS=15000
 

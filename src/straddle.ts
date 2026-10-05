@@ -5,7 +5,7 @@ import {
   StraddleExecutionResult,
   StraddleLegs,
 } from './types';
-import { AppConfig } from './config';
+import { AppConfig, config } from './config';
 import { initializeStraddleState, monitorStraddleRisk } from './riskManager';
 import { Notifier } from './notifier';
 import { getTodayDateStringIST, saveStraddleState } from './stateStore';
@@ -45,15 +45,16 @@ const MONTH_NAMES = [
  * `BTC-4OCT26-84750-C-USDT`, while the bot asked for `BTC-3OCT26-...` and was
  * rejected with " does not exist." — that single date error was the whole bug.
  */
-const DAILY_EXPIRY_HOUR_UTC = 8;
-
 /** The expiry date of the contract that is actually tradeable right now. */
-export function nextExpiryDate(now = new Date()): Date {
+export function nextExpiryDate(
+  now = new Date(),
+  expiryHourUtc = config?.dailyExpiryHourUTC ?? 8
+): Date {
   const todaysExpiryMs = Date.UTC(
     now.getUTCFullYear(),
     now.getUTCMonth(),
     now.getUTCDate(),
-    DAILY_EXPIRY_HOUR_UTC,
+    expiryHourUtc,
     0,
     0,
     0
@@ -71,9 +72,10 @@ export function nextExpiryDate(now = new Date()): Date {
  */
 export function generateContractSymbols(
   atmStrike: number,
-  targetDate = new Date()
+  targetDate = new Date(),
+  expiryHourUtc = config?.dailyExpiryHourUTC ?? 8
 ): { readonly callSymbol: string; readonly putSymbol: string } {
-  const expiry = nextExpiryDate(targetDate);
+  const expiry = nextExpiryDate(targetDate, expiryHourUtc);
   const day = expiry.getUTCDate();
   const month = MONTH_NAMES[expiry.getUTCMonth()];
   const yy = String(expiry.getUTCFullYear()).slice(-2);

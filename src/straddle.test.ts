@@ -27,6 +27,7 @@ const mockConfig: AppConfig = {
   baseUrl: 'https://api.coindcx.com',
   scheduledHourIST: 18,
   scheduledMinuteIST: 15,
+  dailyExpiryHourUTC: 8,
   strikeStep: 250,
   orderQuantity: 0.01,
   leverage: 10,
@@ -73,6 +74,18 @@ describe('Straddle Execution & Unwind Tests', () => {
     const beforeExpiry = new Date('2026-10-03T05:00:00.000Z'); // 10:30 IST
     const symbols = generateContractSymbols(84750, beforeExpiry);
     assert.equal(symbols.callSymbol, 'BTC-3OCT26-84750-C-USDT');
+  });
+
+  it('shifts the derived contract when DAILY_EXPIRY_HOUR_UTC is customized', () => {
+    // At 10:00 UTC (15:30 IST):
+    // If daily expiry is 8 (08:00 UTC), 10:00 UTC is AFTER expiry -> rolls to NEXT day (4OCT26).
+    // If daily expiry is changed to 12 (12:00 UTC), 10:00 UTC is BEFORE expiry -> stays on SAME day (3OCT26).
+    const midDay = new Date('2026-10-03T10:00:00.000Z');
+    const symbolsWithDefault8 = generateContractSymbols(84750, midDay, 8);
+    assert.equal(symbolsWithDefault8.callSymbol, 'BTC-4OCT26-84750-C-USDT');
+
+    const symbolsWithCustom12 = generateContractSymbols(84750, midDay, 12);
+    assert.equal(symbolsWithCustom12.callSymbol, 'BTC-3OCT26-84750-C-USDT');
   });
 
   it('aborts cleanly when both Call and Put entry orders fail', async () => {

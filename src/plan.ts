@@ -30,6 +30,7 @@ export async function runPlan(): Promise<void> {
   console.log(
     `[Plan] Target Execution Time: ${config.scheduledHourIST}:${String(config.scheduledMinuteIST).padStart(2, '0')} IST`
   );
+  console.log(`[Plan] Daily Expiry UTC: ${config.dailyExpiryHourUTC}:00 UTC`);
   console.log(`[Plan] Conversion Rate: ${await client.resolveConversionRate()} (live USDT/INR)`);
   console.log(`[Plan] Margin Currency: ${config.marginCurrency}`);
   console.log(`[Plan] Order Quantity: ${config.orderQuantity} BTC per leg`);

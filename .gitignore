@@ -7,3 +7,6 @@ state/
 session.token
 session.token.*
 *.png
+__pycache__/
+*.pyc
+

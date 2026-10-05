@@ -34,6 +34,7 @@ async function main(): Promise<void> {
   }
 
   console.log(`[Config] Scheduled Time : ${config.scheduledHourIST}:${String(config.scheduledMinuteIST).padStart(2, '0')} IST`);
+  console.log(`[Config] Daily Expiry UTC: ${config.dailyExpiryHourUTC}:00 UTC`);
   console.log(`[Config] Order Quantity : ${config.orderQuantity} BTC`);
   console.log(`[Config] Leverage       : ${config.leverage}x`);
   console.log(`[Config] Strike Step    : ${config.strikeStep}`);
