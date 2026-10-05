@@ -136,26 +136,43 @@ export async function publishDailyReport(
       execSync('git read-tree --empty', { cwd: repoDir, env, stdio: 'pipe', timeout: LOCAL_TIMEOUT_MS });
     }
 
-    // 3. Stage the report file into the isolated index using git add
-    // Note: ensure reports/<file>.md is in cwd relative path if reportsDir is within repo,
-    // or add object directly using git hash-object + git update-index
-    const reportData = fs.readFileSync(fullReportPath);
-    const blobHash = execSync('git hash-object -w --stdin', {
-      cwd: repoDir,
-      input: reportData,
-      env,
-      stdio: 'pipe',
-      timeout: LOCAL_TIMEOUT_MS,
-    })
-      .toString()
-      .trim();
+    // 3. Stage the report file and records into the isolated index using git add
+    const filesToStage: { relPath: string; fullPath: string }[] = [
+      { relPath: relReportPath, fullPath: fullReportPath },
+    ];
 
-    execSync(`git update-index --add --cacheinfo 100644 ${blobHash} "${relReportPath}"`, {
-      cwd: repoDir,
-      env,
-      stdio: 'pipe',
-      timeout: LOCAL_TIMEOUT_MS,
-    });
+    const recordFiles = [
+      path.join('records', `${expiryDateStr}.jsonl`),
+      path.join('records', `${expiryDateStr}.mtm.jsonl`),
+      path.join('records', `${expiryDateStr}.summary.json`),
+    ];
+
+    for (const rf of recordFiles) {
+      const fullRf = path.join(repoDir, rf);
+      if (fs.existsSync(fullRf)) {
+        filesToStage.push({ relPath: rf.replace(/\\/g, '/'), fullPath: fullRf });
+      }
+    }
+
+    for (const f of filesToStage) {
+      const fileData = fs.readFileSync(f.fullPath);
+      const blobHash = execSync('git hash-object -w --stdin', {
+        cwd: repoDir,
+        input: fileData,
+        env,
+        stdio: 'pipe',
+        timeout: LOCAL_TIMEOUT_MS,
+      })
+        .toString()
+        .trim();
+
+      execSync(`git update-index --add --cacheinfo 100644 ${blobHash} "${f.relPath}"`, {
+        cwd: repoDir,
+        env,
+        stdio: 'pipe',
+        timeout: LOCAL_TIMEOUT_MS,
+      });
+    }
 
     // 4. Write tree from isolated index
     const treeHash = execSync('git write-tree', { cwd: repoDir, env, stdio: 'pipe', timeout: LOCAL_TIMEOUT_MS })

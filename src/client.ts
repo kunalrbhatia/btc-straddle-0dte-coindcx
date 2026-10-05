@@ -255,55 +255,92 @@ export class CoinDCXClient {
 
   /**
    * Fetches options wallet transactions from /api/v1/options/wallet/transactions.
-   * Used for venue ledger cash flow reconciliation (trade settlements, deliveries, fees).
-   * Returns empty array if session is invalid or endpoint returns an error.
+   * Handles cursor-based pagination: records live at `data.list`, paged via `data.nextPageCursor`.
+   * Paginates until cursor is null or maxPages reached (default 10).
+   * Surfaces failure reasons if reads fail.
    */
   public async getOptionsWalletTransactions(
-    params: { page?: number; size?: number } = {}
+    params: { size?: number; maxPages?: number } = {}
   ): Promise<readonly Record<string, unknown>[]> {
     const token = this.getBearerToken();
     if (!token) {
+      console.warn('[CoinDCXClient] Cannot fetch wallet transactions: missing session token.');
       return [];
     }
 
+    const size = params.size ?? 50;
+    const maxPages = params.maxPages ?? 10;
+    const allRows: Record<string, unknown>[] = [];
+    let cursor: string | null = null;
+    let pageCount = 0;
+
     try {
-      const page = params.page ?? 1;
-      const size = params.size ?? 50;
-      const endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.walletTransactions}?page=${page}&size=${size}`;
-      const response = await fetch(endpoint, {
-        method: 'GET',
-        headers: this.getOptionsHeaders(token),
-      });
+      while (pageCount < maxPages) {
+        pageCount++;
+        let endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.walletTransactions}?size=${size}`;
+        if (cursor) {
+          endpoint += `&cursor=${encodeURIComponent(cursor)}`;
+        }
 
-      if (!response.ok) {
-        return [];
-      }
+        const response = await fetch(endpoint, {
+          method: 'GET',
+          headers: this.getOptionsHeaders(token),
+        });
 
-      const raw = (await response.json()) as unknown;
-      if (Array.isArray(raw)) {
-        return raw as readonly Record<string, unknown>[];
-      }
-      if (typeof raw === 'object' && raw !== null) {
+        if (response.status === 401) {
+          const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
+          console.error(`[CoinDCXClient] 401 Unauthorized fetching wallet transactions: ${msg}`);
+          appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
+          throw new SessionTokenExpiredError(msg);
+        }
+
+        if (!response.ok) {
+          const bodyText = await response.text().catch(() => '');
+          console.warn(
+            `[CoinDCXClient] Failed to fetch wallet transactions: HTTP ${response.status} ${response.statusText} (${bodyText.slice(0, 100)})`
+          );
+          break;
+        }
+
+        const raw = (await response.json()) as unknown;
+        if (!raw || typeof raw !== 'object') {
+          console.warn('[CoinDCXClient] Non-object response received for wallet transactions');
+          break;
+        }
+
         const rec = raw as Record<string, unknown>;
-        if (Array.isArray(rec.data)) {
-          return rec.data as readonly Record<string, unknown>[];
+        const dataObj = (rec.data && typeof rec.data === 'object') ? (rec.data as Record<string, unknown>) : null;
+
+        let rows: Record<string, unknown>[] = [];
+        if (dataObj && Array.isArray(dataObj.list)) {
+          rows = dataObj.list as Record<string, unknown>[];
+        } else if (Array.isArray(rec.data)) {
+          rows = rec.data as Record<string, unknown>[];
+        } else if (Array.isArray(rec.list)) {
+          rows = rec.list as Record<string, unknown>[];
+        } else if (dataObj && Array.isArray(dataObj.data)) {
+          rows = dataObj.data as Record<string, unknown>[];
         }
-        if (rec.data && typeof rec.data === 'object') {
-          const nested = rec.data as Record<string, unknown>;
-          if (Array.isArray(nested.data)) {
-            return nested.data as readonly Record<string, unknown>[];
-          }
-          if (Array.isArray(nested.transactions)) {
-            return nested.transactions as readonly Record<string, unknown>[];
-          }
-        }
-        if (Array.isArray(rec.transactions)) {
-          return rec.transactions as readonly Record<string, unknown>[];
+
+        allRows.push(...rows);
+
+        const nextCursor = dataObj?.nextPageCursor ?? dataObj?.nextCursor ?? rec.nextPageCursor;
+        if (typeof nextCursor === 'string' && nextCursor.trim().length > 0) {
+          cursor = nextCursor.trim();
+        } else {
+          // No more pages
+          break;
         }
       }
-      return [];
-    } catch {
-      return [];
+
+      return allRows;
+    } catch (err) {
+      if (err instanceof SessionTokenExpiredError) {
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[CoinDCXClient] Error fetching wallet transactions: ${msg}`);
+      return allRows;
     }
   }
 
@@ -778,6 +815,7 @@ export class CoinDCXClient {
         { label: 'V1 fallback', path: OPTIONS_ENDPOINTS.orderCreateFallback },
       ] as const;
 
+      let activeRoute: string = createEndpoints[0].label;
       let response = await fetch(`${this.baseUrl}${createEndpoints[0].path}`, {
         method: 'POST',
         headers: this.getOptionsHeaders(token),
@@ -794,6 +832,7 @@ export class CoinDCXClient {
         console.warn(
           `[CoinDCXClient] ⚠️ create refused with a generic placement error on the primary route — retrying via ${alt.label}`
         );
+        activeRoute = alt.label;
         response = await fetch(`${this.baseUrl}${alt.path}`, {
           method: 'POST',
           headers: this.getOptionsHeaders(token),
@@ -850,6 +889,9 @@ export class CoinDCXClient {
         console.log(`[CoinDCXClient] Extracted order ID (${orderId}) from response field '${matchedField}'`);
       }
 
+      const errObj = (data.error as Record<string, unknown> | undefined) ?? {};
+      const traceId = (data.traceId ?? data.trace_id ?? errObj.traceId ?? errObj.trace_id) as string | undefined;
+
       const isSuccess =
         response.ok &&
         (data.status === 'success' ||
@@ -864,13 +906,13 @@ export class CoinDCXClient {
           orderId,
           limitPrice: numPrice,
           rawResponse: data,
+          route: activeRoute,
+          traceId,
         };
       }
 
-      const errObj = (data.error as Record<string, unknown> | undefined) ?? {};
       const errCode = errObj.code ?? data.code;
       const errErrorCode = errObj.errorCode ?? data.errorCode;
-      const traceId = data.traceId ?? data.trace_id ?? errObj.traceId ?? errObj.trace_id;
       const rawMsg =
         typeof errObj.message === 'string'
           ? errObj.message

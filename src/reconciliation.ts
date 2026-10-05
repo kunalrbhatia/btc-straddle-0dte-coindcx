@@ -4,6 +4,8 @@ import { Notifier } from './notifier';
 import { appendAlert } from './fileAlerter';
 import { saveStraddleState, findLatestStraddleState } from './stateStore';
 import { ActiveLeg, LegCloseReason, OptionsPosition, StraddlePositionState } from './types';
+import { CycleRecordWriter } from './records/cycleRecordWriter';
+import { parseContractExpiryDate as parseExpiryString } from './reports/reportDataCollector';
 
 export interface ExitResult {
   readonly success: boolean;
@@ -301,6 +303,36 @@ export async function reconcileAndResurrectState(
     const dateStr = expDate.toISOString().slice(0, 10);
     const adoptedState = buildAdoptedStateFromPositions(openPositions, dateStr, config);
     await saveStraddleState(adoptedState, dateStr);
+
+    const cycleExpiryStr = parseExpiryString(firstSym) || dateStr;
+    const recordWriter = new CycleRecordWriter(cycleExpiryStr);
+    recordWriter.appendEvent('CYCLE_START', {
+      entryDate: dateStr,
+      source: 'state-adoption',
+      adopted: true,
+      openPositions: openPositions.map((p) => p.symbol),
+    });
+    recordWriter.writeSummarySnapshot({
+      schemaVersion: 1,
+      cycle: cycleExpiryStr,
+      entryDate: dateStr,
+      updatedAt: new Date().toISOString(),
+      status: 'ADOPTED',
+      adopted: true,
+      source: 'state-adoption',
+      callSymbol: adoptedState.callLeg.symbol,
+      putSymbol: adoptedState.putLeg.symbol,
+      callLeg: {
+        symbol: adoptedState.callLeg.symbol,
+        entryPrice: adoptedState.callLeg.entryPrice,
+        status: adoptedState.callLeg.status,
+      },
+      putLeg: {
+        symbol: adoptedState.putLeg.symbol,
+        entryPrice: adoptedState.putLeg.entryPrice,
+        status: adoptedState.putLeg.status,
+      },
+    });
 
     const msg = `Adopted orphaned live position from exchange with 0 local state: ${openPositions.map((p) => p.symbol).join(', ')}`;
     console.warn(`[Reconciliation] 🚨 ${msg}`);

@@ -5,6 +5,8 @@ import { saveStraddleState } from './stateStore';
 import { recordMtmLog } from './mtmWatcher';
 import { appendAlert } from './fileAlerter';
 import { isPositionOpenOnExchange, parseContractExpiryDate, safeCloseLeg } from './reconciliation';
+import { CycleRecordWriter } from './records/cycleRecordWriter';
+import { parseContractExpiryDate as parseExpiryString } from './reports/reportDataCollector';
 import {
   ActiveLeg,
   EntryPriceSource,
@@ -218,6 +220,11 @@ export async function monitorStraddleRisk(
   const startTime = Date.now();
   const maxMonitorMs = (config.riskConfig.maxMonitorMinutes ?? 720) * 60 * 1000;
 
+  const cycleExpiryStr = parseExpiryString(state.callLeg.symbol) || parseExpiryString(state.putLeg.symbol) || state.date;
+  const recordWriter = new CycleRecordWriter(cycleExpiryStr);
+  let lastCheckpointTime = Date.now();
+  const checkpointInterval = config.checkpointIntervalMs ?? 300_000;
+
   return new Promise<TradeScenario>((resolve) => {
     let timer: NodeJS.Timeout | null = null;
 
@@ -230,6 +237,55 @@ export async function monitorStraddleRisk(
         state.resolvedScenario = scenario;
         state.updatedAt = new Date().toISOString();
         await saveStraddleState(state, state.date);
+
+        // Record CYCLE_CLOSED
+        recordWriter.appendEvent('CYCLE_CLOSED', {
+          resolvedScenario: scenario,
+          combinedPnLPoints: state.combinedPnLPoints,
+          callStatus: state.callLeg.status,
+          callExitPrice: state.callLeg.exitPrice,
+          putStatus: state.putLeg.status,
+          putExitPrice: state.putLeg.exitPrice,
+        });
+
+        // Write terminal summary snapshot
+        recordWriter.writeSummarySnapshot({
+          schemaVersion: 1,
+          cycle: cycleExpiryStr,
+          entryDate: state.date,
+          updatedAt: new Date().toISOString(),
+          status: 'CLOSED',
+          totalCreditReceived: state.totalCreditReceived,
+          targetProfitPoints: state.targetProfitPoints,
+          callLeg: {
+            symbol: state.callLeg.symbol,
+            entryPrice: state.callLeg.entryPrice,
+            venueAvgPrice: state.callLeg.venueAvgPrice,
+            status: state.callLeg.status,
+            exitPrice: state.callLeg.exitPrice,
+            closeReason: state.callLeg.closeReason,
+            orderId: state.callLeg.orderId,
+            closeOrderId: state.callLeg.exitOrderId,
+            pnlPoints: state.callLeg.exitPrice !== null && state.callLeg.exitPrice !== undefined
+              ? state.callLeg.entryPrice - state.callLeg.exitPrice
+              : null,
+          },
+          putLeg: {
+            symbol: state.putLeg.symbol,
+            entryPrice: state.putLeg.entryPrice,
+            venueAvgPrice: state.putLeg.venueAvgPrice,
+            status: state.putLeg.status,
+            exitPrice: state.putLeg.exitPrice,
+            closeReason: state.putLeg.closeReason,
+            orderId: state.putLeg.orderId,
+            closeOrderId: state.putLeg.exitOrderId,
+            pnlPoints: state.putLeg.exitPrice !== null && state.putLeg.exitPrice !== undefined
+              ? state.putLeg.entryPrice - state.putLeg.exitPrice
+              : null,
+          },
+          combinedPnLPoints: state.combinedPnLPoints,
+          resolvedScenario: scenario,
+        });
 
         if (notifier) {
           const summary =
@@ -395,6 +451,12 @@ export async function monitorStraddleRisk(
           state.callLeg.currentPrice >= state.callLeg.stopLossPrice
         ) {
           console.warn(`[Risk Manager] ⚠️ CALL leg hit 100% Stop Loss! Price: $${state.callLeg.currentPrice.toFixed(2)} >= SL: $${state.callLeg.stopLossPrice.toFixed(2)}`);
+          recordWriter.appendEvent('LEG_SL_HIT', {
+            legType: 'CALL',
+            symbol: state.callLeg.symbol,
+            price: state.callLeg.currentPrice,
+            stopLossPrice: state.callLeg.stopLossPrice,
+          });
           await closeLeg(
             client,
             state.callLeg,
@@ -403,6 +465,12 @@ export async function monitorStraddleRisk(
             config,
             notifier
           );
+          recordWriter.appendEvent('LEG_CLOSED', {
+            legType: 'CALL',
+            symbol: state.callLeg.symbol,
+            reason: 'SL_HIT',
+            exitPrice: state.callLeg.exitPrice ?? state.callLeg.currentPrice,
+          });
           state.updatedAt = new Date().toISOString();
           await saveStraddleState(state, state.date);
         }
@@ -412,6 +480,12 @@ export async function monitorStraddleRisk(
           state.putLeg.currentPrice >= state.putLeg.stopLossPrice
         ) {
           console.warn(`[Risk Manager] ⚠️ PUT leg hit 100% Stop Loss! Price: $${state.putLeg.currentPrice.toFixed(2)} >= SL: $${state.putLeg.stopLossPrice.toFixed(2)}`);
+          recordWriter.appendEvent('LEG_SL_HIT', {
+            legType: 'PUT',
+            symbol: state.putLeg.symbol,
+            price: state.putLeg.currentPrice,
+            stopLossPrice: state.putLeg.stopLossPrice,
+          });
           await closeLeg(
             client,
             state.putLeg,
@@ -420,6 +494,12 @@ export async function monitorStraddleRisk(
             config,
             notifier
           );
+          recordWriter.appendEvent('LEG_CLOSED', {
+            legType: 'PUT',
+            symbol: state.putLeg.symbol,
+            reason: 'SL_HIT',
+            exitPrice: state.putLeg.exitPrice ?? state.putLeg.currentPrice,
+          });
           state.updatedAt = new Date().toISOString();
           await saveStraddleState(state, state.date);
         }
@@ -429,8 +509,26 @@ export async function monitorStraddleRisk(
         const putPnL = calculateLegPnL(state.putLeg);
         state.combinedPnLPoints = callPnL + putPnL;
 
-        // Record MTM to daily log file
+        // Record MTM to daily log file and dedicated cycle MTM tape
         void recordMtmLog(state.combinedPnLPoints, new Date(), state.date);
+        recordWriter.appendMtmTape({
+          ts: new Date().toISOString(),
+          callMark: state.callLeg.currentPrice,
+          putMark: state.putLeg.currentPrice,
+          combinedPts: state.combinedPnLPoints,
+        });
+
+        // 5-minute periodic checkpoint event
+        if (Date.now() - lastCheckpointTime >= checkpointInterval) {
+          lastCheckpointTime = Date.now();
+          recordWriter.appendEvent('MTM_CHECKPOINT', {
+            callMark: state.callLeg.currentPrice,
+            putMark: state.putLeg.currentPrice,
+            combinedPnLPoints: state.combinedPnLPoints,
+            callStatus: state.callLeg.status,
+            putStatus: state.putLeg.status,
+          });
+        }
 
         console.log(
           `[Monitor] CALL: $${state.callLeg.currentPrice.toFixed(2)} (${state.callLeg.status}) | ` +
@@ -448,10 +546,11 @@ export async function monitorStraddleRisk(
             : 'PROFIT_TARGET_REACHED';
 
           console.log('\n🎯 ==============================================');
-          console.log(`🎯 PROFIT TARGET ACHIEVED: +${state.combinedPnLPoints.toFixed(2)} points!`);
-          console.log(`🎯 Scenario: ${resolvedScenario}`);
-          console.log('🎯 Closing remaining open legs...');
-          console.log('🎯 ==============================================\n');
+          recordWriter.appendEvent('TARGET_HIT', {
+            targetProfitPoints: state.targetProfitPoints,
+            combinedPnLPoints: state.combinedPnLPoints,
+            resolvedScenario,
+          });
 
           // Close all open remaining legs
           if (state.callLeg.status === 'open') {

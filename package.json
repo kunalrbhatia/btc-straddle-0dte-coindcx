@@ -15,6 +15,7 @@
     "scan-secrets": "node scripts/pre-commit-secrets.cjs",
     "verify:hooks": "node scripts/verify-hooks.cjs",
     "report": "ts-node src/reportCli.ts",
+    "verify": "ts-node src/verifyCli.ts",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "keywords": [
