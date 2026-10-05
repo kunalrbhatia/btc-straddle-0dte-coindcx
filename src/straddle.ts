@@ -729,7 +729,49 @@ export async function executeShortStraddle(
   // Scenario D: Both legs succeeded and confirmed filled
   console.log('[Straddle] ✅ Both legs placed & filled successfully! Initializing risk management...');
   try {
-    const state = await initializeStraddleState(callOutcome, putOutcome, client, config, undefined, undefined, todayStr);
+    let callVenueAvgPrice: number | undefined;
+    let putVenueAvgPrice: number | undefined;
+    try {
+      const openPositions = await client.getOptionsPositions();
+      const callPos = openPositions.find((p) => p.symbol === legs.callSymbol);
+      const putPos = openPositions.find((p) => p.symbol === legs.putSymbol);
+
+      if (callPos) {
+        const cAvg = Number(callPos.entryPrice ?? callPos.avgPrice ?? callPos.price);
+        if (Number.isFinite(cAvg) && cAvg > 0) {
+          callVenueAvgPrice = cAvg;
+          if (callOutcome.limitPrice && Math.abs(cAvg - callOutcome.limitPrice) > 0.001) {
+            console.log(
+              `[Straddle] CALL venue avgPrice ($${cAvg.toFixed(2)}) differs from order limit quote ($${callOutcome.limitPrice.toFixed(2)}). Using venue avgPrice as basis.`
+            );
+          }
+        }
+      }
+
+      if (putPos) {
+        const pAvg = Number(putPos.entryPrice ?? putPos.avgPrice ?? putPos.price);
+        if (Number.isFinite(pAvg) && pAvg > 0) {
+          putVenueAvgPrice = pAvg;
+          if (putOutcome.limitPrice && Math.abs(pAvg - putOutcome.limitPrice) > 0.001) {
+            console.log(
+              `[Straddle] PUT venue avgPrice ($${pAvg.toFixed(2)}) differs from order limit quote ($${putOutcome.limitPrice.toFixed(2)}). Using venue avgPrice as basis.`
+            );
+          }
+        }
+      }
+    } catch (posErr) {
+      console.warn(`[Straddle] Could not inspect exchange positions for venue avgPrice post-fill: ${(posErr as Error).message}`);
+    }
+
+    const state = await initializeStraddleState(
+      callOutcome,
+      putOutcome,
+      client,
+      config,
+      callVenueAvgPrice,
+      putVenueAvgPrice,
+      todayStr
+    );
     
     // Persist initial state
     await saveStraddleState(state, todayStr);

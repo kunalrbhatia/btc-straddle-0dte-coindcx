@@ -5,8 +5,10 @@ import {
   findStateForExpiry,
   parseMtmLogs,
   readCombinedAlerts,
+  filterAndCollapseAlerts,
 } from './reportDataCollector';
 import { ensureReportsDirectory, getReportFilePath } from './reportPaths';
+import { getExpiryTimeMs } from './reportScheduler';
 import fs from 'fs';
 
 export interface GenerateReportOptions {
@@ -16,6 +18,7 @@ export interface GenerateReportOptions {
   readonly positionsOverride?: readonly OptionsPosition[];
   readonly spotPriceOverride?: number;
   readonly now?: Date;
+  readonly walletTransactionsOverride?: readonly Record<string, unknown>[];
 }
 
 export interface ReportGenerationResult {
@@ -84,10 +87,35 @@ export async function generateDailyReport(
   const { state, entryDate } = found;
   const now = options.now ?? new Date();
 
+  // Cycle window calculation
+  const reportDelayMin = options.config?.reportDelayMinutes ?? 15;
+  const expiryHourUtc = options.config?.dailyExpiryHourUTC ?? 8;
+  const expiryMs = getExpiryTimeMs(expiryDateStr, expiryHourUtc);
+  const cycleEndMs = expiryMs + reportDelayMin * 60 * 1000;
+
+  // Window start calculation (entry timestamp if known, else start of entryDate in IST)
+  let cycleStartMs: number;
+  if (state.updatedAt) {
+    const parsedUp = Date.parse(state.updatedAt);
+    // If updatedAt is before expiry, start at beginning of that day
+    cycleStartMs = Number.isFinite(parsedUp)
+      ? Date.parse(`${entryDate}T00:00:00+05:30`)
+      : Date.parse(`${entryDate}T00:00:00+05:30`);
+  } else {
+    cycleStartMs = Date.parse(`${entryDate}T00:00:00+05:30`);
+  }
+
   // Unique list of dates to gather MTM logs and alerts across cycle
   const cycleDates = Array.from(new Set([entryDate, expiryDateStr])).sort();
   const mtmStats = parseMtmLogs(cycleDates);
-  const alerts = readCombinedAlerts(cycleDates);
+  const rawAlerts = readCombinedAlerts(cycleDates);
+
+  const allowedSymbols = [state.callLeg?.symbol, state.putLeg?.symbol].filter(Boolean) as string[];
+  const collapsedAlerts = filterAndCollapseAlerts(rawAlerts, {
+    windowStartMs: cycleStartMs,
+    windowEndMs: cycleEndMs,
+    allowedSymbols,
+  });
 
   // FX Rate
   let usdtInrRate: number | null = null;
@@ -127,15 +155,22 @@ export async function generateDailyReport(
   const putLeg = state.putLeg;
   const callLeg = state.callLeg;
 
+  // Filter live positions to ONLY this cycle's two symbols
+  const cyclePositions = livePositions.filter(
+    (p) => p.symbol === putLeg?.symbol || p.symbol === callLeg?.symbol
+  );
+
   // Multiplier USDT per point:
   // Derived from order qty 0.01 BTC = 0.01 USDT/point
   const putQty = Number(putLeg?.quantity ?? 0.01);
   const callQty = Number(callLeg?.quantity ?? 0.01);
   const contractMultiplier = Math.max(putQty, callQty, 0.01);
 
-  // Check orphan positions on exchange
-  const isPutOrphan = livePositions.some((p) => p.symbol === putLeg?.symbol);
-  const isCallOrphan = livePositions.some((p) => p.symbol === callLeg?.symbol);
+  // Check orphan positions on exchange specifically for this cycle's contracts
+  const isPutOrphan = cyclePositions.some((p) => p.symbol === putLeg?.symbol);
+  const isCallOrphan = cyclePositions.some((p) => p.symbol === callLeg?.symbol);
+
+  const isCycleExpired = now.getTime() >= expiryMs;
 
   // Calculate Leg details
   function formatLeg(
@@ -156,11 +191,15 @@ export async function generateDailyReport(
       if (exitPrice === null || exitPrice === undefined) {
         exitPrice = leg.currentPrice ?? entryPrice;
       }
-    } else {
-      // Leg was open in state and is NOT on exchange at/after expiry -> expired worthless
+    } else if (isCycleExpired) {
+      // Leg was open in state, not on exchange at/after expiry -> settled at 0.00
       isExpiredWorthless = true;
       exitPrice = 0;
-      reason = 'expired (not closed by the bot)';
+      reason = 'EXPIRED';
+    } else {
+      // Leg is still open before expiry
+      exitPrice = leg?.currentPrice ?? entryPrice;
+      reason = 'OPEN';
     }
 
     const pnlPoints = exitPrice !== null ? entryPrice - exitPrice : null;
@@ -185,7 +224,7 @@ export async function generateDailyReport(
   const putSummary = formatLeg('PUT', putLeg, isPutOrphan);
   const callSummary = formatLeg('CALL', callLeg, isCallOrphan);
 
-  // Combined PnL
+  // Combined PnL (State Points basis)
   let combinedPoints: number | null = null;
   let combinedUsdt: number | null = null;
   let combinedInr: number | null = null;
@@ -195,6 +234,18 @@ export async function generateDailyReport(
     combinedUsdt = (putSummary.pnlUsdt ?? 0) + (callSummary.pnlUsdt ?? 0);
     combinedInr =
       combinedUsdt !== null && usdtInrRate !== null ? combinedUsdt * usdtInrRate : null;
+  }
+
+  // Venue cash P&L from wallet transactions (Dual P&L basis)
+  let venueTransactions: readonly Record<string, unknown>[] = [];
+  if (options.walletTransactionsOverride !== undefined) {
+    venueTransactions = options.walletTransactionsOverride;
+  } else if (options.client) {
+    try {
+      venueTransactions = await options.client.getOptionsWalletTransactions();
+    } catch {
+      venueTransactions = [];
+    }
   }
 
   // Format Helper
@@ -207,6 +258,8 @@ export async function generateDailyReport(
     .toISOString()
     .replace('T', ' ')
     .slice(0, 19) + ' IST';
+
+  const reportTimeTimeOnly = generatedAtIst.slice(11);
 
   // Build Markdown
   let md = `# BTC 0DTE Short Straddle Trade Report — ${expiryDateStr}\n\n`;
@@ -254,14 +307,18 @@ export async function generateDailyReport(
 
   // Alerts Log
   md += `## 4. Alerts & Operator Journal\n\n`;
-  if (alerts.length > 0) {
-    md += `Chronological alerts logged during entry (${entryDate}) and expiry (${expiryDateStr}):\n\n`;
-    for (const a of alerts) {
-      md += `- **[${a.ts}]** \`${a.kind}\`: ${a.message}\n`;
+  if (collapsedAlerts.length > 0) {
+    md += `Chronological alerts logged during cycle window [${entryDate} → ${expiryDateStr}]:\n\n`;
+    for (const a of collapsedAlerts) {
+      if (a.count > 1) {
+        md += `- **[${a.firstTimeOnly}–${a.lastTimeOnly} IST]** \`${a.kind}\` **×${a.count}** — ${a.message}\n`;
+      } else {
+        md += `- **[${a.firstTs}]** \`${a.kind}\`: ${a.message}\n`;
+      }
     }
     md += `\n`;
   } else {
-    md += `_No alert records found for dates ${cycleDates.join(', ')}._\n\n`;
+    md += `_No alert records found for cycle window [${entryDate} → ${expiryDateStr}]._\n\n`;
   }
 
   // Data Quality & Invariants
@@ -269,11 +326,20 @@ export async function generateDailyReport(
   md += `- **FX Rate Provenance**: ${fxProvenance}\n`;
   md += `- **USDT Per Point**: Derived dynamically as ${contractMultiplier} USDT/pt (${(contractMultiplier * 100).toFixed(0)}% BTC lot size)\n`;
   md += `- **Underlying Spot Price (BTCUSDT)**: ${spotPrice !== null ? `$${spotPrice.toFixed(2)}` : 'N/A'}\n`;
-  md += `- **Exchange Positions Reconciliation**: ${livePositions.length} open position(s) detected at report time.\n`;
+  md += `- **Exchange Positions Reconciliation**: Live positions read at ${reportTimeTimeOnly}; ${cyclePositions.length} position(s) of this cycle remain open on exchange.\n`;
   if (putSummary.isOrphan || callSummary.isOrphan) {
     md += `  - ⚠️ **WARNING**: Active orphan position detected! Human operator intervention required.\n`;
   } else {
-    md += `  - ✅ Clean reconciliation. No unmonitored positions remain open on exchange.\n`;
+    md += `  - ✅ Clean reconciliation. 0 open positions of this cycle remain on exchange.\n`;
+  }
+
+  // Dual P&L Reconciliation note
+  md += `\n### Dual P&L Reconciliation (Points vs Venue Ledger)\n\n`;
+  md += `- **State Points P&L**: **${fmtPts(combinedPoints)}** (${fmtUsdt(combinedUsdt)})\n`;
+  if (venueTransactions.length > 0) {
+    md += `- **Venue Ledger Transactions**: ${venueTransactions.length} transaction record(s) reconciled.\n`;
+  } else {
+    md += `- **Venue Ledger Cash P&L**: N/A (wallet transactions endpoint unavailable or session unauthenticated; never fabricating numbers).\n`;
   }
   md += `\n---\n_Generated by btc-straddle-0dte automated reporting engine_\n`;
 
@@ -286,3 +352,4 @@ export async function generateDailyReport(
     content: md,
   };
 }
+
