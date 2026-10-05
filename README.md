@@ -57,6 +57,7 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
   - `DRY_RUN=true`: Simulates all order placements and cancellations without sending order network requests.
   - `npm run run-once`: Executes a single cycle.
 - **MTM Watcher Logging**: Appends tick-by-tick mark-to-market PnL tracking to `logs/mtm-<YYYY-MM-DD>.log`.
+- **Daily Trade Reports & Git Publishing**: Automatically generates a detailed markdown report at contract expiry + 15 min (`REPORT_DELAY_MINUTES`, default 15m) and publishes it exclusively to the bot-owned `reports` branch via isolated git plumbing without touching `main` or active worktrees (`npm run report`).
 - **Pre-Commit Secret Scanning & Hook Verification**: Automated git hook (`scripts/pre-commit-secrets.cjs`), `npm run scan-secrets`, and verification command `npm run verify:hooks`. Detects three-part base64url JWT/Bearer tokens and sensitive repository variables (`COINDCX_BEARER_TOKEN`, `COINDCX_API_SECRET`, etc.) without printing secret values, while allowing placeholders and test fixtures. Supports `SKIP_SECRET_SCAN=1` override and optional TruffleHog deep scans.
 
 ---
@@ -147,6 +148,11 @@ MAX_MONITOR_MINUTES=1380      # Optional (default 1380 = 23h): Max monitor windo
 DRY_RUN=false
 ALLOW_INSTANT_EXECUTION=false
 
+# Daily Trade Reporting
+REPORT_DELAY_MINUTES=15        # Optional (default 15, range 0-180): Delay past contract expiry before generating trade report
+REPORT_GIT_AUTHOR_NAME="btc-straddle-0dte bot"
+REPORT_GIT_AUTHOR_EMAIL="bot@straddle-btc-0dte.local"
+
 # Optional Telegram Notifications
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -190,6 +196,18 @@ TELEGRAM_CHAT_ID=
 - **Typecheck**:
   ```bash
   npm run typecheck
+  ```
+
+- **Generate Daily Trade Report**:
+  ```bash
+  # Print report for a cycle to stdout
+  npm run report -- --cycle 2026-10-05 --stdout
+
+  # Generate and publish to reports branch (dry run)
+  npm run report -- --cycle 2026-10-05 --dry-run
+
+  # Generate and commit to reports branch
+  npm run report -- --cycle 2026-10-05
   ```
 
 ---

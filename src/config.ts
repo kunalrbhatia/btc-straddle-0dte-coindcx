@@ -26,6 +26,9 @@ export interface AppConfig {
   readonly riskConfig: RiskManagementConfig;
   readonly customCallSymbol?: string;
   readonly customPutSymbol?: string;
+  readonly reportDelayMinutes?: number;
+  readonly reportGitAuthorName?: string;
+  readonly reportGitAuthorEmail?: string;
 }
 
 export function parseRequiredIntInRange(key: string, min: number, max: number): number {
@@ -131,5 +134,8 @@ export const config: AppConfig = {
   },
   customCallSymbol: process.env.CUSTOM_CALL_SYMBOL || undefined,
   customPutSymbol: process.env.CUSTOM_PUT_SYMBOL || undefined,
+  reportDelayMinutes: parseOptionalIntInRange('REPORT_DELAY_MINUTES', 15, 0, 180),
+  reportGitAuthorName: process.env.REPORT_GIT_AUTHOR_NAME || 'btc-straddle-0dte bot',
+  reportGitAuthorEmail: process.env.REPORT_GIT_AUTHOR_EMAIL || 'bot@straddle-btc-0dte.local',
 };
 

@@ -8,8 +8,9 @@ const alertsDir = path.join(tmpBase, 'btc-test-alerts');
 const stateDir = path.join(tmpBase, 'btc-test-state');
 const logsDir = path.join(tmpBase, 'btc-test-logs');
 const lockDir = path.join(tmpBase, 'btc-test-lock');
+const reportsDir = path.join(tmpBase, 'btc-test-reports');
 
-[alertsDir, stateDir, logsDir, lockDir].forEach((dir) => {
+[alertsDir, stateDir, logsDir, lockDir, reportsDir].forEach((dir) => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -21,6 +22,7 @@ const env = {
   BTC_STATE_DIR: stateDir,
   BTC_LOGS_DIR: logsDir,
   BTC_LOCK_DIR: lockDir,
+  BTC_REPORTS_DIR: reportsDir,
 };
 
 const result = spawnSync(
