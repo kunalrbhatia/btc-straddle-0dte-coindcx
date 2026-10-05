@@ -4,13 +4,19 @@ import { Notifier } from './notifier';
 import { saveStraddleState } from './stateStore';
 import { recordMtmLog } from './mtmWatcher';
 import { appendAlert } from './fileAlerter';
-import { isPositionOpenOnExchange, parseContractExpiryDate, safeCloseLeg } from './reconciliation';
+import {
+  isPositionOpenOnExchange,
+  parseContractExpiryDate,
+  safeCloseLeg,
+  verifyStopOrderArmed,
+} from './reconciliation';
 import { CycleRecordWriter } from './records/cycleRecordWriter';
 import { parseContractExpiryDate as parseExpiryString } from './reports/reportDataCollector';
 import {
   ActiveLeg,
   EntryPriceSource,
   LegCloseReason,
+  OptionsPosition,
   OrderPlacementOutcome,
   StraddlePositionState,
   TradeScenario,
@@ -308,7 +314,174 @@ export async function monitorStraddleRisk(
 
     timer = setInterval(async () => {
       try {
-        // Fetch current prices for open legs
+        // Step 1: Venue Position Truth & Reconciliation on every poll
+        let venuePositions: readonly OptionsPosition[] = [];
+        let venueOrders: readonly Record<string, unknown>[] = [];
+        let venueFetchFailed = false;
+
+        const hasVenuePositionsFeed = typeof client.getOptionsPositions === 'function';
+        try {
+          const posPromise = hasVenuePositionsFeed
+            ? client.getOptionsPositions().catch(() => {
+                venueFetchFailed = true;
+                return [];
+              })
+            : Promise.resolve([]);
+          const ordPromise = typeof client.getOpenOptionsOrders === 'function'
+            ? client.getOpenOptionsOrders().catch(() => {
+                venueFetchFailed = true;
+                return [];
+              })
+            : Promise.resolve([]);
+
+          [venuePositions, venueOrders] = await Promise.all([posPromise, ordPromise]);
+        } catch (err) {
+          venueFetchFailed = true;
+          console.warn(`[Risk Manager] Could not fetch live venue positions/orders: ${(err as Error).message}`);
+        }
+
+        if (!venueFetchFailed && hasVenuePositionsFeed) {
+          // A. Detect unexpected positions on cycle symbols (e.g. long positions from accidental buys)
+          for (const p of venuePositions) {
+            const sym = p.symbol || '';
+            if (sym === state.callLeg.symbol || sym === state.putLeg.symbol) {
+              const qty = Number(p.qty ?? p.quantity ?? 0);
+              const side = String(p.side || '').toLowerCase();
+              // In CoinDCX options, short positions are typically negative qty or side === 'sell'.
+              // An accidental long is qty > 0 with side === 'buy' (or positive qty when represented signed).
+              const isLong = side === 'buy' || (side !== 'sell' && qty > 0 && !p.isShort);
+              if (isLong && qty > 0) {
+                const anomalyMsg = `ANOMALY: Unexpected LONG position detected on venue for ${sym} (qty: ${qty}). Flattening immediately with reduceOnly.`;
+                console.error(`[Risk Manager] 🚨 ${anomalyMsg}`);
+                appendAlert('unexpected_position', anomalyMsg, { symbol: sym, qty, side: p.side });
+                recordWriter.appendEvent('ANOMALY', {
+                  type: 'UNEXPECTED_LONG_POSITION',
+                  symbol: sym,
+                  qty,
+                  side: p.side,
+                });
+                if (notifier) {
+                  void notifier.notifyError(`Unexpected Position (${sym})`, new Error(anomalyMsg));
+                }
+                // Flatten emergency long with reduceOnly: true
+                try {
+                  await client.placeOptionsOrder(sym, 'sell', qty, 'Market', undefined, '', '', undefined, true);
+                } catch (flatErr) {
+                  console.error(`[Risk Manager] Failed to flatten anomalous long position ${sym}: ${(flatErr as Error).message}`);
+                }
+              }
+            }
+          }
+
+          // B. Position truth: Check if open legs in state have disappeared from venue (e.g. venue stop fired)
+          for (const leg of [state.callLeg, state.putLeg]) {
+            if (leg.status !== 'open') {
+              continue;
+            }
+
+            const contractExpiry = parseContractExpiryDate(leg.symbol, config.dailyExpiryHourUTC);
+            const expiryPassed = contractExpiry !== null && Date.now() >= contractExpiry.getTime();
+            if (expiryPassed) {
+              // Expiry reconciliation will handle this below
+              continue;
+            }
+
+            const posOnVenue = venuePositions.find((p) => p.symbol === leg.symbol);
+            const venueQty = Number(posOnVenue?.qty ?? posOnVenue?.quantity ?? 0);
+            const isStillOpenOnVenue = Boolean(posOnVenue) && venueQty !== 0;
+
+            if (!isStillOpenOnVenue) {
+              // Position was open in state, but is gone on venue before expiry!
+              // The venue stop order executed, or it was closed on exchange.
+              console.log(
+                `[Risk Manager] 🎯 ${leg.legType} (${leg.symbol}) is ABSENT from venue positions. Adopting as closed via venue stop execution.`
+              );
+
+              // Resolve venue fill price from transactions or last known mark
+              let fillPrice = leg.currentPrice;
+              let fillOrderId = leg.exitOrderId;
+              try {
+                const txs = await client.getOptionsWalletTransactions();
+                const tradeRow = txs.find(
+                  (r) =>
+                    r.symbol === leg.symbol &&
+                    (String(r.transactionType || r.type).toUpperCase() === 'TRADE')
+                );
+                if (tradeRow && tradeRow.filledPrice !== undefined) {
+                  const p = Number(tradeRow.filledPrice);
+                  if (Number.isFinite(p) && p > 0) {
+                    fillPrice = p;
+                    fillOrderId = String(tradeRow.orderId || tradeRow.order_id || '') || fillOrderId;
+                    console.log(`[Risk Manager] Found venue fill price for ${leg.symbol}: $${fillPrice.toFixed(2)} (order: ${fillOrderId || 'n/a'})`);
+                  }
+                }
+              } catch (txErr) {
+                console.warn(`[Risk Manager] Could not query wallet transactions for venue fill: ${(txErr as Error).message}`);
+              }
+
+              leg.status = 'closed';
+              leg.exitPrice = fillPrice;
+              leg.closeReason = 'SL_HIT';
+              leg.exitOrderId = fillOrderId;
+
+              recordWriter.appendEvent('LEG_CLOSED', {
+                legType: leg.legType,
+                symbol: leg.symbol,
+                reason: 'SL_HIT',
+                exitPrice: leg.exitPrice,
+                source: 'venue',
+                orderId: fillOrderId,
+              });
+
+              state.updatedAt = new Date().toISOString();
+              await saveStraddleState(state, state.date);
+
+              const msg = `${leg.legType} (${leg.symbol}) closed by venue stop order at $${leg.exitPrice.toFixed(2)}.`;
+              appendAlert('leg_closed_venue', msg, {
+                symbol: leg.symbol,
+                leg: leg.legType,
+                exitPrice: leg.exitPrice,
+                orderId: fillOrderId,
+              });
+
+              if (notifier) {
+                void notifier.notifyLegClosed({
+                  legType: leg.legType,
+                  symbol: leg.symbol,
+                  reason: 'SL_HIT',
+                  exitPrice: leg.exitPrice,
+                  runningPnL: leg.entryPrice - leg.exitPrice,
+                });
+              }
+            } else {
+              // C. Leg is still open on venue: Verify stop order is armed
+              const stopCheck = verifyStopOrderArmed(venueOrders, leg);
+              if (!stopCheck.armed) {
+                const stopAlertMsg = `STOP ORDER ALERT for ${leg.legType} (${leg.symbol}): ${stopCheck.message || 'Not armed'}`;
+                console.error(`[Risk Manager] 🚨 ${stopAlertMsg}`);
+                appendAlert(
+                  stopCheck.reason === 'MISSING' ? 'stop_missing' : 'stop_mismatch',
+                  stopAlertMsg,
+                  {
+                    symbol: leg.symbol,
+                    leg: leg.legType,
+                    reason: stopCheck.reason,
+                    expectedTrigger: leg.stopLossPrice,
+                  },
+                  { dedupKey: `stop_alert:${leg.symbol}:${stopCheck.reason}` }
+                );
+                if (notifier) {
+                  void notifier.notifyError(
+                    `Stop Order Alert (${leg.symbol})`,
+                    new Error(stopAlertMsg)
+                  );
+                }
+              }
+            }
+          }
+        }
+
+        // Step 2: Fetch current prices for open legs
         let anyFeedMissing = false;
 
         for (const leg of [state.callLeg, state.putLeg]) {
@@ -317,23 +490,13 @@ export async function monitorStraddleRisk(
           }
 
           // ── Expiry-aware handling ─────────────────────────────────────────
-          // A contract past its expiry cannot be priced any more: the venue
-          // delists it, the positions feed drops it, and the public options
-          // ticker rejects a past expiry outright ("expiry time must be greater
-          // than current time"). Polling it anyway produced a
-          // "price feed unavailable" alert on EVERY poll — twice a second for
-          // hours on 2026-10-05. So stop asking and reconcile instead.
           const contractExpiry = parseContractExpiryDate(leg.symbol, config.dailyExpiryHourUTC);
           const expiryPassed = contractExpiry !== null && Date.now() >= contractExpiry.getTime();
 
           if (expiryPassed) {
-            // Tri-state: true = still listed, false = confirmed absent, null = unverifiable.
             const stillListed = await isPositionOpenOnExchange(client, leg.symbol);
 
             if (stillListed === false) {
-              // Confirmed gone from the exchange after expiry. The settlement value
-              // is NOT exposed by the API, so record the expiry without inventing
-              // one — never silently zero a surviving mark.
               leg.status = 'closed';
               leg.closeReason = 'EXPIRED';
               state.updatedAt = new Date().toISOString();
@@ -360,9 +523,6 @@ export async function monitorStraddleRisk(
             }
 
             if (stillListed === null) {
-              // Could not verify against the exchange. Keep the leg OPEN and
-              // monitored (never claim a close we cannot prove), but do not poll a
-              // price the venue is already refusing to give.
               anyFeedMissing = true;
               const msg =
                 `Expiry reconciliation failed for ${leg.legType} ${leg.symbol}: could not read the exchange ` +
@@ -376,8 +536,6 @@ export async function monitorStraddleRisk(
               }
               continue;
             }
-
-            // Still listed after expiry — keep tracking it normally (fall through).
           }
 
           const livePrice = await client.getContractPrice(leg.symbol);
@@ -400,22 +558,24 @@ export async function monitorStraddleRisk(
           console.warn('[Risk Manager] ⚠️ Position valuation is degraded due to missing mark price(s).');
         }
 
-        // Both legs are gone => the cycle is over. Resolve and stop the monitor
-        // rather than polling a dead contract until the next process restart.
+        // Both legs are gone => the cycle is over. Resolve and stop the monitor.
         if (state.callLeg.status === 'closed' && state.putLeg.status === 'closed') {
           state.combinedPnLPoints = calculateLegPnL(state.callLeg) + calculateLegPnL(state.putLeg);
           void recordMtmLog(state.combinedPnLPoints, new Date(), state.date);
           console.warn(
             `[Risk Manager] ✅ Both legs closed (CALL: ${state.callLeg.closeReason ?? 'n/a'} | ` +
-              `PUT: ${state.putLeg.closeReason ?? 'n/a'}) — resolving cycle after expiry reconciliation.`
+              `PUT: ${state.putLeg.closeReason ?? 'n/a'}) — resolving cycle.`
           );
-          await cleanupAndResolve('MAX_TIME_REACHED');
+          const scenario =
+            state.callLeg.closeReason === 'SL_HIT' && state.putLeg.closeReason === 'SL_HIT'
+              ? 'BOTH_LEGS_SL'
+              : 'MAX_TIME_REACHED';
+          await cleanupAndResolve(scenario);
           return;
         }
 
-        // End-of-life cutoff check
+        // Step 3: End-of-life cutoff check
         if (Date.now() - startTime >= maxMonitorMs) {
-          // Check if contract has actually expired or if only the monitor window elapsed
           const sampleSymbol = (state.callLeg.status === 'open' ? state.callLeg.symbol : state.putLeg.symbol) || '';
           const contractExpiry = parseContractExpiryDate(sampleSymbol, config.dailyExpiryHourUTC);
           const isActualContractExpired = contractExpiry ? Date.now() >= contractExpiry.getTime() : false;
@@ -436,7 +596,6 @@ export async function monitorStraddleRisk(
           state.updatedAt = new Date().toISOString();
           await saveStraddleState(state, state.date);
 
-          // Only resolve and stop monitoring if all legs are confirmed closed!
           if (state.callLeg.status === 'closed' && state.putLeg.status === 'closed') {
             await cleanupAndResolve('MAX_TIME_REACHED');
             return;
@@ -445,63 +604,68 @@ export async function monitorStraddleRisk(
           }
         }
 
-        // Check Individual Leg Stop Losses (100% SL)
-        if (
-          state.callLeg.status === 'open' &&
-          state.callLeg.currentPrice >= state.callLeg.stopLossPrice
-        ) {
-          console.warn(`[Risk Manager] ⚠️ CALL leg hit 100% Stop Loss! Price: $${state.callLeg.currentPrice.toFixed(2)} >= SL: $${state.callLeg.stopLossPrice.toFixed(2)}`);
-          recordWriter.appendEvent('LEG_SL_HIT', {
-            legType: 'CALL',
-            symbol: state.callLeg.symbol,
-            price: state.callLeg.currentPrice,
-            stopLossPrice: state.callLeg.stopLossPrice,
-          });
-          await closeLeg(
-            client,
-            state.callLeg,
-            state.callLeg.currentPrice,
-            'SL_HIT',
-            config,
-            notifier
-          );
-          recordWriter.appendEvent('LEG_CLOSED', {
-            legType: 'CALL',
-            symbol: state.callLeg.symbol,
-            reason: 'SL_HIT',
-            exitPrice: state.callLeg.exitPrice ?? state.callLeg.currentPrice,
-          });
-          state.updatedAt = new Date().toISOString();
-          await saveStraddleState(state, state.date);
-        }
+        // Step 4: Stop-Loss Monitoring & Stuck Stop Escalation
+        // IMPORTANT: The venue executes stop orders. The bot does NOT race the venue stop.
+        // It only sends a fallback close if mark has overshot the SL trigger by slOverrunTolerance (default 10%),
+        // the position is still open on venue, and the venue stop has failed to trigger.
+        const overrunTolerance = config.riskConfig.slOverrunTolerance ?? 0.10;
 
-        if (
-          state.putLeg.status === 'open' &&
-          state.putLeg.currentPrice >= state.putLeg.stopLossPrice
-        ) {
-          console.warn(`[Risk Manager] ⚠️ PUT leg hit 100% Stop Loss! Price: $${state.putLeg.currentPrice.toFixed(2)} >= SL: $${state.putLeg.stopLossPrice.toFixed(2)}`);
-          recordWriter.appendEvent('LEG_SL_HIT', {
-            legType: 'PUT',
-            symbol: state.putLeg.symbol,
-            price: state.putLeg.currentPrice,
-            stopLossPrice: state.putLeg.stopLossPrice,
-          });
-          await closeLeg(
-            client,
-            state.putLeg,
-            state.putLeg.currentPrice,
-            'SL_HIT',
-            config,
-            notifier
-          );
-          recordWriter.appendEvent('LEG_CLOSED', {
-            legType: 'PUT',
-            symbol: state.putLeg.symbol,
-            reason: 'SL_HIT',
-            exitPrice: state.putLeg.exitPrice ?? state.putLeg.currentPrice,
-          });
-          state.updatedAt = new Date().toISOString();
-          await saveStraddleState(state, state.date);
+        for (const leg of [state.callLeg, state.putLeg]) {
+          if (leg.status !== 'open') {
+            continue;
+          }
+
+          if (leg.currentPrice >= leg.stopLossPrice) {
+            console.warn(
+              `[Risk Manager] ℹ️ ${leg.legType} price ($${leg.currentPrice.toFixed(2)}) is at/above SL ($${leg.stopLossPrice.toFixed(2)}). Waiting for venue stop order execution...`
+            );
+
+            const overrunThreshold = leg.stopLossPrice * (1 + overrunTolerance);
+            if (leg.currentPrice >= overrunThreshold) {
+              // Stuck stop escalation!
+              const stuckMsg =
+                `STUCK STOP ESCALATION: ${leg.legType} price ($${leg.currentPrice.toFixed(2)}) exceeds SL ($${leg.stopLossPrice.toFixed(2)}) ` +
+                `by >${(overrunTolerance * 100).toFixed(0)}% (threshold $${overrunThreshold.toFixed(2)}) and position remains OPEN on venue. ` +
+                `Executing SL_FALLBACK_CLOSE with reduceOnly.`;
+              console.error(`[Risk Manager] 🚨 ${stuckMsg}`);
+              appendAlert('sl_fallback_close', stuckMsg, {
+                symbol: leg.symbol,
+                leg: leg.legType,
+                price: leg.currentPrice,
+                stopLossPrice: leg.stopLossPrice,
+                overrunThreshold,
+              });
+              recordWriter.appendEvent('ANOMALY', {
+                type: 'STUCK_STOP_FALLBACK_CLOSE',
+                symbol: leg.symbol,
+                leg: leg.legType,
+                price: leg.currentPrice,
+                stopLossPrice: leg.stopLossPrice,
+              });
+
+              await closeLeg(
+                client,
+                leg,
+                leg.currentPrice,
+                'SL_FALLBACK_CLOSE',
+                config,
+                notifier
+              );
+
+              const closedLeg = leg as ActiveLeg;
+              if (closedLeg.status === 'closed') {
+                recordWriter.appendEvent('LEG_CLOSED', {
+                  legType: leg.legType,
+                  symbol: leg.symbol,
+                  reason: 'SL_FALLBACK_CLOSE',
+                  exitPrice: leg.exitPrice ?? leg.currentPrice,
+                });
+              }
+
+              state.updatedAt = new Date().toISOString();
+              await saveStraddleState(state, state.date);
+            }
+          }
         }
 
         // Calculate current Combined PnL in points

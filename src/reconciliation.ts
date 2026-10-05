@@ -99,6 +99,108 @@ export function parseContractExpiryDate(symbol: string, defaultHourUtc = 8): Dat
 }
 
 /**
+ * Verifies that a stop order is armed on the venue for a given leg.
+ * Checks for an open order with:
+ * - symbol matching leg.symbol
+ * - triggerPrice matching expectedTriggerPrice (within tolerance)
+ * - status 'Untriggered' or 'Open'
+ * - reduceOnly: true
+ * - qty matching leg.quantity
+ */
+export function verifyStopOrderArmed(
+  orders: readonly Record<string, unknown>[],
+  leg: ActiveLeg,
+  tolerance = 2.0
+): {
+  readonly armed: boolean;
+  readonly reason?: 'MISSING' | 'TRIGGER_MISMATCH' | 'QTY_MISMATCH' | 'NOT_REDUCE_ONLY' | 'STATUS_INVALID';
+  readonly matchedOrder?: Record<string, unknown>;
+  readonly message?: string;
+} {
+  const symbolOrders = orders.filter((o) => {
+    const sym = String(o.symbol || o.pair || '');
+    return sym === leg.symbol;
+  });
+
+  if (symbolOrders.length === 0) {
+    return {
+      armed: false,
+      reason: 'MISSING',
+      message: `No open order found on venue for ${leg.symbol}`,
+    };
+  }
+
+  // Look for stop/trigger order
+  const stopOrder = symbolOrders.find((o) => {
+    const orderType = String(o.orderType || o.order_type || o.type || '').toLowerCase();
+    const hasTrigger = o.triggerPrice !== undefined || o.stopPrice !== undefined || o.stop_price !== undefined;
+    const isStopOrder = orderType.includes('stop') || hasTrigger;
+    const orderId = String(o.id || o.orderId || o.order_id || '');
+    return isStopOrder || orderId.startsWith('x-');
+  });
+
+  if (!stopOrder) {
+    return {
+      armed: false,
+      reason: 'MISSING',
+      message: `No stop order found on venue for ${leg.symbol} (found ${symbolOrders.length} orders but none are stop orders)`,
+    };
+  }
+
+  // Check trigger price
+  const rawTrigger = stopOrder.triggerPrice ?? stopOrder.stopPrice ?? stopOrder.stop_price;
+  const triggerPrice = Number(rawTrigger);
+  if (!Number.isFinite(triggerPrice) || Math.abs(triggerPrice - leg.stopLossPrice) > tolerance) {
+    return {
+      armed: false,
+      reason: 'TRIGGER_MISMATCH',
+      matchedOrder: stopOrder,
+      message: `Trigger price mismatch for ${leg.symbol}: venue has ${rawTrigger}, expected ${leg.stopLossPrice.toFixed(2)}`,
+    };
+  }
+
+  // Check quantity if available
+  const rawQty = stopOrder.qty ?? stopOrder.quantity ?? stopOrder.total_quantity;
+  if (rawQty !== undefined) {
+    const qty = Number(rawQty);
+    if (Number.isFinite(qty) && Math.abs(qty - leg.quantity) > 0.0001) {
+      return {
+        armed: false,
+        reason: 'QTY_MISMATCH',
+        matchedOrder: stopOrder,
+        message: `Quantity mismatch for ${leg.symbol} stop order: venue has ${rawQty}, expected ${leg.quantity}`,
+      };
+    }
+  }
+
+  // Check reduceOnly if present
+  if (stopOrder.reduceOnly !== undefined && stopOrder.reduceOnly === false) {
+    return {
+      armed: false,
+      reason: 'NOT_REDUCE_ONLY',
+      matchedOrder: stopOrder,
+      message: `Stop order for ${leg.symbol} is NOT reduceOnly`,
+    };
+  }
+
+  // Check status (should be Untriggered or Open or pending)
+  const status = String(stopOrder.status || '').toLowerCase();
+  if (status && status !== 'untriggered' && status !== 'open' && status !== 'pending') {
+    return {
+      armed: false,
+      reason: 'STATUS_INVALID',
+      matchedOrder: stopOrder,
+      message: `Stop order for ${leg.symbol} has unexpected status: ${status}`,
+    };
+  }
+
+  return {
+    armed: true,
+    matchedOrder: stopOrder,
+  };
+}
+
+/**
  * Closes an individual leg safely with bounded retry, classification, and exchange confirmation.
  * CRITICAL RULE: NEVER marks leg.status = 'closed' without exchange confirmation!
  */
@@ -157,6 +259,28 @@ export async function safeCloseLeg(
       }
 
       return { success: true, orderId: outcome.orderId, isPermanent: false };
+    }
+
+    if (outcome.isAlreadyFlat) {
+      console.log(
+        `[Exit] ℹ️ Leg ${leg.legType} (${leg.symbol}) is ALREADY_FLAT on venue (rejected with no open positions). Reconciling as closed.`
+      );
+      leg.status = 'closed';
+      leg.exitPrice = currentPrice;
+      leg.closeReason = reason;
+
+      if (notifier) {
+        const runningPnL = leg.entryPrice - currentPrice;
+        void notifier.notifyLegClosed({
+          legType: leg.legType,
+          symbol: leg.symbol,
+          reason,
+          exitPrice: currentPrice,
+          runningPnL,
+        });
+      }
+
+      return { success: true, isPermanent: false, message: 'ALREADY_FLAT' };
     }
 
     // Verify if position is already closed despite error return (e.g. race or prior fill)

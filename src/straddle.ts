@@ -11,7 +11,7 @@ import { initializeStraddleState, monitorStraddleRisk } from './riskManager';
 import { Notifier } from './notifier';
 import { getTodayDateStringIST, saveStraddleState } from './stateStore';
 import { appendAlert } from './fileAlerter';
-import { classifyExitError } from './reconciliation';
+import { classifyExitError, verifyStopOrderArmed } from './reconciliation';
 import { CycleRecordWriter } from './records/cycleRecordWriter';
 import { parseContractExpiryDate } from './reports/reportDataCollector';
 
@@ -849,6 +849,45 @@ export async function executeShortStraddle(
       venueAvgPrice: state.putLeg.venueAvgPrice,
       priceSource: state.putLeg.entryPriceSource,
     });
+
+    // Verify stop orders armed on venue
+    if (hasToken && !config.dryRun) {
+      try {
+        const openOrders = await client.getOpenOptionsOrders();
+        const callStopCheck = verifyStopOrderArmed(openOrders, state.callLeg);
+        const putStopCheck = verifyStopOrderArmed(openOrders, state.putLeg);
+
+        if (!callStopCheck.armed) {
+          const alertMsg = `CALL Stop Order not armed on venue post-entry! ${callStopCheck.message || 'Missing'}`;
+          console.error(`[Straddle] 🚨 ${alertMsg}`);
+          appendAlert('stop_missing', alertMsg, {
+            symbol: state.callLeg.symbol,
+            leg: 'CALL',
+            reason: callStopCheck.reason,
+            expectedTrigger: state.callLeg.stopLossPrice,
+          });
+          if (notifier) {
+            void notifier.notifyError('Straddle Entry: CALL stop missing', new Error(alertMsg));
+          }
+        }
+
+        if (!putStopCheck.armed) {
+          const alertMsg = `PUT Stop Order not armed on venue post-entry! ${putStopCheck.message || 'Missing'}`;
+          console.error(`[Straddle] 🚨 ${alertMsg}`);
+          appendAlert('stop_missing', alertMsg, {
+            symbol: state.putLeg.symbol,
+            leg: 'PUT',
+            reason: putStopCheck.reason,
+            expectedTrigger: state.putLeg.stopLossPrice,
+          });
+          if (notifier) {
+            void notifier.notifyError('Straddle Entry: PUT stop missing', new Error(alertMsg));
+          }
+        }
+      } catch (err) {
+        console.warn(`[Straddle] Could not verify stop orders post-fill: ${(err as Error).message}`);
+      }
+    }
 
     recordWriter.appendEvent('STOPS_ARMED', {
       callStopLossPrice: state.callLeg.stopLossPrice,
