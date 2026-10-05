@@ -200,6 +200,121 @@ export function verifyStopOrderArmed(
   };
 }
 
+export interface RearmResult {
+  readonly rearmed: boolean;
+  readonly orderId?: string;
+  readonly message?: string;
+}
+
+/**
+ * Re-arms a missing stop loss order for an open leg on the venue.
+ * Never touches or cancels an existing order if it already matches expectations.
+ * Places the stop order with:
+ * - symbol: leg.symbol
+ * - side: 'buy'
+ * - qty: leg.quantity
+ * - price: 0 (or Market)
+ * - stopLoss: triggerPrice (2 * entry price)
+ * - reduceOnly: true
+ * Logs STOP_RE_ARMED and writes ANOMALY event to cycle record.
+ */
+export async function rearmStopOrderIfMissing(
+  client: CoinDCXClient,
+  leg: ActiveLeg,
+  orders: readonly Record<string, unknown>[],
+  _config: AppConfig,
+  cycleExpiryStr?: string,
+  notifier?: Notifier
+): Promise<RearmResult> {
+  if (leg.status !== 'open' || !leg.confirmedOpen) {
+    return { rearmed: false, message: `Leg ${leg.symbol} is not open or confirmed open` };
+  }
+
+  const check = verifyStopOrderArmed(orders, leg);
+  if (check.armed) {
+    return { rearmed: false, message: `Stop order is already correctly armed on venue for ${leg.symbol}` };
+  }
+
+  console.warn(
+    `[Risk Manager] ⚠️ Stop missing for ${leg.legType} (${leg.symbol}). Re-arming venue stop order @ trigger $${leg.stopLossPrice.toFixed(
+      2
+    )} (reduceOnly: true)...`
+  );
+
+  const expiry = cycleExpiryStr || (parseExpiryString(leg.symbol) ?? new Date().toISOString().slice(0, 10));
+  const writer = new CycleRecordWriter(expiry);
+
+  try {
+    const outcome = await client.placeOptionsOrder(
+      leg.symbol,
+      'buy',
+      leg.quantity,
+      'Market',
+      undefined,
+      String(leg.stopLossPrice), // stopLoss trigger
+      '',                        // takeProfit
+      undefined,
+      true                       // reduceOnly: true
+    );
+
+    if (outcome.success) {
+      const orderId = outcome.orderId || 'rearmed-stop';
+      console.log(
+        `[Risk Manager] ✅ STOP_RE_ARMED: Placed venue stop for ${leg.legType} (${leg.symbol}) @ $${leg.stopLossPrice.toFixed(
+          2
+        )} | Order ID: ${orderId}`
+      );
+
+      writer.appendEvent('ANOMALY', {
+        type: 'STOP_RE_ARMED',
+        legType: leg.legType,
+        symbol: leg.symbol,
+        stopLossPrice: leg.stopLossPrice,
+        orderId,
+        priorStatus: check.reason,
+      });
+
+      appendAlert(
+        'stop_rearmed',
+        `STOP_RE_ARMED: Successfully placed missing stop order for ${leg.legType} (${leg.symbol}) at trigger $${leg.stopLossPrice.toFixed(2)} [Order: ${orderId}].`,
+        { symbol: leg.symbol, leg: leg.legType, orderId, trigger: leg.stopLossPrice }
+      );
+
+      if (notifier) {
+        void notifier.notifyReconciliation(
+          `Stop Order Re-Armed (${leg.symbol}): Re-placed missing venue stop @ $${leg.stopLossPrice.toFixed(2)} (reduceOnly: true). Order ID: ${orderId}`
+        );
+      }
+
+      return { rearmed: true, orderId, message: 'STOP_RE_ARMED' };
+    } else {
+      const err = `Failed to re-arm stop order for ${leg.symbol}: ${outcome.message || 'unknown error'}`;
+      console.error(`[Risk Manager] 🚨 ${err}`);
+      appendAlert('stop_rearm_failed', err, {
+        symbol: leg.symbol,
+        leg: leg.legType,
+        error: outcome.message,
+      });
+      if (notifier) {
+        void notifier.notifyError(`Stop Re-Arm Failed (${leg.symbol})`, new Error(err));
+      }
+      return { rearmed: false, message: err };
+    }
+  } catch (placeErr) {
+    const err = `Exception re-arming stop order for ${leg.symbol}: ${(placeErr as Error).message}`;
+    console.error(`[Risk Manager] 🚨 ${err}`);
+    appendAlert('stop_rearm_failed', err, {
+      symbol: leg.symbol,
+      leg: leg.legType,
+      error: (placeErr as Error).message,
+    });
+    if (notifier) {
+      void notifier.notifyError(`Stop Re-Arm Exception (${leg.symbol})`, placeErr as Error);
+    }
+    return { rearmed: false, message: err };
+  }
+}
+
 /**
  * Closes an individual leg safely with bounded retry, classification, and exchange confirmation.
  * CRITICAL RULE: NEVER marks leg.status = 'closed' without exchange confirmation!
@@ -401,13 +516,32 @@ export async function reconcileAndResurrectState(
           if (expiry && Date.now() >= expiry.getTime()) {
             // Past its expiry and gone from the venue => it expired.
             leg.closeReason = 'EXPIRED';
+            leg.exitPrice = 0;
           } else {
-            // Absent BEFORE expiry with no close order of ours: we cannot explain
-            // this, so we do not invent a reason for it.
-            console.warn(
-              `[Reconciliation] ⚠️ ${leg.symbol} is absent from the exchange but its expiry ` +
-                `(${expiry ? expiry.toISOString() : 'unknown'}) has not passed — no close reason recorded.`
-            );
+            // Absent BEFORE expiry: venue stop order executed or closed on venue!
+            // Query wallet transactions to adopt venue fill price
+            leg.closeReason = 'SL_HIT';
+            try {
+              const txs = await client.getOptionsWalletTransactions();
+              const tradeRow = txs.find(
+                (r) =>
+                  r.symbol === leg.symbol &&
+                  String(r.transactionType || r.type).toUpperCase() === 'TRADE'
+              );
+              if (tradeRow && tradeRow.filledPrice !== undefined) {
+                const fp = Number(tradeRow.filledPrice);
+                if (Number.isFinite(fp) && fp > 0) {
+                  leg.exitPrice = fp;
+                  leg.exitOrderId = String(tradeRow.orderId || tradeRow.order_id || '') || leg.exitOrderId;
+                  console.log(`[Reconciliation] Adopted venue fill price for ${leg.symbol}: $${leg.exitPrice.toFixed(2)}`);
+                }
+              }
+            } catch {
+              // Keep default/mark if txs unreadable
+            }
+            if (leg.exitPrice === undefined) {
+              leg.exitPrice = leg.currentPrice;
+            }
           }
         }
         latest.state.resolvedScenario = 'MAX_TIME_REACHED';

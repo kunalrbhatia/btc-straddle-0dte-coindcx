@@ -1,4 +1,6 @@
 import fs from 'fs';
+import { getStateFilePath } from '../stateStore';
+import { getMtmLogFilePath } from '../mtmWatcher';
 import {
   ensureRecordsDirectory,
   getRecordJsonlPath,
@@ -42,7 +44,7 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
 
   // Load state file for this cycle
   const entryDate = options.entryDateStr || (expiryDateStr === '2026-10-05' ? '2026-10-04' : expiryDateStr);
-  const statePath = `state/straddle-state-${entryDate}.json`;
+  const statePath = getStateFilePath(entryDate);
 
   let stateObj: any = null;
   if (fs.existsSync(statePath)) {
@@ -185,23 +187,26 @@ export async function backfillHistoricalCycle(options: BackfillOptions): Promise
   const windowEndMs = Date.parse(`${expiryDateStr}T13:45:00+05:30`);
 
   const mtmSamples: MtmTapeSample[] = [];
-  const mtmLogPath = `logs/mtm-${entryDate}.log`;
-  if (fs.existsSync(mtmLogPath)) {
-    const raw = fs.readFileSync(mtmLogPath, 'utf8').trim().split('\n');
-    for (const line of raw) {
-      const match = line.match(/^(\d{1,2}:\d{2}:\d{2}\s+(?:AM|PM)):\s*([-\d.]+)\s*MTM/i);
-      if (match) {
-        const sampleMs = Date.parse(`${entryDate}T${match[1]}+05:30`);
-        // Clip to cycle window
-        if (Number.isFinite(sampleMs) && (sampleMs < windowStartMs || sampleMs > windowEndMs)) {
-          continue;
+  const cycleDates = Array.from(new Set([entryDate, expiryDateStr])).sort();
+  for (const dateStr of cycleDates) {
+    const mtmLogPath = getMtmLogFilePath(dateStr);
+    if (fs.existsSync(mtmLogPath)) {
+      const raw = fs.readFileSync(mtmLogPath, 'utf8').trim().split('\n');
+      for (const line of raw) {
+        const match = line.match(/^(\d{1,2}:\d{2}:\d{2}\s+(?:AM|PM)):\s*([-\d.]+)\s*MTM/i);
+        if (match) {
+          const sampleMs = Date.parse(`${dateStr}T${match[1]}+05:30`);
+          // Clip to cycle window
+          if (Number.isFinite(sampleMs) && (sampleMs < windowStartMs || sampleMs > windowEndMs)) {
+            continue;
+          }
+          mtmSamples.push({
+            ts: `${dateStr}T${match[1]}`,
+            callMark: callEntry,
+            putMark: putEntry,
+            combinedPts: parseFloat(match[2]),
+          });
         }
-        mtmSamples.push({
-          ts: `${entryDate}T${match[1]}`,
-          callMark: callEntry,
-          putMark: putEntry,
-          combinedPts: parseFloat(match[2]),
-        });
       }
     }
   }

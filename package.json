@@ -16,6 +16,8 @@
     "verify:hooks": "node scripts/verify-hooks.cjs",
     "report": "ts-node src/reportCli.ts",
     "verify": "ts-node src/verifyCli.ts",
+    "doctor": "ts-node src/doctorCli.ts",
+    "acceptance": "node scripts/run-acceptance.cjs",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "keywords": [

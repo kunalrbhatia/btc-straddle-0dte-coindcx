@@ -13,11 +13,18 @@ import path from 'path';
  * File: logs/alerts-<YYYY-MM-DD>.jsonl  (one JSON object per line)
  */
 
+import { assertSafeTestDirectory } from './testIsolationGuard';
+
 // Overridable so test runs can never write into the live logs/ journal
 // (the Hermes watch banner reads that directory and would forward test noise).
-const LOGS_DIR = process.env.BTC_ALERTS_DIR
-  ? path.resolve(process.env.BTC_ALERTS_DIR)
-  : path.resolve(process.cwd(), 'logs');
+export function getAlertsDir(): string {
+  const dir = process.env.BTC_ALERTS_DIR
+    ? path.resolve(process.env.BTC_ALERTS_DIR)
+    : path.resolve(process.cwd(), 'logs');
+  assertSafeTestDirectory(dir, 'alerts log directory');
+  return dir;
+}
+
 const IST_OFFSET_MINUTES = 330;
 
 export interface AlertRecord {
@@ -116,7 +123,7 @@ function getIstTimestamp(now = new Date()): string {
 }
 
 export function alertFilePath(dateStr = getIstDateString()): string {
-  return path.join(LOGS_DIR, `alerts-${dateStr}.jsonl`);
+  return path.join(getAlertsDir(), `alerts-${dateStr}.jsonl`);
 }
 
 /**
@@ -135,7 +142,8 @@ export function appendAlert(
       return;
     }
 
-    fs.mkdirSync(LOGS_DIR, { recursive: true });
+    const dir = getAlertsDir();
+    fs.mkdirSync(dir, { recursive: true });
     const record: AlertRecord = {
       ts: getIstTimestamp(),
       kind,

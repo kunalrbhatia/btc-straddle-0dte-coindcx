@@ -110,7 +110,10 @@ export async function generateDailyReport(
 
   // Unique list of dates to gather MTM logs and alerts across cycle
   const cycleDates = Array.from(new Set([entryDate, expiryDateStr])).sort();
-  const mtmStats = parseMtmLogs(cycleDates);
+  const mtmStats = parseMtmLogs(cycleDates, {
+    windowStartMs: cycleStartMs,
+    windowEndMs: cycleEndMs,
+  });
   const rawAlerts = readCombinedAlerts(cycleDates);
 
   const allowedSymbols = [state.callLeg?.symbol, state.putLeg?.symbol].filter(Boolean) as string[];
@@ -175,38 +178,89 @@ export async function generateDailyReport(
 
   const isCycleExpired = now.getTime() >= expiryMs;
 
-  // Calculate Leg details
+  // Check for cycle record & summary snapshot early so sections 1 & 2 can consume it
+  const recordSummaryPath = getRecordSummaryPath(expiryDateStr);
+  const recordJsonlPath = getRecordJsonlPath(expiryDateStr);
+  let cycleSummarySnap: CycleSummarySnapshot | null = null;
+  if (fs.existsSync(recordSummaryPath)) {
+    try {
+      cycleSummarySnap = JSON.parse(fs.readFileSync(recordSummaryPath, 'utf8'));
+    } catch {
+      cycleSummarySnap = null;
+    }
+  }
+
+  // Read timeline from records jsonl if available
+  const timelineEvents: Array<{ ts: string; event: string; detail: string }> = [];
+  let recordCycleClosedEvent: CycleEventPayload | null = null;
+
+  if (fs.existsSync(recordJsonlPath)) {
+    try {
+      const lines = fs.readFileSync(recordJsonlPath, 'utf8').trim().split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const ev = JSON.parse(line.trim()) as CycleEventPayload;
+        let detail = '';
+        if (ev.event === 'CYCLE_START') {
+          detail = `Cycle initiated (Strike: ${ev.data?.strike ?? 'N/A'}, Call: ${ev.data?.callSymbol ?? 'N/A'}, Put: ${ev.data?.putSymbol ?? 'N/A'})`;
+        } else if (ev.event === 'ORDER_FILLED') {
+          detail = `${ev.data?.legType} filled @ $${Number(ev.data?.price ?? ev.data?.entryPrice ?? 0).toFixed(2)} (Order ID: ${ev.data?.orderId ?? 'N/A'})`;
+        } else if (ev.event === 'LEG_CLOSED') {
+          detail = `${ev.data?.legType} closed @ $${Number(ev.data?.price ?? ev.data?.exitPrice ?? 0).toFixed(2)} [${ev.data?.reason ?? 'N/A'}]`;
+        } else if (ev.event === 'EXPIRY_SETTLEMENT') {
+          detail = `${ev.data?.legType} settled at expiry @ $${Number(ev.data?.settlementPrice ?? 0).toFixed(2)} [${ev.data?.settlementReason ?? 'EXPIRED'}]`;
+        } else if (ev.event === 'CYCLE_CLOSED') {
+          recordCycleClosedEvent = ev;
+          detail = `Cycle closed [${ev.data?.resolvedScenario ?? 'CLOSED'}], Realised P&L: ${Number(ev.data?.realisedPnlPoints ?? 0).toFixed(2)} pts`;
+        } else {
+          detail = JSON.stringify(ev.data ?? {});
+        }
+        timelineEvents.push({ ts: ev.ts, event: ev.event, detail });
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
+  // Calculate Leg details: consumes record first!
   function formatLeg(
     legType: 'PUT' | 'CALL',
     leg: typeof putLeg,
     isOrphan: boolean
   ) {
-    const symbol = leg?.symbol ?? 'UNKNOWN';
-    const entryPrice = leg?.entryPrice ?? 0;
-    let exitPrice = leg?.exitPrice ?? null;
-    let reason = leg?.closeReason ? String(leg.closeReason) : 'N/A';
+    const symbol = leg?.symbol ?? (legType === 'PUT' ? cycleSummarySnap?.putSymbol : cycleSummarySnap?.callSymbol) ?? 'UNKNOWN';
+    const recLeg = legType === 'PUT' ? cycleSummarySnap?.putLeg : cycleSummarySnap?.callLeg;
+
+    // Entry price from record, fallback to state
+    let entryPrice = recLeg?.entryPrice ?? leg?.entryPrice ?? 0;
+    let exitPrice: number | null = null;
+    let reason = 'N/A';
     let isExpiredWorthless = false;
 
     if (isOrphan) {
       reason = '🔴 ORPHAN / MANUAL ACTION NEEDED (open on exchange)';
       exitPrice = null;
+    } else if (recLeg && (recLeg.exitPrice !== null && recLeg.exitPrice !== undefined || recLeg.status === 'closed')) {
+      // Consume record leg details
+      exitPrice = recLeg.exitPrice !== undefined ? recLeg.exitPrice : null;
+      reason = recLeg.closeReason ? String(recLeg.closeReason) : 'CLOSED';
+      if (reason === 'EXPIRED') isExpiredWorthless = true;
     } else if (leg?.status === 'closed') {
-      if (exitPrice === null || exitPrice === undefined) {
-        exitPrice = leg.currentPrice ?? null;
-      }
+      exitPrice = leg.exitPrice !== undefined && leg.exitPrice !== null
+        ? leg.exitPrice
+        : (leg.currentPrice ?? null);
+      reason = leg.closeReason ? String(leg.closeReason) : 'CLOSED';
     } else if (isCycleExpired) {
-      // Leg was open in state, not on exchange at/after expiry -> settled at 0.00
       isExpiredWorthless = true;
       exitPrice = 0;
       reason = 'EXPIRED';
     } else {
-      // Leg is still open before expiry
       exitPrice = leg?.currentPrice ?? null;
       reason = 'OPEN';
     }
 
     const pnlPoints = exitPrice !== null ? entryPrice - exitPrice : null;
-    const pnlUsdt = pnlPoints !== null ? pnlPoints * (leg?.quantity ?? contractMultiplier) : null;
+    const pnlUsdt = pnlPoints !== null ? pnlPoints * (leg?.quantity ?? cycleSummarySnap?.orderQuantity ?? contractMultiplier) : null;
     const pnlInr =
       pnlUsdt !== null && usdtInrRate !== null ? pnlUsdt * usdtInrRate : null;
 
@@ -227,12 +281,20 @@ export async function generateDailyReport(
   const putSummary = formatLeg('PUT', putLeg, isPutOrphan);
   const callSummary = formatLeg('CALL', callLeg, isCallOrphan);
 
-  // Combined PnL (State Points basis)
+  // Combined PnL: consumes cycleSummarySnap or CYCLE_CLOSED if available
   let combinedPoints: number | null = null;
   let combinedUsdt: number | null = null;
   let combinedInr: number | null = null;
 
-  if (putSummary.pnlPoints !== null && callSummary.pnlPoints !== null) {
+  if (cycleSummarySnap?.combinedPnLPoints !== undefined && cycleSummarySnap.combinedPnLPoints !== null) {
+    combinedPoints = cycleSummarySnap.combinedPnLPoints;
+    combinedUsdt = combinedPoints * (cycleSummarySnap.orderQuantity ?? contractMultiplier);
+    combinedInr = combinedUsdt !== null && usdtInrRate !== null ? combinedUsdt * usdtInrRate : null;
+  } else if (recordCycleClosedEvent?.data?.realisedPnlPoints !== undefined) {
+    combinedPoints = Number(recordCycleClosedEvent.data.realisedPnlPoints);
+    combinedUsdt = combinedPoints * contractMultiplier;
+    combinedInr = combinedUsdt !== null && usdtInrRate !== null ? combinedUsdt * usdtInrRate : null;
+  } else if (putSummary.pnlPoints !== null && callSummary.pnlPoints !== null) {
     combinedPoints = putSummary.pnlPoints + callSummary.pnlPoints;
     combinedUsdt = (putSummary.pnlUsdt ?? 0) + (callSummary.pnlUsdt ?? 0);
     combinedInr =
@@ -268,15 +330,19 @@ export async function generateDailyReport(
   let md = `# BTC 0DTE Short Straddle Trade Report — ${expiryDateStr}\n\n`;
 
   // Summary Table
+  const totalCreditReceived = cycleSummarySnap?.totalCreditReceived ?? state.totalCreditReceived;
+  const targetProfitPoints = cycleSummarySnap?.targetProfitPoints ?? state.targetProfitPoints;
+  const resolvedScenario = cycleSummarySnap?.resolvedScenario ?? state.resolvedScenario ?? (putSummary.isOrphan || callSummary.isOrphan ? 'UNRESOLVED_ORPHAN' : 'COMPLETED');
+
   md += `## 1. Executive Summary\n\n`;
   md += `| Field | Value |\n`;
   md += `| :--- | :--- |\n`;
   md += `| **Cycle Expiry** | ${expiryDateStr} (08:00 UTC / 13:30 IST) |\n`;
   md += `| **Entry Date** | ${entryDate} |\n`;
   md += `| **Report Generated** | ${generatedAtIst} |\n`;
-  md += `| **Resolved Scenario** | \`${state.resolvedScenario ?? (putSummary.isOrphan || callSummary.isOrphan ? 'UNRESOLVED_ORPHAN' : 'COMPLETED')}\` |\n`;
-  md += `| **Total Credit Received** | ${state.totalCreditReceived.toFixed(2)} pts |\n`;
-  md += `| **Target Profit** | ${state.targetProfitPoints.toFixed(2)} pts |\n`;
+  md += `| **Resolved Scenario** | \`${resolvedScenario}\` |\n`;
+  md += `| **Total Credit Received** | ${totalCreditReceived.toFixed(2)} pts |\n`;
+  md += `| **Target Profit** | ${targetProfitPoints.toFixed(2)} pts |\n`;
   md += `| **Combined Realised P&L (pts)** | **${fmtPts(combinedPoints)}** |\n`;
   md += `| **Combined Realised P&L (USDT)** | **${fmtUsdt(combinedUsdt)}** |\n`;
   md += `| **Combined Realised P&L (INR)** | **${fmtInr(combinedInr)}** |\n`;
@@ -308,47 +374,6 @@ export async function generateDailyReport(
     md += `_No MTM log observations were recorded for this cycle._\n\n`;
   }
 
-  // Check for cycle record & summary snapshot
-  const recordSummaryPath = getRecordSummaryPath(expiryDateStr);
-  const recordJsonlPath = getRecordJsonlPath(expiryDateStr);
-  let cycleSummarySnap: CycleSummarySnapshot | null = null;
-  if (fs.existsSync(recordSummaryPath)) {
-    try {
-      cycleSummarySnap = JSON.parse(fs.readFileSync(recordSummaryPath, 'utf8'));
-    } catch {
-      cycleSummarySnap = null;
-    }
-  }
-
-  // Read timeline from records jsonl if available
-  const timelineEvents: Array<{ ts: string; event: string; detail: string }> = [];
-  if (fs.existsSync(recordJsonlPath)) {
-    try {
-      const lines = fs.readFileSync(recordJsonlPath, 'utf8').trim().split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const ev = JSON.parse(line.trim()) as CycleEventPayload;
-        let detail = '';
-        if (ev.event === 'CYCLE_START') {
-          detail = `Cycle initiated (Strike: ${ev.data?.strike ?? 'N/A'}, Call: ${ev.data?.callSymbol ?? 'N/A'}, Put: ${ev.data?.putSymbol ?? 'N/A'})`;
-        } else if (ev.event === 'ORDER_FILLED') {
-          detail = `${ev.data?.legType} filled @ $${Number(ev.data?.price ?? 0).toFixed(2)} (Order ID: ${ev.data?.orderId ?? 'N/A'})`;
-        } else if (ev.event === 'LEG_CLOSED') {
-          detail = `${ev.data?.legType} closed @ $${Number(ev.data?.price ?? 0).toFixed(2)} [${ev.data?.reason ?? 'N/A'}]`;
-        } else if (ev.event === 'EXPIRY_SETTLEMENT') {
-          detail = `${ev.data?.legType} settled at expiry @ $${Number(ev.data?.settlementPrice ?? 0).toFixed(2)} [${ev.data?.settlementReason ?? 'EXPIRED'}]`;
-        } else if (ev.event === 'CYCLE_CLOSED') {
-          detail = `Cycle closed [${ev.data?.resolvedScenario ?? 'CLOSED'}], Realised P&L: ${Number(ev.data?.realisedPnlPoints ?? 0).toFixed(2)} pts`;
-        } else {
-          detail = JSON.stringify(ev.data ?? {});
-        }
-        timelineEvents.push({ ts: ev.ts, event: ev.event, detail });
-      }
-    } catch {
-      // Fallback
-    }
-  }
-
   // Alerts Log / Timeline Section
   md += `## 4. Alerts & Operator Journal\n\n`;
   if (timelineEvents.length > 0) {
@@ -362,7 +387,7 @@ export async function generateDailyReport(
   }
 
   if (collapsedAlerts.length > 0) {
-    md += `Chronological alerts logged during cycle window [${entryDate} → ${expiryDateStr}]:\n\n`;
+    md += `Secondary — raw alert stream during cycle window [${entryDate} → ${expiryDateStr}]:\n\n`;
     for (const a of collapsedAlerts) {
       if (a.count > 1) {
         md += `- **[${a.firstTimeOnly}–${a.lastTimeOnly} IST]** \`${a.kind}\` **×${a.count}** — ${a.message}\n`;
@@ -407,7 +432,7 @@ export async function generateDailyReport(
       const matchedRows = ls.tradeRowsCount + ls.deliveryRowsCount;
       md += `- **Venue Ledger Cash P&L**: ₹${ls.totalTradeNetCashFlowInr.toFixed(2)} net (Gross: ₹${ls.totalTradeGrossCashFlowInr.toFixed(2)}, Fees: ₹${ls.totalFeesInr.toFixed(2)})\n`;
       md += `- **Reconciled Transactions**: ${matchedRows} row(s) matched cycle contracts out of ${ls.transactionCount} total wallet transactions (${ls.tradeRowsCount} trade(s), ${ls.deliveryRowsCount} delivery).\n`;
-      md += `- **Basis Gap Explanation**: The difference between State points P&L and Venue net cash flow arises from exchange transaction fees (~1.9%) and the venue USDT/INR conversion spread (~₹102 vs public rate).\n`;
+      md += `- **Basis Gap Explanation**: The difference between State points P&L and Venue net cash flow arises from exchange transaction fees (~1.9%) and the venue's USDT/INR conversion spread (~₹102 vs public rate ≈ ₹98.9–99.1); cash is derived directly from the venue ledger, never re-derived from public FX rates.\n`;
     } else if (venueTransactions.length > 0) {
       md += `- **Venue Ledger Transactions**: ${venueTransactions.length} transaction record(s) reconciled.\n`;
     } else {

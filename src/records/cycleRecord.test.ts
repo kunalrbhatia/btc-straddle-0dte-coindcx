@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { CycleRecordWriter, scrubCredentials } from './cycleRecordWriter';
 import { getRecordJsonlPath, getRecordMtmPath, getRecordSummaryPath } from './cycleRecordPaths';
@@ -269,7 +270,7 @@ test('Cycle Backfill — generates reconstructed records for historical cycle', 
 });
 
 test('CycleRecordWriter — RECORD_DIR isolation prevents writing outside assigned directory', () => {
-  const customDir = path.resolve(process.cwd(), 'scratch-records-test');
+  const customDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scratch-records-test-'));
   const prevEnv = process.env.RECORD_DIR;
   try {
     process.env.RECORD_DIR = customDir;
@@ -285,7 +286,7 @@ test('CycleRecordWriter — RECORD_DIR isolation prevents writing outside assign
       try {
         fs.rmSync(customDir, { recursive: true, force: true });
       } catch {
-        // Ignore
+        // cleanup
       }
     }
   }

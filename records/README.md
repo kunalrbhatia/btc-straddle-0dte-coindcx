@@ -7,5 +7,10 @@ This directory contains offline, write-through cycle event ledgers, MTM tapes, a
 - `<YYYY-MM-DD>.mtm.jsonl`: Dedicated per-cycle MTM tape samples.
 - `<YYYY-MM-DD>.summary.json`: Materialised summary snapshot written atomically via temp file and rename.
 
-## Publication & Retention
-Per repo rules, cycle record files are gitignored on `main`. During daily report publishing via git plumbing (`src/reports/reportPublisher.ts`), `<YYYY-MM-DD>.jsonl` and `<YYYY-MM-DD>.summary.json` are committed and pushed to the isolated `reports` git branch alongside the markdown report. The high-frequency `<YYYY-MM-DD>.mtm.jsonl` tape is retained locally on the trading host to prevent repository bloat, while key MTM statistics (high, low, peak, trough, count) are permanently preserved in the summary and report.
+## Publication & Retention Policy
+Per repo rules, cycle record files are gitignored on `main`. During daily report publishing via git plumbing (`src/reports/reportPublisher.ts`), `<YYYY-MM-DD>.jsonl` and `<YYYY-MM-DD>.summary.json` are committed and pushed to the isolated `reports` git branch alongside the markdown report.
+
+To prevent repository bloat (a raw 2.5 MB per cycle tape scales to ~0.9 GB/year of git history):
+1. The full high-frequency tape is retained locally on the trading host.
+2. Committed/backfilled tapes are strictly clipped to the cycle window `[entryTs, expiry + REPORT_DELAY_MINUTES]`.
+3. High-frequency samples are thinned to 1-minute resolution plus threshold crossings (stop loss, profit target, and checkpoints) before permanent archival, preserving exact metrics and statistics in `<YYYY-MM-DD>.summary.json` and the markdown report.

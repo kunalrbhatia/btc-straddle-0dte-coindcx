@@ -410,10 +410,14 @@ describe('Straddle Execution & Unwind Tests', () => {
           takeProfit?: string
         ) => {
           if (symbol.includes('-C-')) {
-            callOrderPlaced = { symbol, side, qty, orderType, price, stopLoss, takeProfit };
+            if (side === 'sell') {
+              callOrderPlaced = { symbol, side, qty, orderType, price, stopLoss, takeProfit };
+            }
             return { symbol, side, success: true, orderId: 'call-1', limitPrice: Number(price), rawResponse: { status: 'filled' } };
           } else {
-            putOrderPlaced = { symbol, side, qty, orderType, price, stopLoss, takeProfit };
+            if (side === 'sell') {
+              putOrderPlaced = { symbol, side, qty, orderType, price, stopLoss, takeProfit };
+            }
             return { symbol, side, success: true, orderId: 'put-1', limitPrice: Number(price), rawResponse: { status: 'filled' } };
           }
         },

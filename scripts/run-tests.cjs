@@ -27,6 +27,7 @@ const env = {
   // The cycle-record path honours RECORD_DIR (config.recordDir); point tests at a temp dir so a
   // test run can never append to a live cycle's record in ./records.
   RECORD_DIR: recordsDir,
+  BTC_TEST_MODE: '1',
 };
 
 /**

@@ -2,12 +2,16 @@ import fs from 'fs';
 import path from 'path';
 import { StraddlePositionState } from './types';
 
+import { assertSafeTestDirectory } from './testIsolationGuard';
+
 // Overridable (BTC_STATE_DIR) so test runs cannot write a fake position into
 // the live state directory that the bot reconciles against at startup.
 export function getStateDir(): string {
-  return process.env.BTC_STATE_DIR
+  const dir = process.env.BTC_STATE_DIR
     ? path.resolve(process.env.BTC_STATE_DIR)
     : path.resolve(process.cwd(), 'state');
+  assertSafeTestDirectory(dir, 'state directory');
+  return dir;
 }
 
 export function getTodayDateStringIST(now = new Date()): string {

@@ -9,6 +9,7 @@ import {
   parseContractExpiryDate,
   safeCloseLeg,
   verifyStopOrderArmed,
+  rearmStopOrderIfMissing,
 } from './reconciliation';
 import { CycleRecordWriter } from './records/cycleRecordWriter';
 import { parseContractExpiryDate as parseExpiryString } from './reports/reportDataCollector';
@@ -474,6 +475,18 @@ export async function monitorStraddleRisk(
                   void notifier.notifyError(
                     `Stop Order Alert (${leg.symbol})`,
                     new Error(stopAlertMsg)
+                  );
+                }
+
+                // If stop is missing, re-arm it automatically (naked-leg risk mitigation)
+                if (stopCheck.reason === 'MISSING') {
+                  void rearmStopOrderIfMissing(
+                    client,
+                    leg,
+                    venueOrders,
+                    config,
+                    cycleExpiryStr,
+                    notifier
                   );
                 }
               }

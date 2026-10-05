@@ -1,11 +1,14 @@
 import fs from 'fs';
 import path from 'path';
+import { assertSafeTestDirectory } from '../testIsolationGuard';
 
 // Overridable (BTC_REPORTS_DIR) so tests do not touch live repo reports directory
 export function getReportsDir(): string {
-  return process.env.BTC_REPORTS_DIR
+  const dir = process.env.BTC_REPORTS_DIR
     ? path.resolve(process.env.BTC_REPORTS_DIR)
     : path.resolve(process.cwd(), 'reports');
+  assertSafeTestDirectory(dir, 'reports directory');
+  return dir;
 }
 
 export function ensureReportsDirectory(): string {

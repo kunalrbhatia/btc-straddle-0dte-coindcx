@@ -42,61 +42,158 @@ export function parseContractExpiryDate(symbol: string): string | null {
   return `${fullYear}-${month}-${day}`;
 }
 
+import { getRecordSummaryPath } from '../records/cycleRecordPaths';
+import { CycleSummarySnapshot } from '../records/cycleRecordTypes';
+
 export async function findStateForExpiry(targetExpiryDateStr: string): Promise<{
   state: StraddlePositionState;
   entryDate: string;
   expiryDate: string;
-  expirySource: 'symbol_parsed' | 'date_inferred';
+  expirySource: 'symbol_parsed' | 'date_inferred' | 'record_snapshot';
 } | null> {
+  // 1. Resolve from RECORD first (summary.json or jsonl)
+  const recordSummaryFile = getRecordSummaryPath(targetExpiryDateStr);
+  let recordSnap: CycleSummarySnapshot | null = null;
+  if (fs.existsSync(recordSummaryFile)) {
+    try {
+      recordSnap = JSON.parse(fs.readFileSync(recordSummaryFile, 'utf8')) as CycleSummarySnapshot;
+    } catch {
+      recordSnap = null;
+    }
+  }
+
+
+
+  // 2. Search state directory
   const stateDir = getStateDir();
-  if (!fs.existsSync(stateDir)) {
-    return null;
+  let foundFromState: {
+    state: StraddlePositionState;
+    entryDate: string;
+    expiryDate: string;
+    expirySource: 'symbol_parsed' | 'date_inferred';
+  } | null = null;
+
+  if (fs.existsSync(stateDir)) {
+    try {
+      const files = (await fs.promises.readdir(stateDir))
+        .filter((f) => f.startsWith('straddle-state-') && f.endsWith('.json'))
+        .sort()
+        .reverse();
+
+      for (const f of files) {
+        const dateMatch = f.match(/straddle-state-(\d{4}-\d{2}-\d{2})\.json/);
+        if (!dateMatch) continue;
+        const entryDate = dateMatch[1];
+        const state = await loadStraddleState(entryDate);
+        if (!state) continue;
+
+        // Check symbols first
+        const callExpiry = parseContractExpiryDate(state.callLeg?.symbol || '');
+        const putExpiry = parseContractExpiryDate(state.putLeg?.symbol || '');
+        const matchedExpiry = callExpiry || putExpiry;
+
+        if (matchedExpiry === targetExpiryDateStr) {
+          foundFromState = {
+            state,
+            entryDate,
+            expiryDate: targetExpiryDateStr,
+            expirySource: 'symbol_parsed',
+          };
+          break;
+        }
+
+        // If entry date matches targetExpiryDateStr directly and symbol parse failed
+        if (entryDate === targetExpiryDateStr && !matchedExpiry) {
+          foundFromState = {
+            state,
+            entryDate,
+            expiryDate: targetExpiryDateStr,
+            expirySource: 'date_inferred',
+          };
+          break;
+        }
+      }
+    } catch {
+      // Ignore directory scan error
+    }
   }
 
-  const files = (await fs.promises.readdir(stateDir))
-    .filter((f) => f.startsWith('straddle-state-') && f.endsWith('.json'))
-    .sort()
-    .reverse();
-
-  for (const f of files) {
-    const dateMatch = f.match(/straddle-state-(\d{4}-\d{2}-\d{2})\.json/);
-    if (!dateMatch) continue;
-    const entryDate = dateMatch[1];
-    const state = await loadStraddleState(entryDate);
-    if (!state) continue;
-
-    // Check symbols first
-    const callExpiry = parseContractExpiryDate(state.callLeg?.symbol || '');
-    const putExpiry = parseContractExpiryDate(state.putLeg?.symbol || '');
-    const matchedExpiry = callExpiry || putExpiry;
-
-    if (matchedExpiry === targetExpiryDateStr) {
-      return {
-        state,
-        entryDate,
-        expiryDate: targetExpiryDateStr,
-        expirySource: 'symbol_parsed',
-      };
-    }
-
-    // If entry date matches targetExpiryDateStr directly and symbol parse failed
-    if (entryDate === targetExpiryDateStr && !matchedExpiry) {
-      return {
-        state,
-        entryDate,
-        expiryDate: targetExpiryDateStr,
-        expirySource: 'date_inferred',
-      };
-    }
+  if (foundFromState) {
+    return foundFromState;
   }
 
+  // 3. Fallback to state reconstructed from record snapshot when state file is missing/clobbered
+  if (recordSnap) {
+    const entryDate = recordSnap.entryDate || targetExpiryDateStr;
+    const callLegEntry = recordSnap.callLeg?.entryPrice ?? 0;
+    const putLegEntry = recordSnap.putLeg?.entryPrice ?? 0;
+    const totalCredit = recordSnap.totalCreditReceived ?? (callLegEntry + putLegEntry);
+    const targetProfit = recordSnap.targetProfitPoints ?? totalCredit * 0.55;
+
+    const reconstructedState: StraddlePositionState = {
+      date: entryDate,
+      entryExecuted: true,
+      callLeg: {
+        legType: 'CALL',
+        symbol: recordSnap.callLeg?.symbol || recordSnap.callSymbol || `BTC-CALL`,
+        entryPrice: callLegEntry,
+        entryPriceSource: 'fill',
+        stopLossPrice: callLegEntry * 2,
+        quantity: recordSnap.orderQuantity ?? 0.01,
+        confirmedOpen: true,
+        status: (recordSnap.callLeg?.status as any) || 'closed',
+        currentPrice: recordSnap.callLeg?.exitPrice ?? callLegEntry,
+        exitPrice: recordSnap.callLeg?.exitPrice !== null && recordSnap.callLeg?.exitPrice !== undefined
+          ? recordSnap.callLeg.exitPrice
+          : undefined,
+        closeReason: (recordSnap.callLeg?.closeReason as any) || undefined,
+        orderId: recordSnap.callLeg?.orderId,
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: recordSnap.putLeg?.symbol || recordSnap.putSymbol || `BTC-PUT`,
+        entryPrice: putLegEntry,
+        entryPriceSource: 'fill',
+        stopLossPrice: putLegEntry * 2,
+        quantity: recordSnap.orderQuantity ?? 0.01,
+        confirmedOpen: true,
+        status: (recordSnap.putLeg?.status as any) || 'closed',
+        currentPrice: recordSnap.putLeg?.exitPrice ?? putLegEntry,
+        exitPrice: recordSnap.putLeg?.exitPrice !== null && recordSnap.putLeg?.exitPrice !== undefined
+          ? recordSnap.putLeg.exitPrice
+          : undefined,
+        closeReason: (recordSnap.putLeg?.closeReason as any) || undefined,
+        orderId: recordSnap.putLeg?.orderId,
+      },
+      totalCreditReceived: totalCredit,
+      targetProfitPoints: targetProfit,
+      combinedPnLPoints: recordSnap.combinedPnLPoints ?? 0,
+      resolvedScenario: (recordSnap.resolvedScenario as any) || undefined,
+      updatedAt: recordSnap.updatedAt,
+    };
+
+    return {
+      state: reconstructedState,
+      entryDate,
+      expiryDate: targetExpiryDateStr,
+      expirySource: 'record_snapshot',
+    };
+  }
+
+  // If neither state nor record found, caller can fail naming both sources
   return null;
 }
 
-export function parseMtmLogs(dateStrings: string[]): MtmStats {
+import { assertSafeTestDirectory } from '../testIsolationGuard';
+
+export function parseMtmLogs(
+  dateStrings: string[],
+  options?: { windowStartMs?: number; windowEndMs?: number }
+): MtmStats {
   const logsDir = process.env.BTC_LOGS_DIR
     ? path.resolve(process.env.BTC_LOGS_DIR)
     : path.resolve(process.cwd(), 'logs');
+  assertSafeTestDirectory(logsDir, 'MTM logs directory');
 
   let count = 0;
   let min: number | null = null;
@@ -124,6 +221,15 @@ export function parseMtmLogs(dateStrings: string[]): MtmStats {
           const time = `${dateStr} ${m[1]}`;
           const val = parseFloat(m[2]);
           if (Number.isFinite(val)) {
+            // Clip to cycle window if provided
+            if (options?.windowStartMs !== undefined || options?.windowEndMs !== undefined) {
+              const sampleMs = new Date(`${dateStr} ${m[1]} GMT+0530`).getTime();
+              if (Number.isFinite(sampleMs)) {
+                if (options.windowStartMs !== undefined && sampleMs < options.windowStartMs) continue;
+                if (options.windowEndMs !== undefined && sampleMs > options.windowEndMs) continue;
+              }
+            }
+
             count++;
             if (first === null) {
               first = val;
@@ -149,6 +255,7 @@ export function readCombinedAlerts(dateStrings: string[]): AlertLogItem[] {
   const alertsDir = process.env.BTC_ALERTS_DIR
     ? path.resolve(process.env.BTC_ALERTS_DIR)
     : path.resolve(process.cwd(), 'logs');
+  assertSafeTestDirectory(alertsDir, 'alerts directory');
 
   const alerts: AlertLogItem[] = [];
 
