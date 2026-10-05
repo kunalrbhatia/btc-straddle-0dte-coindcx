@@ -15,6 +15,7 @@ export interface AppConfig {
   readonly scheduledHourIST: number;
   readonly scheduledMinuteIST: number;
   readonly dailyExpiryHourUTC: number;
+  readonly expiryMinLeadMinutes?: number;
   readonly strikeStep: number;
   readonly orderQuantity: number;
   readonly leverage: number;
@@ -112,6 +113,7 @@ export const config: AppConfig = {
   scheduledHourIST: parseRequiredIntInRange('EXECUTION_HOUR_IST', 0, 23),
   scheduledMinuteIST: parseRequiredIntInRange('EXECUTION_MINUTE_IST', 0, 59),
   dailyExpiryHourUTC: parseOptionalIntInRange('DAILY_EXPIRY_HOUR_UTC', 8, 0, 23),
+  expiryMinLeadMinutes: getEnvNumber('EXPIRY_MIN_LEAD_MINUTES', 30),
   strikeStep: getEnvNumber('STRIKE_STEP', 250), // CoinDCX BTC 0DTE options grid is spaced at 250
   orderQuantity: getEnvNumber('ORDER_QUANTITY', 0.01), // CoinDCX options min lot is 0.01 BTC
   leverage: getEnvNumber('LEVERAGE', 10),

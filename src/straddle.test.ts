@@ -5,9 +5,12 @@ import {
   calculateAtmStrike,
   generateContractSymbols,
   waitForFills,
+  discoverAtmStraddleFromInstruments,
+  determineAtmStraddle,
 } from './straddle';
 import { CoinDCXClient } from './client';
 import { AppConfig } from './config';
+import { OptionsInstrument } from './types';
 import { Notifier } from './notifier';
 
 /**
@@ -639,4 +642,165 @@ describe('Straddle Execution & Unwind Tests', () => {
       assert.equal(res.putFilled, true);
     });
   });
+
+  describe('Exchange Instruments & Expiry Discovery Tests', () => {
+    const fixedNow = new Date('2026-10-05T12:45:00.000Z'); // 18:15 IST on 05 Oct 2026
+
+    it('discovers earliest active expiry and extracts verbatim symbols from real listing shape', () => {
+      const mockListing: readonly OptionsInstrument[] = [
+        {
+          symbol: 'BTC-6OCT26-85000-C-USDT',
+          displayName: 'BTC-6OCT26-85000-C',
+          expiryTime: String(Date.UTC(2026, 9, 6, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Call',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-6OCT26-85000-P-USDT',
+          displayName: 'BTC-6OCT26-85000-P',
+          expiryTime: String(Date.UTC(2026, 9, 6, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Put',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-7OCT26-85000-C-USDT',
+          displayName: 'BTC-7OCT26-85000-C',
+          expiryTime: String(Date.UTC(2026, 9, 7, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Call',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-7OCT26-85000-P-USDT',
+          displayName: 'BTC-7OCT26-85000-P',
+          expiryTime: String(Date.UTC(2026, 9, 7, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Put',
+          isActive: true,
+        },
+      ];
+
+      const discovered = discoverAtmStraddleFromInstruments(mockListing, 84980, 250, fixedNow, 30);
+      assert.ok(discovered);
+      assert.equal(discovered.atmStrike, 85000);
+      assert.equal(discovered.callSymbol, 'BTC-6OCT26-85000-C-USDT');
+      assert.equal(discovered.putSymbol, 'BTC-6OCT26-85000-P-USDT');
+      assert.equal(discovered.expiryTimeMs, Date.UTC(2026, 9, 6, 8, 0, 0));
+    });
+
+    it('skipped-date case: when 08 Oct is skipped, selects 09 Oct instead of failing', () => {
+      // Entry at 18:15 IST on 07 Oct (12:45 UTC).
+      // Next day arithmetic would have expected 08 Oct. But exchange listing skips 08 Oct and jumps to 09 Oct!
+      const entryTime = new Date('2026-10-07T12:45:00.000Z');
+      const mockListingWithSkippedDate: readonly OptionsInstrument[] = [
+        // 07 Oct expired or active earlier today (08:00 UTC was 4h 45m ago)
+        {
+          symbol: 'BTC-7OCT26-85000-C-USDT',
+          expiryTime: String(Date.UTC(2026, 9, 7, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Call',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-7OCT26-85000-P-USDT',
+          expiryTime: String(Date.UTC(2026, 9, 7, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Put',
+          isActive: true,
+        },
+        // NOTICE: 08 Oct is NOT in the listing (it was skipped by CoinDCX!)
+        // Next available listing is 09 Oct:
+        {
+          symbol: 'BTC-9OCT26-85000-C-USDT',
+          expiryTime: String(Date.UTC(2026, 9, 9, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Call',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-9OCT26-85000-P-USDT',
+          expiryTime: String(Date.UTC(2026, 9, 9, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Put',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-16OCT26-85000-C-USDT',
+          expiryTime: String(Date.UTC(2026, 9, 16, 8, 0, 0)),
+          strikePrice: '85000',
+          optionsType: 'Call',
+          isActive: true,
+        },
+      ];
+
+      const discovered = discoverAtmStraddleFromInstruments(mockListingWithSkippedDate, 85020, 250, entryTime, 30);
+      assert.ok(discovered);
+      assert.equal(discovered.atmStrike, 85000);
+      assert.equal(discovered.callSymbol, 'BTC-9OCT26-85000-C-USDT');
+      assert.equal(discovered.putSymbol, 'BTC-9OCT26-85000-P-USDT');
+      assert.equal(discovered.expiryTimeMs, Date.UTC(2026, 9, 9, 8, 0, 0));
+    });
+
+    it('rejects an expiry less than EXPIRY_MIN_LEAD_MINUTES away in favour of a future expiry', () => {
+      // Current time: 07:45 UTC.
+      // Expiry 1: 08:00 UTC (15 mins away < 30 mins lead time) -> must be rejected.
+      // Expiry 2: Tomorrow 08:00 UTC (24h 15m away) -> must be selected.
+      const now = new Date('2026-10-06T07:45:00.000Z');
+      const expiringSoonMs = Date.UTC(2026, 9, 6, 8, 0, 0); // 15 min away
+      const tomorrowMs = Date.UTC(2026, 9, 7, 8, 0, 0);
+
+      const mockListing: readonly OptionsInstrument[] = [
+        {
+          symbol: 'BTC-6OCT26-85000-C-USDT',
+          expiryTime: String(expiringSoonMs),
+          strikePrice: '85000',
+          optionsType: 'Call',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-6OCT26-85000-P-USDT',
+          expiryTime: String(expiringSoonMs),
+          strikePrice: '85000',
+          optionsType: 'Put',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-7OCT26-85000-C-USDT',
+          expiryTime: String(tomorrowMs),
+          strikePrice: '85000',
+          optionsType: 'Call',
+          isActive: true,
+        },
+        {
+          symbol: 'BTC-7OCT26-85000-P-USDT',
+          expiryTime: String(tomorrowMs),
+          strikePrice: '85000',
+          optionsType: 'Put',
+          isActive: true,
+        },
+      ];
+
+      const discovered = discoverAtmStraddleFromInstruments(mockListing, 85000, 250, now, 30);
+      assert.ok(discovered);
+      assert.equal(discovered.expiryTimeMs, tomorrowMs);
+      assert.equal(discovered.callSymbol, 'BTC-7OCT26-85000-C-USDT');
+      assert.equal(discovered.putSymbol, 'BTC-7OCT26-85000-P-USDT');
+    });
+
+    it('falls back to arithmetic calculation when getOptionsInstruments fails or returns empty', async () => {
+      const mockClient = {
+        getBtcSpotPrice: async () => 84750,
+        getOptionsInstruments: async () => [],
+      } as unknown as CoinDCXClient;
+
+      const legs = await determineAtmStraddle(mockClient, mockConfig);
+      assert.ok(legs);
+      assert.equal(legs.atmStrike, 84750);
+      assert.ok(legs.callSymbol.includes('84750-C-USDT'));
+      assert.ok(legs.putSymbol.includes('84750-P-USDT'));
+    });
+  });
 });
+

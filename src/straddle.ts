@@ -2,6 +2,7 @@ import { CoinDCXClient } from './client';
 import {
   OrderItem,
   OrderPlacementOutcome,
+  OptionsInstrument,
   StraddleExecutionResult,
   StraddleLegs,
 } from './types';
@@ -37,13 +38,7 @@ const MONTH_NAMES = [
 /**
  * CoinDCX's BTC options expire every day at 08:00 UTC (= 13:30 IST).
  *
- * The bot enters at 18:15 IST — nearly five hours AFTER that day's expiry — so at
- * entry time "today's" contract no longer exists. The live (tradeable) contract is
- * the NEXT day's.
- *
- * Verified live 2026-10-03: at 18:15 IST the exchange's own order form used
- * `BTC-4OCT26-84750-C-USDT`, while the bot asked for `BTC-3OCT26-...` and was
- * rejected with " does not exist." — that single date error was the whole bug.
+ * Used as a fallback when public instruments discovery is unavailable.
  */
 /** The expiry date of the contract that is actually tradeable right now. */
 export function nextExpiryDate(
@@ -66,8 +61,7 @@ export function nextExpiryDate(
 
 /**
  * Generates the contract symbols for Call (C) and Put (P) at the given strike.
- * Defaults to the NEXT tradeable expiry (see nextExpiryDate) rather than the
- * current calendar date.
+ * Used as fallback arithmetic when instrument discovery is unavailable.
  * e.g. BTC-4OCT26-84750-C-USDT / BTC-4OCT26-84750-P-USDT
  */
 export function generateContractSymbols(
@@ -88,7 +82,96 @@ export function generateContractSymbols(
 }
 
 /**
- * Determines ATM straddle legs based on live BTC spot price or custom overrides
+ * Discovers ATM straddle legs directly from CoinDCX's public options instruments list.
+ *
+ * Algorithm:
+ * 1. Filter for isActive === true and valid numeric expiryTimeMs.
+ * 2. Filter for expiryTimeMs >= nowMs + minLeadMinutes (reject contracts expiring too soon).
+ * 3. Group by expiryTimeMs and pick the earliest valid expiryTimeMs.
+ * 4. Among instruments of that expiry, identify available strike prices.
+ * 5. Pick the strike closest to spot on the strikeStep grid (or closest listed strike).
+ * 6. Extract exact call and put symbols verbatim from the API.
+ *
+ * Returns null if no eligible instruments are found.
+ */
+export function discoverAtmStraddleFromInstruments(
+  instruments: readonly OptionsInstrument[],
+  spotPrice: number,
+  strikeStep: number,
+  now = new Date(),
+  minLeadMinutes = 30
+): StraddleLegs | null {
+  const nowMs = now.getTime();
+  const minLeadMs = minLeadMinutes * 60 * 1000;
+
+  // 1 & 2: Active instruments with at least minLeadMinutes lead time
+  const valid = instruments.filter((inst) => {
+    if (!inst.isActive) return false;
+    const expMs = Number(inst.expiryTime);
+    return Number.isFinite(expMs) && expMs >= nowMs + minLeadMs;
+  });
+
+  if (valid.length === 0) {
+    return null;
+  }
+
+  // 3. Find earliest future expiry
+  const allExpiries = Array.from(new Set(valid.map((inst) => Number(inst.expiryTime)))).sort((a, b) => a - b);
+  const targetExpiryMs = allExpiries[0];
+
+  const expiryInstruments = valid.filter((inst) => Number(inst.expiryTime) === targetExpiryMs);
+
+  // 4. Identify available strikes with both Call and Put available
+  const callMap = new Map<number, string>();
+  const putMap = new Map<number, string>();
+
+  for (const inst of expiryInstruments) {
+    const strike = Number(inst.strikePrice);
+    if (!Number.isFinite(strike) || strike <= 0) continue;
+    const optType = String(inst.optionsType || '').toLowerCase();
+    const symbol = inst.symbol || inst.displayName;
+    if (!symbol) continue;
+
+    if (optType === 'call') {
+      callMap.set(strike, symbol);
+    } else if (optType === 'put') {
+      putMap.set(strike, symbol);
+    }
+  }
+
+  // Complete pairs available
+  const completeStrikes = Array.from(callMap.keys()).filter((s) => putMap.has(s));
+  if (completeStrikes.length === 0) {
+    return null;
+  }
+
+  // 5. Select strike closest to spot rounded to strikeStep
+  const idealAtm = calculateAtmStrike(spotPrice, strikeStep);
+
+  // If idealAtm is listed, pick it; otherwise pick nearest available listed strike
+  completeStrikes.sort((a, b) => Math.abs(a - idealAtm) - Math.abs(b - idealAtm) || Math.abs(a - spotPrice) - Math.abs(b - spotPrice));
+  const chosenStrike = completeStrikes[0];
+
+  const callSymbol = callMap.get(chosenStrike)!;
+  const putSymbol = putMap.get(chosenStrike)!;
+
+  return {
+    spotPrice,
+    atmStrike: chosenStrike,
+    callSymbol,
+    putSymbol,
+    expiryTimeMs: targetExpiryMs,
+  };
+}
+
+/**
+ * Determines ATM straddle legs based on live BTC spot price or custom overrides.
+ *
+ * Primary discovery: queries the public instruments endpoint to discover the actual
+ * listed expiry and verbatim symbols from the exchange.
+ *
+ * Fallback: if instruments cannot be read or no valid future expiry exists,
+ * logs a loud warning and falls back to arithmetic symbol generation.
  */
 export async function determineAtmStraddle(
   client: CoinDCXClient,
@@ -96,16 +179,58 @@ export async function determineAtmStraddle(
 ): Promise<StraddleLegs> {
   const spotPrice = await client.getBtcSpotPrice();
   const atmStrike = calculateAtmStrike(spotPrice, config.strikeStep);
-  const generated = generateContractSymbols(atmStrike);
 
-  const callSymbol = config.customCallSymbol || generated.callSymbol;
-  const putSymbol = config.customPutSymbol || generated.putSymbol;
+  let discovered: StraddleLegs | null = null;
+  try {
+    const instruments = await client.getOptionsInstruments('BTC');
+    if (instruments && instruments.length > 0) {
+      discovered = discoverAtmStraddleFromInstruments(
+        instruments,
+        spotPrice,
+        config.strikeStep,
+        new Date(),
+        config.expiryMinLeadMinutes ?? 30
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `[Straddle] ⚠️ Failed to fetch options instruments from exchange: ${(err as Error).message}`
+    );
+  }
+
+  let finalCallSymbol: string;
+  let finalPutSymbol: string;
+  let finalStrike = atmStrike;
+  let finalExpiryTimeMs: number | undefined;
+
+  if (discovered) {
+    console.log(
+      `[Straddle] 🔍 Discovered live expiry from exchange: ${new Date(discovered.expiryTimeMs!).toISOString()} (CALL: ${discovered.callSymbol}, PUT: ${discovered.putSymbol})`
+    );
+    finalCallSymbol = discovered.callSymbol;
+    finalPutSymbol = discovered.putSymbol;
+    finalStrike = discovered.atmStrike;
+    finalExpiryTimeMs = discovered.expiryTimeMs;
+  } else {
+    // Fallback path: log loudly that fallback was used
+    console.warn(
+      `[Straddle] ⚠️ Could not discover instruments from exchange API — falling back to arithmetic DAILY_EXPIRY_HOUR_UTC (${config.dailyExpiryHourUTC}) calculation!`
+    );
+    const fallback = generateContractSymbols(atmStrike, new Date(), config.dailyExpiryHourUTC);
+    finalCallSymbol = fallback.callSymbol;
+    finalPutSymbol = fallback.putSymbol;
+    finalExpiryTimeMs = nextExpiryDate(new Date(), config.dailyExpiryHourUTC).getTime();
+  }
+
+  const callSymbol = config.customCallSymbol || finalCallSymbol;
+  const putSymbol = config.customPutSymbol || finalPutSymbol;
 
   return {
     spotPrice,
-    atmStrike,
+    atmStrike: finalStrike,
     callSymbol,
     putSymbol,
+    expiryTimeMs: finalExpiryTimeMs,
   };
 }
 
@@ -200,8 +325,7 @@ export async function executeShortStraddle(
 
   // Step 2: Price the entry from live options ticker when placing Limit orders
   if (hasToken && config.entryOrderType === 'Limit') {
-    const expiry = nextExpiryDate();
-    const expiryTimeMs = expiry.getTime();
+    const expiryTimeMs = legs.expiryTimeMs ?? nextExpiryDate(new Date(), config.dailyExpiryHourUTC).getTime();
 
     const tickers = await client.getOptionsTicker('BTC', expiryTimeMs);
     const callTicker = tickers.find((t) => t.symbol === legs.callSymbol);

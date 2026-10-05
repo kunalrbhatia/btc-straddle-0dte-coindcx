@@ -8,9 +8,11 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
 
 ## Verified Exchange Mechanics & Architecture
 
-1. **Option Expiry Timing**:
-   - CoinDCX BTC options expire daily at **08:00 UTC (13:30 IST)**.
-   - The bot enters at **18:15 IST** (~5 hours *after* that day's expiry). Therefore, "today's" contract no longer exists at entry time; the live tradeable contract is **tomorrow's expiry**. Contract symbol generation rolls automatically past 08:00 UTC via `nextExpiryDate()`.
+1. **Option Expiry Timing & Dynamic Discovery**:
+   - CoinDCX BTC options typically expire at **08:00 UTC (13:30 IST)**, but the exchange skips calendar dates and follows a custom listing schedule (e.g. daily contracts for 3 days followed by weekly contracts).
+   - **Discover, Don't Compute**: The bot dynamically queries CoinDCX's public options instruments endpoint (`GET https://public.coindcx.com/api/v1/options/instruments?baseCurrency=BTC`), groups by `expiryTime`, filters out expiries within `EXPIRY_MIN_LEAD_MINUTES` (default 30m), and selects the earliest active expiry alongside verbatim API contract symbols.
+   - **Logged Fallback**: If the public instruments feed is temporarily unreachable, the bot logs a loud warning and falls back to arithmetic calendar derivation (`DAILY_EXPIRY_HOUR_UTC`, default 8 UTC). If neither works, it aborts cleanly with zero orders.
+   - The standalone position monitor (`scripts/btc-position-monitor.py`) also derives expiry directly from the contract's own symbol rather than independent arithmetic.
 2. **Session Authentication & IP Binding**:
    - CoinDCX options endpoints (`https://api.coindcx.com/api/v1/options/*`) require web session Bearer tokens (`authorization: Bearer <token>`) and the web browser session's `User-Agent`.
    - Standard API Key + HMAC is accepted for spot and margin endpoints, but rejected with 401 on options.
@@ -125,7 +127,8 @@ STRIKE_STEP=250
 EXECUTION_HOUR_IST=18        # Required (0-23): Entry hour in IST
 EXECUTION_MINUTE_IST=15      # Required (0-59): Entry minute in IST
 RESTART_LEAD_MINUTES=45      # Optional (default 45): PM2 pre-entry restart lead time
-DAILY_EXPIRY_HOUR_UTC=8      # Optional (default 8 = 13:30 IST): 0DTE daily options expiry boundary in UTC
+DAILY_EXPIRY_HOUR_UTC=8      # Optional (default 8 = 13:30 IST): Fallback 0DTE daily options expiry boundary in UTC
+EXPIRY_MIN_LEAD_MINUTES=30   # Optional (default 30): Minimum minutes ahead required for chosen expiry
 
 ENTRY_ORDER_TYPE=Limit
 ENTRY_FILL_TIMEOUT_MS=15000

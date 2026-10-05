@@ -143,7 +143,16 @@ def run_tests():
         assert "realised P&L UNAVAILABLE" in output4, f"Must report realised P&L UNAVAILABLE: {output4}"
         print("[PASS] Test 4: Unknown realised PnL suppresses alert and reports UNAVAILABLE.")
 
-        print("\nAll 4 test scenarios passed successfully!")
+        print("--- Test 5: next_expiry derives expiry directly from contract symbol ---")
+        exp_parsed = mon.next_expiry("9OCT26")
+        assert exp_parsed.year == 2026
+        assert exp_parsed.month == 10
+        assert exp_parsed.day == 9
+        assert exp_parsed.hour == 8
+        assert exp_parsed.tzinfo == timezone.utc
+        print("[PASS] Test 5: contract symbol 9OCT26 correctly parsed as 2026-10-09 08:00 UTC.")
+
+        print("\nAll 5 test scenarios passed successfully!")
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

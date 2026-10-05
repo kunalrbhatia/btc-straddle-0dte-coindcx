@@ -108,6 +108,22 @@ export interface OptionsTickerItem {
   readonly [key: string]: unknown;
 }
 
+export interface OptionsInstrument {
+  readonly symbol: string;
+  readonly displayName?: string;
+  readonly expiryTime: string | number;
+  readonly strikePrice: string | number;
+  readonly optionsType: 'Call' | 'Put' | string;
+  readonly isActive: boolean;
+  readonly lotSizeFilter?: Record<string, unknown>;
+  readonly priceFilter?: Record<string, unknown>;
+  readonly baseCoin?: string;
+  readonly quoteCoin?: string;
+  readonly settleCoin?: string;
+  readonly launchTime?: string | number;
+  readonly [key: string]: unknown;
+}
+
 
 export interface TickerItem {
   readonly market: string;
@@ -126,6 +142,7 @@ export interface StraddleLegs {
   readonly atmStrike: number;
   readonly callSymbol: string;
   readonly putSymbol: string;
+  readonly expiryTimeMs?: number;
 }
 
 export interface OrderPlacementOutcome {
