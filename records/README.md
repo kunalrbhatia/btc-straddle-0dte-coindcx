@@ -8,4 +8,4 @@ This directory contains offline, write-through cycle event ledgers, MTM tapes, a
 - `<YYYY-MM-DD>.summary.json`: Materialised summary snapshot written atomically via temp file and rename.
 
 ## Publication & Retention
-Per repo rules, cycle record files are gitignored on `main` and published along with daily trade reports directly to the isolated `reports` git branch via git plumbing (`src/reports/reportPublisher.ts`).
+Per repo rules, cycle record files are gitignored on `main`. During daily report publishing via git plumbing (`src/reports/reportPublisher.ts`), `<YYYY-MM-DD>.jsonl` and `<YYYY-MM-DD>.summary.json` are committed and pushed to the isolated `reports` git branch alongside the markdown report. The high-frequency `<YYYY-MM-DD>.mtm.jsonl` tape is retained locally on the trading host to prevent repository bloat, while key MTM statistics (high, low, peak, trough, count) are permanently preserved in the summary and report.

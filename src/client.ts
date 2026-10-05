@@ -711,7 +711,7 @@ export class CoinDCXClient {
         }
       }
 
-      if (!this.hasLoggedOpenOrdersSample && rows.length > 0) {
+      if (!this.hasLoggedOpenOrdersSample && rows.length > 0 && process.env.DEBUG_ORDERS === 'true') {
         this.hasLoggedOpenOrdersSample = true;
         console.log(`[CoinDCXClient] Sample options orders response row:`, JSON.stringify(rows[0]));
       }

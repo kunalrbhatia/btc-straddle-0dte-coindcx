@@ -143,7 +143,6 @@ export async function publishDailyReport(
 
     const recordFiles = [
       path.join('records', `${expiryDateStr}.jsonl`),
-      path.join('records', `${expiryDateStr}.mtm.jsonl`),
       path.join('records', `${expiryDateStr}.summary.json`),
     ];
 

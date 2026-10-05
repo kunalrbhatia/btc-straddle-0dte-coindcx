@@ -205,7 +205,19 @@ export async function verifyCycleAgainstVenue(
       );
 
       if (deliveryRow) {
-        const venueVal = Number(deliveryRow.filledPrice ?? 0);
+        let venueVal = 0;
+        let fieldUsed = 'netCashFlow';
+        if (deliveryRow.netCashFlow !== undefined && deliveryRow.netCashFlow !== null && deliveryRow.netCashFlow !== '') {
+          venueVal = Number(deliveryRow.netCashFlow);
+          fieldUsed = 'netCashFlow';
+        } else if (deliveryRow.balanceChange !== undefined && deliveryRow.balanceChange !== null && deliveryRow.balanceChange !== '') {
+          venueVal = Number(deliveryRow.balanceChange);
+          fieldUsed = 'balanceChange';
+        } else if (deliveryRow.grossCashFlow !== undefined && deliveryRow.grossCashFlow !== null && deliveryRow.grossCashFlow !== '') {
+          venueVal = Number(deliveryRow.grossCashFlow);
+          fieldUsed = 'grossCashFlow';
+        }
+
         const recordedVal = Number(leg.exitPrice ?? 0);
         const delta = Math.abs(recordedVal - venueVal);
         if (delta <= tolerance) {
@@ -215,6 +227,7 @@ export async function verifyCycleAgainstVenue(
             venueValue: venueVal,
             delta,
             status: 'MATCH',
+            reason: `Matched via venue DELIVERY ${fieldUsed} (${venueVal})`,
             rawVenueRow: deliveryRow,
           });
         } else {
@@ -224,7 +237,7 @@ export async function verifyCycleAgainstVenue(
             venueValue: venueVal,
             delta,
             status: 'MISMATCH',
-            reason: `Recorded settlement ${recordedVal} differs from venue DELIVERY filledPrice ${venueVal}`,
+            reason: `Recorded settlement ${recordedVal} differs from venue DELIVERY ${fieldUsed} ${venueVal}`,
             rawVenueRow: deliveryRow,
           });
         }
