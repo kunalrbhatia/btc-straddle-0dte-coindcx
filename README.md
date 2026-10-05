@@ -57,8 +57,7 @@ Clean and strictly-typed TypeScript application designed to execute a **Short AT
   - `DRY_RUN=true`: Simulates all order placements and cancellations without sending order network requests.
   - `npm run run-once`: Executes a single cycle.
 - **MTM Watcher Logging**: Appends tick-by-tick mark-to-market PnL tracking to `logs/mtm-<YYYY-MM-DD>.log`.
-- **Local Alert Journal**: Writes every alert to `logs/alerts-<YYYY-MM-DD>.jsonl` so local watch banners forward notifications even without Telegram bot credentials.
-- **Pre-Commit Secret Scanning**: Automated git hook (`scripts/pre-commit-secrets.cjs`) and `npm run scan-secrets` inspect staged files and git blobs for credentials, API keys, JWT session tokens, and executes TruffleHog to guarantee no secrets enter commits.
+- **Pre-Commit Secret Scanning & Hook Verification**: Automated git hook (`scripts/pre-commit-secrets.cjs`), `npm run scan-secrets`, and verification command `npm run verify:hooks`. Detects three-part base64url JWT/Bearer tokens and sensitive repository variables (`COINDCX_BEARER_TOKEN`, `COINDCX_API_SECRET`, etc.) without printing secret values, while allowing placeholders and test fixtures. Supports `SKIP_SECRET_SCAN=1` override and optional TruffleHog deep scans.
 
 ---
 
