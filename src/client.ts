@@ -21,6 +21,12 @@ export const OPTIONS_ENDPOINTS = {
   margin: '/api/v1/options/margin',
   // Captured order create / cancel endpoints
   orderCreate: '/api/v2/options/order/create',
+  // Fallback create route. On 2026-10-05 the V2 route began refusing EVERY order with a
+  // generic "Failed to place the order. Please retry." (OCS-TECH-0024) — reproducible even
+  // for a non-existent symbol, i.e. it failed before validating anything of ours — while
+  // this V1 route accepted the identical payload (probe: non-marketable sell placed and
+  // cancelled). Try V2 first, fall back here on exactly that signature.
+  orderCreateFallback: '/api/v1/options/order/create',
   orderCancel: '/api/v1/options/order/cancel',
 } as const;
 
@@ -682,8 +688,6 @@ export class CoinDCXClient {
       throw new SessionTokenExpiredError(msg);
     }
 
-    const endpoint = `${this.baseUrl}${OPTIONS_ENDPOINTS.orderCreate}`;
-
     const priceStr =
       price !== undefined && price !== null
         ? typeof price === 'string'
@@ -708,11 +712,41 @@ export class CoinDCXClient {
     };
 
     try {
-      const response = await fetch(endpoint, {
+      // Create-route fallback. The V2 route validated the JSON envelope but then refused
+      // every well-formed order with a generic OCS-TECH-0024 ("Failed to place the order.
+      // Please retry.") — even for a symbol that does not exist, i.e. before any validation
+      // of ours could be at fault — while the V1 route accepted the identical payload.
+      // Try V2, then fall back to V1 on exactly that generic signature; any other error
+      // (validation, auth, contract) is returned unchanged rather than retried.
+      const createEndpoints = [
+        { label: 'V2', path: OPTIONS_ENDPOINTS.orderCreate },
+        { label: 'V1 fallback', path: OPTIONS_ENDPOINTS.orderCreateFallback },
+      ] as const;
+
+      let response = await fetch(`${this.baseUrl}${createEndpoints[0].path}`, {
         method: 'POST',
         headers: this.getOptionsHeaders(token),
         body: JSON.stringify(body),
       });
+      // Log raw response body (never token)
+      let rawText = await response.text();
+      console.log(`[CoinDCXClient] order create raw response via ${createEndpoints[0].label} (${symbol}): ${rawText}`);
+
+      for (const alt of createEndpoints.slice(1)) {
+        if (!rawText.includes('OCS-TECH-0024')) {
+          break;
+        }
+        console.warn(
+          `[CoinDCXClient] ⚠️ create refused with a generic placement error on the primary route — retrying via ${alt.label}`
+        );
+        response = await fetch(`${this.baseUrl}${alt.path}`, {
+          method: 'POST',
+          headers: this.getOptionsHeaders(token),
+          body: JSON.stringify(body),
+        });
+        rawText = await response.text();
+        console.log(`[CoinDCXClient] order create raw response via ${alt.label} (${symbol}): ${rawText}`);
+      }
 
       if (response.status === 401) {
         const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
@@ -721,16 +755,12 @@ export class CoinDCXClient {
         throw new SessionTokenExpiredError(msg);
       }
 
-      const rawText = await response.text();
       let data: Record<string, unknown> = {};
       try {
         data = JSON.parse(rawText) as Record<string, unknown>;
       } catch {
         data = { rawText };
       }
-
-      // Log raw response body (never token)
-      console.log(`[CoinDCXClient] v2 order create raw response (${symbol}): ${rawText}`);
 
       // Extract order ID defensively from common candidate fields
       const orderData = data.data as Record<string, unknown> | undefined;
