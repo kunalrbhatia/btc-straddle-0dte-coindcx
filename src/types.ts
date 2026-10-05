@@ -56,6 +56,7 @@ export interface OptionsOrderRequest {
   readonly price?: string;
   readonly takeProfit?: string;
   readonly stopLoss?: string;
+  readonly reduceOnly?: boolean;
 }
 
 export interface OptionsPosition {
@@ -124,7 +125,6 @@ export interface OptionsInstrument {
   readonly [key: string]: unknown;
 }
 
-
 export interface TickerItem {
   readonly market: string;
   readonly change_24_hour: string;
@@ -155,6 +155,7 @@ export interface OrderPlacementOutcome {
   readonly rawResponse: Record<string, unknown>;
   readonly route?: 'V2' | 'V1-fallback' | string;
   readonly traceId?: string;
+  readonly isAlreadyFlat?: boolean;
 }
 
 export interface StraddleExecutionResult {
@@ -173,6 +174,7 @@ export type LegStatus = 'open' | 'closed';
 
 export type LegCloseReason =
   | 'SL_HIT'
+  | 'SL_FALLBACK_CLOSE'
   | 'PROFIT_TARGET_HIT'
   | 'MANUAL'
   | 'UNWOUND_PARTIAL'
@@ -210,6 +212,7 @@ export interface RiskManagementConfig {
   readonly profitTargetRatio: number; // 0.55 = 55% of combined credit
   readonly pollIntervalMs: number;
   readonly maxMonitorMinutes?: number; // End-of-life cutoff for monitor
+  readonly slOverrunTolerance?: number; // Overrun beyond SL trigger before fallback close (default 0.10 = 10%)
 }
 
 export interface StraddlePositionState {

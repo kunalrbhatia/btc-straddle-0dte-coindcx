@@ -527,4 +527,322 @@ describe('Risk Manager Unit Tests', () => {
       assert.ok(closeAttempts > 0, 'the leg must go through a real exit attempt, not a silent close');
     });
   });
+
+  describe('monitorStraddleRisk venue-only SL and position reconciliation', () => {
+    it('does NOT send a bot close order when mark >= stopLossPrice while leg is still open on venue', async () => {
+      let slCloseCalled = false;
+      const future = contractSymbolsAt(daysFromNow(90));
+      const client = {
+        getContractPrice: async () => 650, // >= SL (640)
+        getOptionsPositions: async () => [
+          { symbol: future.call, qty: 0.01, side: 'sell' },
+          { symbol: future.put, qty: 0.01, side: 'sell' },
+        ],
+        getOpenOptionsOrders: async () => [
+          {
+            symbol: future.call,
+            orderType: 'Stop',
+            triggerPrice: 640,
+            qty: 0.01,
+            reduceOnly: true,
+            status: 'Untriggered',
+          },
+          {
+            symbol: future.put,
+            orderType: 'Stop',
+            triggerPrice: 730,
+            qty: 0.01,
+            reduceOnly: true,
+            status: 'Untriggered',
+          },
+        ],
+        closePosition: async () => {
+          slCloseCalled = true;
+          return { success: true };
+        },
+      } as unknown as CoinDCXClient;
+
+      const state: StraddlePositionState = {
+        date: '2026-10-05',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: future.call,
+          entryPrice: 320,
+          entryPriceSource: 'fill',
+          stopLossPrice: 640,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 320,
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: future.put,
+          entryPrice: 365,
+          entryPriceSource: 'fill',
+          stopLossPrice: 730,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 365,
+        },
+        totalCreditReceived: 685,
+        targetProfitPoints: 376.75,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+
+      // Set maxMonitorMinutes to 10 so window does not elapse immediately,
+      // but simulate venue closing the CALL leg on poll 2 to allow monitor to resolve.
+      let pollCount = 0;
+      const venuePositions = [
+        { symbol: future.call, qty: 0.01, side: 'sell' },
+        { symbol: future.put, qty: 0.01, side: 'sell' },
+      ];
+      (client as unknown as { getOptionsPositions: () => Promise<unknown> }).getOptionsPositions = async () => {
+        pollCount++;
+        if (pollCount >= 2) {
+          // After observing mark >= SL without triggering bot close, close both legs on venue to resolve monitor
+          return [];
+        }
+        return venuePositions;
+      };
+
+      const fastConfig = {
+        ...mockConfig,
+        riskConfig: {
+          ...mockConfig.riskConfig,
+          pollIntervalMs: 20,
+          maxMonitorMinutes: 10,
+          slOverrunTolerance: 0.10, // 10% overrun -> 640 * 1.10 = 704
+        },
+      };
+
+      const { monitorStraddleRisk } = await import('./riskManager');
+      await monitorStraddleRisk(client, state, fastConfig);
+
+      // Within overrun tolerance (< 704), bot must NOT send close order (venue executes it)
+      assert.equal(slCloseCalled, false, 'bot must not send its own close order on SL breach when within overrun tolerance');
+    });
+
+    it('adopts leg as closed from venue with venue fill price when position disappears from venue', async () => {
+      const future = contractSymbolsAt(daysFromNow(90));
+      const client = {
+        getContractPrice: async () => 600,
+        getOptionsPositions: async () => [
+          // CALL disappeared! Only PUT is present on venue
+          { symbol: future.put, qty: 0.01, side: 'sell' },
+        ],
+        getOpenOptionsOrders: async () => [],
+        getOptionsWalletTransactions: async () => [
+          {
+            symbol: future.call,
+            transactionType: 'TRADE',
+            filledPrice: '677.28',
+            orderId: 'x-venue-stop-call',
+          },
+        ],
+        closePosition: async () => ({ success: true }),
+      } as unknown as CoinDCXClient;
+
+      const state: StraddlePositionState = {
+        date: '2026-10-05',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: future.call,
+          entryPrice: 320,
+          entryPriceSource: 'fill',
+          stopLossPrice: 640,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 320,
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: future.put,
+          entryPrice: 365,
+          entryPriceSource: 'fill',
+          stopLossPrice: 730,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 365,
+        },
+        totalCreditReceived: 685,
+        targetProfitPoints: 376.75,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const fastConfig = {
+        ...mockConfig,
+        riskConfig: {
+          ...mockConfig.riskConfig,
+          pollIntervalMs: 20,
+          maxMonitorMinutes: 0.002,
+        },
+      };
+
+      const { monitorStraddleRisk } = await import('./riskManager');
+      await monitorStraddleRisk(client, state, fastConfig);
+
+      assert.equal(state.callLeg.status, 'closed');
+      assert.equal(state.callLeg.closeReason, 'SL_HIT');
+      assert.equal(state.callLeg.exitPrice, 677.28, 'must adopt venue filledPrice from ledger');
+      assert.equal(state.callLeg.exitOrderId, 'x-venue-stop-call');
+    });
+
+    it('escalates to SL_FALLBACK_CLOSE when price exceeds overrun tolerance and position is stuck open', async () => {
+      let fallbackCloseCalled = false;
+      const future = contractSymbolsAt(daysFromNow(90));
+      const client = {
+        getContractPrice: async () => 720, // SL is 640, overrun threshold is 640 * 1.10 = 704 -> 720 > 704!
+        getOptionsPositions: async () => [
+          { symbol: future.call, qty: 0.01, side: 'sell' },
+          { symbol: future.put, qty: 0.01, side: 'sell' },
+        ],
+        getOpenOptionsOrders: async () => [
+          {
+            symbol: future.call,
+            orderType: 'Stop',
+            triggerPrice: 640,
+            qty: 0.01,
+            reduceOnly: true,
+            status: 'Untriggered',
+          },
+        ],
+        closePosition: async () => {
+          fallbackCloseCalled = true;
+          return { success: true, orderId: 'fallback-ord-1' };
+        },
+      } as unknown as CoinDCXClient;
+
+      const state: StraddlePositionState = {
+        date: '2026-10-05',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: future.call,
+          entryPrice: 320,
+          entryPriceSource: 'fill',
+          stopLossPrice: 640,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 320,
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: future.put,
+          entryPrice: 365,
+          entryPriceSource: 'fill',
+          stopLossPrice: 730,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 365,
+        },
+        totalCreditReceived: 685,
+        targetProfitPoints: 376.75,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const fastConfig = {
+        ...mockConfig,
+        riskConfig: {
+          ...mockConfig.riskConfig,
+          pollIntervalMs: 20,
+          maxMonitorMinutes: 0.002,
+          slOverrunTolerance: 0.10,
+        },
+      };
+
+      const { monitorStraddleRisk } = await import('./riskManager');
+      await monitorStraddleRisk(client, state, fastConfig);
+
+      assert.equal(fallbackCloseCalled, true, 'must execute fallback close on overrun tolerance breach');
+      assert.equal(state.callLeg.closeReason, 'SL_FALLBACK_CLOSE');
+    });
+
+    it('detects unexpected long position on venue and flattens with reduceOnly', async () => {
+      let flattenOrderCalled = false;
+      let flattenReduceOnly = false;
+      const future = contractSymbolsAt(daysFromNow(90));
+
+      const client = {
+        getContractPrice: async () => 320,
+        getOptionsPositions: async () => [
+          { symbol: future.call, qty: 0.01, side: 'buy' }, // Unexpected long position!
+          { symbol: future.put, qty: 0.01, side: 'sell' },
+        ],
+        getOpenOptionsOrders: async () => [],
+        placeOptionsOrder: async (
+          _sym: string,
+          _side: string,
+          _qty: number,
+          _type: string,
+          _price?: number | string,
+          _sl?: string,
+          _tp?: string,
+          _cr?: string,
+          reduceOnly?: boolean
+        ) => {
+          flattenOrderCalled = true;
+          flattenReduceOnly = Boolean(reduceOnly);
+          return { symbol: future.call, side: 'sell' as const, success: true, rawResponse: {} };
+        },
+        closePosition: async () => ({ success: true }),
+      } as unknown as CoinDCXClient;
+
+      const state: StraddlePositionState = {
+        date: '2026-10-05',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: future.call,
+          entryPrice: 320,
+          entryPriceSource: 'fill',
+          stopLossPrice: 640,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 320,
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: future.put,
+          entryPrice: 365,
+          entryPriceSource: 'fill',
+          stopLossPrice: 730,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 365,
+        },
+        totalCreditReceived: 685,
+        targetProfitPoints: 376.75,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const fastConfig = {
+        ...mockConfig,
+        riskConfig: {
+          ...mockConfig.riskConfig,
+          pollIntervalMs: 20,
+          maxMonitorMinutes: 0.002,
+        },
+      };
+
+      const { monitorStraddleRisk } = await import('./riskManager');
+      await monitorStraddleRisk(client, state, fastConfig);
+
+      assert.equal(flattenOrderCalled, true, 'must attempt to flatten unexpected long position');
+      assert.equal(flattenReduceOnly, true, 'flatten order must carry reduceOnly: true');
+    });
+  });
 });

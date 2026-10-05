@@ -311,6 +311,45 @@ describe('CoinDCXClient Options Unit Tests', () => {
       assert.equal(outcome.limitPrice, 416.0);
       assert.match(outcome.orderId ?? '', /^sim-options-/);
     });
+
+    it('attaches reduceOnly: true to payload when requested and detects OCS-TECH-0013', async () => {
+      let interceptedBody: Record<string, unknown> = {};
+      global.fetch = async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.body && typeof init.body === 'string') {
+          interceptedBody = JSON.parse(init.body) as Record<string, unknown>;
+        }
+        return new Response(
+          JSON.stringify({
+            status: 'error',
+            code: 422,
+            message: 'Failed to submit the reduce-only order! You do not have any open positions.',
+            error: {
+              code: 'OCS-TECH-0013',
+              message: 'Failed to submit the reduce-only order! You do not have any open positions.',
+            },
+          }),
+          { status: 422 }
+        );
+      };
+
+      const client = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+      const outcome = await client.placeOptionsOrder(
+        'BTC-6OCT26-85750-C-USDT',
+        'buy',
+        0.01,
+        'Market',
+        undefined,
+        '',
+        '',
+        '102',
+        true
+      );
+
+      assert.equal(interceptedBody.reduceOnly, true);
+      assert.equal(interceptedBody.side, 'buy');
+      assert.equal(outcome.success, false);
+      assert.equal(outcome.isAlreadyFlat, true);
+    });
   });
 
   describe('conversionRate resolution', () => {

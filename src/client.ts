@@ -750,7 +750,8 @@ export class CoinDCXClient {
     price?: number | string,
     stopLoss = '',
     takeProfit = '',
-    conversionRate?: string
+    conversionRate?: string,
+    reduceOnly = false
   ): Promise<OrderPlacementOutcome> {
     const numPrice =
       typeof price === 'number'
@@ -761,7 +762,7 @@ export class CoinDCXClient {
 
     if (this.dryRun) {
       console.log(
-        `[CoinDCXClient] [DRY RUN] Simulating placeOptionsOrder: ${side} ${qty} ${symbol} @ ${price ?? 'Market'} | stopLoss: ${stopLoss || 'none'}`
+        `[CoinDCXClient] [DRY RUN] Simulating placeOptionsOrder: ${side} ${qty} ${symbol} @ ${price ?? 'Market'} | stopLoss: ${stopLoss || 'none'}${reduceOnly ? ' | reduceOnly: true' : ''}`
       );
       return {
         symbol,
@@ -792,7 +793,7 @@ export class CoinDCXClient {
     // Verified against the live API: conversionRate is REQUIRED (its absence is a 400).
     // Resolve it live (USDT -> INR) unless the caller supplied one explicitly.
     const resolvedConversionRate = conversionRate ?? (await this.resolveConversionRate());
-    const body: Record<string, string> = {
+    const body: Record<string, unknown> = {
       symbol,
       side,
       orderType,
@@ -802,6 +803,9 @@ export class CoinDCXClient {
       takeProfit: takeProfit || '',
       conversionRate: resolvedConversionRate,
     };
+    if (reduceOnly) {
+      body.reduceOnly = true;
+    }
 
     try {
       // Create-route fallback. The V2 route validated the JSON envelope but then refused
@@ -927,6 +931,11 @@ export class CoinDCXClient {
       if (!response.ok) errorParts.push(`HTTP ${response.status}`);
       const errorMsg = errorParts.join(' | ');
 
+      const isAlreadyFlat =
+        rawText.includes('OCS-TECH-0013') ||
+        rawMsg.toLowerCase().includes('do not have any open positions') ||
+        rawMsg.toLowerCase().includes('no open positions');
+
       console.error(
         `[CoinDCXClient] ❌ Order placement rejected (${side} ${qty} ${symbol}) HTTP ${response.status}: ${errorMsg}`
       );
@@ -945,6 +954,7 @@ export class CoinDCXClient {
         limitPrice: numPrice,
         message: errorMsg,
         rawResponse: enhancedRaw,
+        isAlreadyFlat,
       };
     } catch (err) {
       if (err instanceof SessionTokenExpiredError) {
@@ -1003,7 +1013,7 @@ export class CoinDCXClient {
   }
 
   /**
-   * Closes an existing short position by executing a BUY order.
+   * Closes an existing short position by executing a BUY order with reduceOnly: true.
    */
   public async closePosition(
     pair: string,
@@ -1012,8 +1022,18 @@ export class CoinDCXClient {
   ): Promise<OrderPlacementOutcome> {
     const token = this.getBearerToken();
     if (token) {
-      // Use native Options API for options contracts
-      return this.placeOptionsOrder(pair, 'buy', quantity, 'Market');
+      // Use native Options API for options contracts with reduceOnly: true
+      return this.placeOptionsOrder(
+        pair,
+        'buy',
+        quantity,
+        'Market',
+        undefined,
+        '',
+        '',
+        undefined,
+        true
+      );
     }
 
     const order: OrderItem = {

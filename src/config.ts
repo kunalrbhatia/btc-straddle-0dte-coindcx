@@ -135,6 +135,7 @@ export const config: AppConfig = {
     profitTargetRatio: getEnvNumber('PROFIT_TARGET_RATIO', 0.55), // 55% of total credit
     pollIntervalMs: getEnvNumber('POLL_INTERVAL_MS', 2000), // Check positions every 2 seconds
     maxMonitorMinutes: getEnvNumber('MAX_MONITOR_MINUTES', 1380), // 23 hours cutoff by default (accommodates 14:15 IST entry to 13:30 IST expiry)
+    slOverrunTolerance: getEnvNumber('SL_OVERRUN_TOLERANCE', 0.10), // 10% overrun before emergency fallback close
   },
   customCallSymbol: process.env.CUSTOM_CALL_SYMBOL || undefined,
   customPutSymbol: process.env.CUSTOM_PUT_SYMBOL || undefined,

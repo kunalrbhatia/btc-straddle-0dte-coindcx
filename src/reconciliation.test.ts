@@ -218,6 +218,122 @@ describe('Reconciliation & Exit Safety Unit Tests', () => {
       assert.equal(leg.exitPrice, 150);
       assert.equal(leg.exitOrderId, 'close-ord-success');
     });
+
+    it('treats isAlreadyFlat rejection as ALREADY_FLAT clean close', async () => {
+      const mockClient = {
+        closePosition: async () => ({
+          symbol: 'BTC-5OCT26-85250-C-USDT',
+          side: 'buy' as const,
+          success: false,
+          isAlreadyFlat: true,
+          message: 'Failed to submit the reduce-only order! You do not have any open positions.',
+          rawResponse: {},
+        }),
+        getOptionsPositions: async () => [],
+      } as unknown as CoinDCXClient;
+
+      const leg: ActiveLeg = {
+        legType: 'CALL',
+        symbol: 'BTC-5OCT26-85250-C-USDT',
+        entryPrice: 300,
+        entryPriceSource: 'fill',
+        stopLossPrice: 600,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 600,
+      };
+
+      const result = await safeCloseLeg(mockClient, leg, 600, 'SL_HIT', mockConfig);
+      assert.equal(result.success, true);
+      assert.equal(result.message, 'ALREADY_FLAT');
+      assert.equal(leg.status, 'closed');
+      assert.equal(leg.exitPrice, 600);
+      assert.equal(leg.closeReason, 'SL_HIT');
+    });
+  });
+
+  describe('verifyStopOrderArmed', () => {
+    it('verifies stop order is armed when symbol, triggerPrice, and qty match', async () => {
+      const { verifyStopOrderArmed } = await import('./reconciliation');
+      const leg: ActiveLeg = {
+        legType: 'CALL',
+        symbol: 'BTC-6OCT26-85750-C-USDT',
+        entryPrice: 535,
+        entryPriceSource: 'fill',
+        stopLossPrice: 1070,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 535,
+      };
+
+      const orders = [
+        {
+          id: 'x-c2422d57-1111',
+          symbol: 'BTC-6OCT26-85750-C-USDT',
+          orderType: 'Stop',
+          triggerPrice: 1070,
+          qty: 0.01,
+          reduceOnly: true,
+          status: 'Untriggered',
+        },
+      ];
+
+      const res = verifyStopOrderArmed(orders, leg);
+      assert.equal(res.armed, true);
+    });
+
+    it('reports MISSING when no stop order exists for symbol', async () => {
+      const { verifyStopOrderArmed } = await import('./reconciliation');
+      const leg: ActiveLeg = {
+        legType: 'PUT',
+        symbol: 'BTC-6OCT26-85750-P-USDT',
+        entryPrice: 400,
+        entryPriceSource: 'fill',
+        stopLossPrice: 800,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 400,
+      };
+
+      const orders: Record<string, unknown>[] = [];
+      const res = verifyStopOrderArmed(orders, leg);
+      assert.equal(res.armed, false);
+      assert.equal(res.reason, 'MISSING');
+    });
+
+    it('reports TRIGGER_MISMATCH when trigger price differs from stopLossPrice', async () => {
+      const { verifyStopOrderArmed } = await import('./reconciliation');
+      const leg: ActiveLeg = {
+        legType: 'CALL',
+        symbol: 'BTC-6OCT26-85750-C-USDT',
+        entryPrice: 535,
+        entryPriceSource: 'fill',
+        stopLossPrice: 1070,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 535,
+      };
+
+      const orders = [
+        {
+          id: 'x-c2422d57-1111',
+          symbol: 'BTC-6OCT26-85750-C-USDT',
+          orderType: 'Stop',
+          triggerPrice: 800, // mismatch
+          qty: 0.01,
+          reduceOnly: true,
+          status: 'Untriggered',
+        },
+      ];
+
+      const res = verifyStopOrderArmed(orders, leg);
+      assert.equal(res.armed, false);
+      assert.equal(res.reason, 'TRIGGER_MISMATCH');
+    });
   });
 
   describe('reconcileAndResurrectState', () => {
