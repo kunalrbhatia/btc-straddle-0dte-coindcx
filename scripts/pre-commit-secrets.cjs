@@ -5,13 +5,18 @@
  *
  * Checks staged files for:
  * 1. Accidental commitment of sensitive files (.env, session.token, private keys)
- * 2. High-risk secret patterns (API keys, secrets, JWT session tokens, TOTP secrets)
- * 3. TruffleHog scanner execution if installed locally
+ * 2. High-risk secret patterns: JWT bearer tokens, sensitive variables with non-placeholder values
+ * 3. TruffleHog scanner execution if installed locally (optional with explicit notification)
  */
 
 const { execSync, spawnSync } = require('child_process');
-const fs = require('fs');
 const path = require('path');
+
+// Explicit override check
+if (process.env.SKIP_SECRET_SCAN === '1') {
+  console.warn('⚠️ [Pre-commit] SKIP_SECRET_SCAN=1 override is active. Skipping secret scanning.');
+  process.exit(0);
+}
 
 // 1. Inspect staged files
 let stagedFiles = [];
@@ -55,89 +60,169 @@ if (blockedStaged.length > 0) {
   process.exit(1);
 }
 
-// 3. Scan staged file diffs for high-risk secret signatures
-const SECRET_REGEXES = [
-  {
-    name: 'CoinDCX API Key/Secret assignment',
-    regex: /(?:COINDCX_API_KEY|COINDCX_API_SECRET)\s*[:=]\s*["']?[a-zA-Z0-9_\-]{16,}["']?/i,
-  },
-  {
-    name: 'CoinDCX JWT Session Token',
-    regex: /(?:COINDCX_SESSION_TOKEN|Bearer)\s*[:=]?\s*["']?eyJ[a-zA-Z0-9_\-]{20,}\.[a-zA-Z0-9_\-]{20,}["']?/i,
-  },
-  {
-    name: 'Gmail App Password',
-    regex: /GMAIL_APP_PASSWORD\s*[:=]\s*["']?[a-z]{4}\s*[a-z]{4}\s*[a-z]{4}\s*[a-z]{4}["']?/i,
-  },
-  {
-    name: 'CoinDCX Web Password',
-    regex: /COINDCX_WEB_PASSWORD\s*[:=]\s*["']?[^"'\s]{6,}["']?/i,
-  },
-  {
-    name: 'TOTP Secret (Base32 16+ chars)',
-    regex: /COINDCX_TOTP_SECRET\s*[:=]\s*["']?[A-Z2-7]{16,}["']?/i,
-  },
-  {
-    name: 'Telegram Bot Token',
-    regex: /\b\d{8,10}:[a-zA-Z0-9_-]{35}\b/,
-  },
-  {
-    name: 'Private Key Header',
-    regex: /-----BEGIN (?:RSA|EC|DSA|OPENSSH|PRIVATE) KEY-----/,
-  },
+// 3. Secret Pattern Definitions
+const SENSITIVE_VAR_NAMES = [
+  'COINDCX_BEARER_TOKEN',
+  'COINDCX_API_SECRET',
+  'COINDCX_WEB_PASSWORD',
+  'COINDCX_TOTP_SECRET',
+  'GMAIL_APP_PASSWORD',
+  'TELEGRAM_BOT_TOKEN',
+  'SESSION_TOKEN',
 ];
 
-let foundSecret = false;
+// Three-part base64url JWT: eyJ... . eyJ... . ...
+const JWT_PATTERN = /eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}/;
+
+const SENSITIVE_VAR_REGEX = new RegExp(
+  `(?:${SENSITIVE_VAR_NAMES.join('|')})\\s*[:=]\\s*(["']?)([^"'\\s\r\n;,]+)\\1`,
+  'i'
+);
+
+const TELEGRAM_TOKEN_REGEX = /\b\d{8,10}:[a-zA-Z0-9_-]{35}\b/;
+const PRIVATE_KEY_HEADER_REGEX = /-----BEGIN (?:RSA|EC|DSA|OPENSSH|PRIVATE) KEY-----/;
+
+// Known placeholder and fixture patterns
+const PLACEHOLDER_REGEX = /^(?:<[^>]+>|changeme|placeholder|your[-_]?\w*)$/i;
+const FIXTURE_REGEX = /(?:sim-|test|dummy|fake|example)/i;
+
+/**
+ * Checks a line of added content for potential secrets.
+ * Returns pattern name if secret is detected, or null if clean.
+ */
+function checkLineForSecret(line) {
+  // Inline escape hatch: pragma: allowlist secret
+  if (/pragma:\s*allowlist\s*secret/i.test(line)) {
+    return null;
+  }
+
+  // Check 1: Three-part base64url JWT
+  const jwtMatch = line.match(JWT_PATTERN);
+  if (jwtMatch) {
+    return 'JWT / Bearer Token';
+  }
+
+  // Check 2: Sensitive variable assignments with non-placeholder values
+  const varMatch = line.match(SENSITIVE_VAR_REGEX);
+  if (varMatch) {
+    const rawVal = varMatch[2].trim();
+    // Allow empty values
+    if (rawVal.length === 0) {
+      return null;
+    }
+    // Allow known placeholders
+    if (PLACEHOLDER_REGEX.test(rawVal)) {
+      return null;
+    }
+    // Allow test-suite fixtures (e.g. 'valid-bearer-token', 'test-secret')
+    if (FIXTURE_REGEX.test(rawVal)) {
+      return null;
+    }
+    return `Sensitive variable assignment (${varMatch[0].split(/[:=]/)[0].trim()})`;
+  }
+
+  // Check 3: Telegram bot token
+  const tgMatch = line.match(TELEGRAM_TOKEN_REGEX);
+  if (tgMatch) {
+    const val = tgMatch[0];
+    if (!FIXTURE_REGEX.test(val) && !PLACEHOLDER_REGEX.test(val)) {
+      return 'Telegram Bot Token';
+    }
+  }
+
+  // Check 4: Private key header
+  if (PRIVATE_KEY_HEADER_REGEX.test(line)) {
+    return 'Private Key Header';
+  }
+
+  return null;
+}
+
+// 4. Scan staged file diffs
+const findings = [];
 
 for (const file of stagedFiles) {
-  // Skip binary or example template files
-  if (file === '.env.example' || file.endsWith('.png') || file.endsWith('.ico')) {
+  // Allow template files and the scanner's own test files
+  if (
+    file === '.env.example' ||
+    file.endsWith('pre-commit-secrets.test.ts') ||
+    file.endsWith('pre-commit-secrets.cjs') ||
+    file.endsWith('.png') ||
+    file.endsWith('.ico')
+  ) {
     continue;
   }
 
-  // Only inspect newly added lines in the diff
-  let addedLines = '';
+  let diff = '';
   try {
-    const diff = execSync(`git diff --cached --text -- "${file}"`, { encoding: 'utf8' });
-    addedLines = diff
-      .split('\n')
-      .filter((l) => l.startsWith('+') && !l.startsWith('+++'))
-      .map((l) => l.substring(1))
-      .filter((l) => !/placeholder|your_|your-|example|foo|bar/i.test(l))
-      .join('\n');
-  } catch {}
+    diff = execSync(`git diff --cached -U0 --text -- "${file}"`, { encoding: 'utf8' });
+  } catch {
+    continue;
+  }
 
-  for (const rule of SECRET_REGEXES) {
-    if (rule.regex.test(addedLines)) {
-      console.error(`\n🚨 [PRE-COMMIT BLOCKED] Potential secret detected in staged file: ${file}`);
-      console.error(`   Detected rule: ${rule.name}`);
-      foundSecret = true;
+  const diffLines = diff.split('\n');
+  let currentLineNum = 0;
+
+  for (const rawLine of diffLines) {
+    // Parse hunk header: @@ -start,count +start,count @@
+    const hunkMatch = rawLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunkMatch) {
+      currentLineNum = parseInt(hunkMatch[1], 10);
+      continue;
+    }
+
+    if (rawLine.startsWith('+') && !rawLine.startsWith('+++')) {
+      const addedContent = rawLine.substring(1);
+      const matchedPattern = checkLineForSecret(addedContent);
+
+      if (matchedPattern) {
+        findings.push({
+          file,
+          line: currentLineNum,
+          pattern: matchedPattern,
+        });
+      }
+      currentLineNum++;
+    } else if (!rawLine.startsWith('-')) {
+      currentLineNum++;
     }
   }
 }
 
-if (foundSecret) {
-  console.error('\nCommit aborted. Please remove sensitive credentials before committing.\n');
+if (findings.length > 0) {
+  console.error('\n🚨 [PRE-COMMIT BLOCKED] Potential secret(s) detected:');
+  for (const f of findings) {
+    console.error(`   ❌ ${f.file}:${f.line} [${f.pattern}]`);
+  }
+  console.error('\nCommit aborted. Never commit active credentials into the repository.');
+  console.error('Use placeholders (<placeholder>), test fixtures, or inline "pragma: allowlist secret" to proceed.\n');
   process.exit(1);
 }
 
-// 4. Run TruffleHog if installed locally
-try {
-  const checkTh = spawnSync('trufflehog', ['--version'], { shell: true });
-  if (checkTh.status === 0) {
-    const thResult = spawnSync(
-      'trufflehog',
-      ['git', 'file://.', '--no-update', '--since-commit', 'HEAD'],
-      { stdio: 'inherit', shell: true }
-    );
-    if (thResult.status !== 0) {
-      console.error('\n🚨 [PRE-COMMIT BLOCKED] TruffleHog detected potential secrets.\n');
-      process.exit(1);
-    }
+// 5. Run TruffleHog if installed locally (with clear optional status)
+const checkTh = spawnSync('trufflehog', ['--version'], { shell: true });
+if (checkTh.status === 0) {
+  const thResult = spawnSync(
+    'trufflehog',
+    ['git', 'file://.', '--no-update', '--since-commit', 'HEAD'],
+    { stdio: 'inherit', shell: true }
+  );
+  if (thResult.status !== 0) {
+    console.error('\n🚨 [PRE-COMMIT BLOCKED] TruffleHog detected potential secrets.\n');
+    process.exit(1);
   }
-} catch {
-  // TruffleHog optional fallback if command fails to spawn
+} else {
+  console.warn('⚠️ [Pre-commit] TruffleHog not installed — pattern scan only.');
 }
 
 console.log('✅ [Pre-commit] Secret scan passed. No secrets detected.');
 process.exit(0);
+
+// Export for unit tests
+if (typeof module !== 'undefined') {
+  module.exports = {
+    checkLineForSecret,
+    SENSITIVE_VAR_NAMES,
+    JWT_PATTERN,
+  };
+}

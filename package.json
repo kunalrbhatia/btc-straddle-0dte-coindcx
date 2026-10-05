@@ -13,6 +13,7 @@
     "test:auth": "ts-node src/testAuth.ts",
     "refresh-session": "node scripts/refresh-session.cjs",
     "scan-secrets": "node scripts/pre-commit-secrets.cjs",
+    "verify:hooks": "node scripts/verify-hooks.cjs",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "keywords": [
