@@ -241,32 +241,95 @@ test('Venue Verification — Matches, Mismatches, and Unverified Handling', asyn
   });
 });
 
-test('Cycle Backfill — generates reconstructed records for historical cycle', async () => {
-  const result = await backfillHistoricalCycle({
-    expiryDateStr: '2026-10-05',
-    overwrite: true,
-  });
+test('Cycle Backfill — derives a reconstructed record from the cycle state (nothing hardcoded)', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scratch-backfill-state-'));
+  const recordsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scratch-backfill-records-'));
+  const prevStateDir = process.env.BTC_STATE_DIR;
+  const prevRecordsDir = process.env.RECORD_DIR;
 
-  assert.ok(fs.existsSync(result.jsonlPath));
-  assert.ok(fs.existsSync(result.mtmPath));
-  assert.ok(fs.existsSync(result.summaryPath));
-  assert.equal(result.summary.reconstructed, true);
-  assert.equal(result.summary.source, 'state+logs');
-  assert.equal(result.summary.atmStrike, 85250);
-  assert.equal(result.summary.callSymbol, 'BTC-5OCT26-85250-C-USDT');
-  assert.equal(result.summary.putSymbol, 'BTC-5OCT26-85250-P-USDT');
-  assert.equal(result.summary.callLeg?.exitPrice, 677.28);
-  assert.equal(result.summary.callLeg?.closeReason, 'SL_HIT');
-  assert.equal(result.summary.callLeg?.pnlPoints, -357.28);
-  assert.equal(result.summary.putLeg?.exitPrice, 0);
-  assert.equal(result.summary.putLeg?.pnlPoints, 365);
-  const pnl = result.summary.combinedPnLPoints ?? 0;
-  assert.equal(Math.round(pnl * 100) / 100, 7.72);
+  try {
+    process.env.BTC_STATE_DIR = stateDir;
+    process.env.RECORD_DIR = recordsDir;
 
-  // Clean up backfill test output
-  if (fs.existsSync(result.jsonlPath)) fs.unlinkSync(result.jsonlPath);
-  if (fs.existsSync(result.mtmPath)) fs.unlinkSync(result.mtmPath);
-  if (fs.existsSync(result.summaryPath)) fs.unlinkSync(result.summaryPath);
+    // The only source of cycle facts: this cycle's own state file.
+    fs.writeFileSync(
+      path.join(stateDir, 'straddle-state-2026-10-04.json'),
+      JSON.stringify({
+        date: '2026-10-04',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: 'BTC-5OCT26-85250-C-USDT',
+          entryPrice: 320,
+          entryPriceSource: 'fill',
+          stopLossPrice: 640,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'closed',
+          currentPrice: 677.28,
+          exitPrice: 677.28,
+          closeReason: 'SL_HIT',
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: 'BTC-5OCT26-85250-P-USDT',
+          entryPrice: 365,
+          entryPriceSource: 'fill',
+          stopLossPrice: 730,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'closed',
+          currentPrice: 0,
+        },
+        totalCreditReceived: 685,
+        targetProfitPoints: 376.75,
+        combinedPnLPoints: 7.72,
+        updatedAt: '2026-10-05T08:00:00.537Z',
+        resolvedScenario: 'MAX_TIME_REACHED',
+      }),
+      'utf8'
+    );
+
+    const result = await backfillHistoricalCycle({ expiryDateStr: '2026-10-05', overwrite: true });
+
+    assert.ok(fs.existsSync(result.jsonlPath));
+    assert.ok(fs.existsSync(result.mtmPath));
+    assert.ok(fs.existsSync(result.summaryPath));
+    assert.equal(result.summary.reconstructed, true);
+    assert.equal(result.summary.source, 'state+logs');
+    // Strike and symbols come from the state's own leg symbols, not from a per-cycle branch.
+    assert.equal(result.summary.atmStrike, 85250);
+    assert.equal(result.summary.callSymbol, 'BTC-5OCT26-85250-C-USDT');
+    assert.equal(result.summary.putSymbol, 'BTC-5OCT26-85250-P-USDT');
+    // CALL closed at its recorded exit; PUT had no exit price -> settled worthless at expiry.
+    assert.equal(result.summary.callLeg?.exitPrice, 677.28);
+    assert.equal(result.summary.callLeg?.closeReason, 'SL_HIT');
+    assert.equal(result.summary.callLeg?.pnlPoints, -357.28);
+    assert.equal(result.summary.putLeg?.exitPrice, 0);
+    assert.equal(result.summary.putLeg?.closeReason, 'EXPIRED');
+    assert.equal(result.summary.putLeg?.pnlPoints, 365);
+    const pnl = result.summary.combinedPnLPoints ?? 0;
+    assert.equal(Math.round(pnl * 100) / 100, 7.72);
+
+    // MTM tape timestamps must be parseable ISO-8601 in IST, never the legacy "06:15:03 PM" hybrid.
+    const tapeLines = fs.readFileSync(result.mtmPath, 'utf8').trim().split('\n').filter(Boolean);
+    assert.ok(tapeLines.length > 0, 'tape must not be empty');
+    for (const line of tapeLines) {
+      const sample = JSON.parse(line) as { ts: string };
+      assert.match(sample.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+05:30$/, `unparseable ts: ${sample.ts}`);
+      const ms = Date.parse(sample.ts);
+      assert.ok(Number.isFinite(ms), `ts must parse: ${sample.ts}`);
+      assert.ok(
+        ms >= Date.parse('2026-10-04T00:00:00+05:30') && ms <= Date.parse('2026-10-05T13:45:00+05:30'),
+        `sample outside the cycle window: ${sample.ts}`
+      );
+    }
+  } finally {
+    process.env.BTC_STATE_DIR = prevStateDir;
+    process.env.RECORD_DIR = prevRecordsDir;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    fs.rmSync(recordsDir, { recursive: true, force: true });
+  }
 });
 
 test('CycleRecordWriter — RECORD_DIR isolation prevents writing outside assigned directory', () => {
