@@ -206,7 +206,7 @@ export class CoinDCXClient {
     const token = this.getBearerToken();
     if (!token) {
       const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
-      appendAlert('auth_error', msg);
+      appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
       throw new SessionTokenExpiredError(msg);
     }
 
@@ -219,7 +219,7 @@ export class CoinDCXClient {
     if (response.status === 401) {
       const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
       console.error(`[CoinDCXClient] 401 Unauthorized fetching positions: ${msg}`);
-      appendAlert('auth_error', msg);
+      appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
       throw new SessionTokenExpiredError(msg);
     }
 
@@ -260,7 +260,7 @@ export class CoinDCXClient {
     const token = this.getBearerToken();
     if (!token) {
       const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
-      appendAlert('auth_error', msg);
+      appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
       throw new SessionTokenExpiredError(msg);
     }
 
@@ -274,7 +274,7 @@ export class CoinDCXClient {
     if (response.status === 401) {
       const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
       console.error(`[CoinDCXClient] 401 Unauthorized fetching options margin: ${msg}`);
-      appendAlert('auth_error', msg);
+      appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
       throw new SessionTokenExpiredError(msg);
     }
 
@@ -576,7 +576,7 @@ export class CoinDCXClient {
     const token = this.getBearerToken();
     if (!token) {
       const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
-      appendAlert('auth_error', msg);
+      appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
       throw new SessionTokenExpiredError(msg);
     }
 
@@ -590,7 +590,7 @@ export class CoinDCXClient {
       if (response.status === 401) {
         const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
         console.error(`[CoinDCXClient] 401 Unauthorized fetching options orders: ${msg}`);
-        appendAlert('auth_error', msg);
+        appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
         throw new SessionTokenExpiredError(msg);
       }
 
@@ -684,7 +684,7 @@ export class CoinDCXClient {
     const token = this.getBearerToken();
     if (!token) {
       const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
-      appendAlert('auth_error', msg);
+      appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
       throw new SessionTokenExpiredError(msg);
     }
 
@@ -751,7 +751,7 @@ export class CoinDCXClient {
       if (response.status === 401) {
         const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
         console.error(`[CoinDCXClient] 401 Unauthorized placing order: ${msg}`);
-        appendAlert('auth_error', msg);
+        appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
         throw new SessionTokenExpiredError(msg);
       }
 
@@ -878,7 +878,7 @@ export class CoinDCXClient {
     const token = this.getBearerToken();
     if (!token) {
       const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
-      appendAlert('auth_error', msg);
+      appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
       throw new SessionTokenExpiredError(msg);
     }
 
@@ -892,7 +892,7 @@ export class CoinDCXClient {
       if (res.status === 401) {
         const msg = 'CoinDCX session token expired/invalid — refresh it from the browser.';
         console.error(`[CoinDCXClient] 401 Unauthorized cancelling order: ${msg}`);
-        appendAlert('auth_error', msg);
+        appendAlert('auth_error', msg, undefined, { dedupKey: 'auth_error' });
         throw new SessionTokenExpiredError(msg);
       }
 
