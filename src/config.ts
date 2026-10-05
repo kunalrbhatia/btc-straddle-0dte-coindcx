@@ -136,6 +136,9 @@ export const config: AppConfig = {
     pollIntervalMs: getEnvNumber('POLL_INTERVAL_MS', 2000), // Check positions every 2 seconds
     maxMonitorMinutes: getEnvNumber('MAX_MONITOR_MINUTES', 1380), // 23 hours cutoff by default (accommodates 14:15 IST entry to 13:30 IST expiry)
     slOverrunTolerance: getEnvNumber('SL_OVERRUN_TOLERANCE', 0.10), // 10% overrun before emergency fallback close
+    costStopEnabled: process.env.COST_STOP_ENABLED !== 'false', // Enabled by default
+    costStopBufferPoints: getEnvNumber('COST_STOP_BUFFER_POINTS', 0),
+    costStopOnOverdue: (process.env.COST_STOP_ON_OVERDUE === 'close' ? 'close' : 'keep') as 'keep' | 'close',
   },
   customCallSymbol: process.env.CUSTOM_CALL_SYMBOL || undefined,
   customPutSymbol: process.env.CUSTOM_PUT_SYMBOL || undefined,

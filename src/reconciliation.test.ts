@@ -5,6 +5,9 @@ import {
   parseContractExpiryDate,
   safeCloseLeg,
   reconcileAndResurrectState,
+  moveStopToCostOnSurvivingLeg,
+  roundToTickSize,
+  verifyStopOrderArmed,
 } from './reconciliation';
 import { ActiveLeg, OptionsPosition, StraddlePositionState } from './types';
 import { AppConfig } from './config';
@@ -431,4 +434,398 @@ describe('Reconciliation & Exit Safety Unit Tests', () => {
     }
   });
 });
+
+describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
+  it('Criterion 7: roundToTickSize rounds correctly to instrument tickSize', () => {
+    assert.equal(roundToTickSize(532.4, 5), 530);
+    assert.equal(roundToTickSize(533, 5), 535);
+    assert.equal(roundToTickSize(535, 5), 535);
+    assert.equal(roundToTickSize(537.5, 5), 540);
+    assert.equal(roundToTickSize(100.123, 0.5), 100);
+    assert.equal(roundToTickSize(100.26, 0.5), 100.5);
+  });
+
+  it('Criterion 1 & 6: moves stop to venue cost basis + buffer with tick-rounding and reduceOnly', async () => {
+    const fs = await import('fs');
+    const path = await import('path');
+    const os = await import('os');
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'cost-stop-test-'));
+
+    const prevMode = process.env.BTC_TEST_MODE;
+    const prevStateDir = process.env.BTC_STATE_DIR;
+    const prevRecDir = process.env.RECORD_DIR;
+    const prevAlertsDir = process.env.BTC_ALERTS_DIR;
+
+    process.env.BTC_TEST_MODE = '1';
+    process.env.BTC_STATE_DIR = path.join(tmpBase, 'state');
+    process.env.RECORD_DIR = path.join(tmpBase, 'records');
+    process.env.BTC_ALERTS_DIR = path.join(tmpBase, 'logs');
+    fs.mkdirSync(process.env.BTC_STATE_DIR, { recursive: true });
+    fs.mkdirSync(process.env.RECORD_DIR, { recursive: true });
+    fs.mkdirSync(process.env.BTC_ALERTS_DIR, { recursive: true });
+
+    try {
+      let placedOrder: any = null;
+      let cancelledOrderId: string | null = null;
+
+      // Existing orders on venue: has old 2x stop @ 800
+      const venueOrders: any[] = [
+        {
+          id: 'old-put-stop-id',
+          symbol: 'BTC-5OCT26-85250-P-USDT',
+          orderType: 'Stop-Market',
+          triggerPrice: 800,
+          qty: 0.01,
+          reduceOnly: true,
+          status: 'Untriggered',
+        },
+      ];
+
+      const mockClient = {
+        getOptionsInstruments: async () => [
+          {
+            symbol: 'BTC-5OCT26-85250-P-USDT',
+            priceFilter: { tickSize: 5 },
+          },
+        ],
+        getOptionsWalletTransactions: async () => [],
+        getOpenOptionsOrders: async () => venueOrders,
+        placeOptionsOrder: async (
+          symbol: string,
+          side: string,
+          qty: number,
+          type: string,
+          _price: any,
+          stopLoss: string,
+          _tp: any,
+          _cr: any,
+          reduceOnly: boolean
+        ) => {
+          placedOrder = { symbol, side, qty, type, stopLoss, reduceOnly };
+          // Add newly placed stop to venue orders
+          const newOrder = {
+            id: 'mock-cost-stop-1',
+            symbol,
+            orderType: 'Stop-Market',
+            triggerPrice: Number(stopLoss),
+            qty,
+            reduceOnly,
+            status: 'Untriggered',
+          };
+          venueOrders.push(newOrder);
+          return {
+            symbol,
+            side: side as any,
+            success: true,
+            orderId: 'mock-cost-stop-1',
+            rawResponse: {},
+          };
+        },
+        cancelOptionsOrder: async (orderId: string) => {
+          cancelledOrderId = orderId;
+          const idx = venueOrders.findIndex((o) => o.id === orderId);
+          if (idx !== -1) venueOrders.splice(idx, 1);
+          return true;
+        },
+      } as unknown as CoinDCXClient;
+
+      // State: PUT is surviving, venue fill is 400 (even though entry was quoted at 395)
+      const state: StraddlePositionState = {
+        date: '2026-10-05',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: 'BTC-5OCT26-85250-C-USDT',
+          entryPrice: 535,
+          entryPriceSource: 'fill',
+          stopLossPrice: 1070,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'closed',
+          currentPrice: 1080,
+          exitPrice: 1080,
+          closeReason: 'SL_HIT',
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: 'BTC-5OCT26-85250-P-USDT',
+          entryPrice: 395, // quote
+          venueAvgPrice: 400, // actual venue fill! Criterion 6
+          entryPriceSource: 'fill',
+          stopLossPrice: 800,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 250, // comfortably below cost (400)
+        },
+        totalCreditReceived: 935,
+        targetProfitPoints: 500,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const result = await moveStopToCostOnSurvivingLeg(mockClient, state.putLeg, state, mockConfig);
+      assert.equal(result.moved, true);
+      assert.equal(result.newTrigger, 400, 'must move trigger to venueAvgPrice 400');
+      assert.notEqual(placedOrder, null);
+      assert.equal(placedOrder.reduceOnly, true, 'new stop must carry reduceOnly: true');
+      assert.equal(placedOrder.stopLoss, '400');
+      assert.equal(cancelledOrderId, 'old-put-stop-id', 'old stop must be cancelled after new stop verified');
+      assert.equal(venueOrders.length, 1, 'exactly one stop must remain');
+      assert.equal(state.putLeg.stopLossPrice, 400, 'state.putLeg.stopLossPrice must be updated to 400');
+
+      // Check record JSONL
+      const recFile = path.join(process.env.RECORD_DIR, '2026-10-05.jsonl');
+      assert.equal(fs.existsSync(recFile), true);
+      const lines = fs.readFileSync(recFile, 'utf8').trim().split('\n');
+      const stopMovedEv = lines.map((l) => JSON.parse(l)).find((e) => e.event === 'STOP_MOVED_TO_COST');
+      assert.notEqual(stopMovedEv, undefined);
+      assert.equal(stopMovedEv.data.newTrigger, 400);
+      assert.equal(stopMovedEv.data.costBasis, 400);
+    } finally {
+      process.env.BTC_TEST_MODE = prevMode;
+      process.env.BTC_STATE_DIR = prevStateDir;
+      process.env.RECORD_DIR = prevRecDir;
+      process.env.BTC_ALERTS_DIR = prevAlertsDir;
+      try {
+        fs.rmSync(tmpBase, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  it('Criterion 2: mark >= newTrigger skips move, logs COST_STOP_SKIPPED_ALREADY_THROUGH_COST, leaves old stop', async () => {
+    const fs = await import('fs');
+    const path = await import('path');
+    const os = await import('os');
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'cost-stop-skip-'));
+
+    const prevMode = process.env.BTC_TEST_MODE;
+    const prevStateDir = process.env.BTC_STATE_DIR;
+    const prevRecDir = process.env.RECORD_DIR;
+    const prevAlertsDir = process.env.BTC_ALERTS_DIR;
+
+    process.env.BTC_TEST_MODE = '1';
+    process.env.BTC_STATE_DIR = path.join(tmpBase, 'state');
+    process.env.RECORD_DIR = path.join(tmpBase, 'records');
+    process.env.BTC_ALERTS_DIR = path.join(tmpBase, 'logs');
+    fs.mkdirSync(process.env.BTC_STATE_DIR, { recursive: true });
+    fs.mkdirSync(process.env.RECORD_DIR, { recursive: true });
+    fs.mkdirSync(process.env.BTC_ALERTS_DIR, { recursive: true });
+
+    try {
+      let placeAttempted = false;
+      let cancelAttempted = false;
+
+      const mockClient = {
+        getOptionsInstruments: async () => [{ symbol: 'BTC-5OCT26-85250-P-USDT', priceFilter: { tickSize: 5 } }],
+        getOptionsWalletTransactions: async () => [],
+        getOpenOptionsOrders: async () => [],
+        placeOptionsOrder: async () => {
+          placeAttempted = true;
+          return { success: true };
+        },
+        cancelOptionsOrder: async () => {
+          cancelAttempted = true;
+          return true;
+        },
+      } as unknown as CoinDCXClient;
+
+      // Mark is 450, while cost basis is 400 -> already crossed!
+      const state: StraddlePositionState = {
+        date: '2026-10-05',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: 'BTC-5OCT26-85250-C-USDT',
+          entryPrice: 535,
+          entryPriceSource: 'fill',
+          stopLossPrice: 1070,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'closed',
+          currentPrice: 1080,
+          exitPrice: 1080,
+          closeReason: 'SL_HIT',
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: 'BTC-5OCT26-85250-P-USDT',
+          entryPrice: 400,
+          entryPriceSource: 'fill',
+          stopLossPrice: 800,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 450, // >= newTrigger (400)
+        },
+        totalCreditReceived: 935,
+        targetProfitPoints: 500,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const result = await moveStopToCostOnSurvivingLeg(mockClient, state.putLeg, state, mockConfig);
+      assert.equal(result.moved, false);
+      assert.equal(result.skippedAlreadyThroughCost, true);
+      assert.equal(placeAttempted, false, 'no order placement must be attempted');
+      assert.equal(cancelAttempted, false, 'no order cancellation must be attempted');
+      assert.equal(state.putLeg.stopLossPrice, 800, 'existing stopLossPrice must be retained');
+
+      // Check ANOMALY record event
+      const recFile = path.join(process.env.RECORD_DIR, '2026-10-05.jsonl');
+      const lines = fs.readFileSync(recFile, 'utf8').trim().split('\n');
+      const anomalyEv = lines.map((l) => JSON.parse(l)).find((e) => e.data?.type === 'COST_STOP_SKIPPED_ALREADY_THROUGH_COST');
+      assert.notEqual(anomalyEv, undefined);
+    } finally {
+      process.env.BTC_TEST_MODE = prevMode;
+      process.env.BTC_STATE_DIR = prevStateDir;
+      process.env.RECORD_DIR = prevRecDir;
+      process.env.BTC_ALERTS_DIR = prevAlertsDir;
+      try {
+        fs.rmSync(tmpBase, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  it('Criterion 3: No unprotected window — if new stop fails, old stop remains and ANOMALY is recorded', async () => {
+    const fs = await import('fs');
+    const path = await import('path');
+    const os = await import('os');
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'cost-stop-err-'));
+
+    const prevMode = process.env.BTC_TEST_MODE;
+    const prevStateDir = process.env.BTC_STATE_DIR;
+    const prevRecDir = process.env.RECORD_DIR;
+    const prevAlertsDir = process.env.BTC_ALERTS_DIR;
+
+    process.env.BTC_TEST_MODE = '1';
+    process.env.BTC_STATE_DIR = path.join(tmpBase, 'state');
+    process.env.RECORD_DIR = path.join(tmpBase, 'records');
+    process.env.BTC_ALERTS_DIR = path.join(tmpBase, 'logs');
+    fs.mkdirSync(process.env.BTC_STATE_DIR, { recursive: true });
+    fs.mkdirSync(process.env.RECORD_DIR, { recursive: true });
+    fs.mkdirSync(process.env.BTC_ALERTS_DIR, { recursive: true });
+
+    try {
+      let cancelCalled = false;
+      const venueOrders: any[] = [
+        {
+          id: 'old-put-stop-id',
+          symbol: 'BTC-5OCT26-85250-P-USDT',
+          orderType: 'Stop-Market',
+          triggerPrice: 800,
+          qty: 0.01,
+          reduceOnly: true,
+          status: 'Untriggered',
+        },
+      ];
+
+      const mockClient = {
+        getOptionsInstruments: async () => [{ symbol: 'BTC-5OCT26-85250-P-USDT', priceFilter: { tickSize: 5 } }],
+        getOptionsWalletTransactions: async () => [],
+        getOpenOptionsOrders: async () => venueOrders,
+        placeOptionsOrder: async () => {
+          // Placement fails!
+          return {
+            symbol: 'BTC-5OCT26-85250-P-USDT',
+            side: 'buy' as const,
+            success: false,
+            message: 'Simulated venue reject',
+            rawResponse: {},
+          };
+        },
+        cancelOptionsOrder: async () => {
+          cancelCalled = true;
+          return true;
+        },
+      } as unknown as CoinDCXClient;
+
+      const state: StraddlePositionState = {
+        date: '2026-10-05',
+        entryExecuted: true,
+        callLeg: {
+          legType: 'CALL',
+          symbol: 'BTC-5OCT26-85250-C-USDT',
+          entryPrice: 535,
+          entryPriceSource: 'fill',
+          stopLossPrice: 1070,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'closed',
+          currentPrice: 1080,
+          exitPrice: 1080,
+          closeReason: 'SL_HIT',
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: 'BTC-5OCT26-85250-P-USDT',
+          entryPrice: 400,
+          entryPriceSource: 'fill',
+          stopLossPrice: 800,
+          quantity: 0.01,
+          confirmedOpen: true,
+          status: 'open',
+          currentPrice: 200,
+        },
+        totalCreditReceived: 935,
+        targetProfitPoints: 500,
+        combinedPnLPoints: 0,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const result = await moveStopToCostOnSurvivingLeg(mockClient, state.putLeg, state, mockConfig);
+      assert.equal(result.moved, false);
+      assert.equal(cancelCalled, false, 'must NOT cancel old stop when new placement fails');
+      assert.equal(venueOrders.length, 1, 'old stop must remain untouched');
+      assert.equal(state.putLeg.stopLossPrice, 800, 'state stopLossPrice must not be changed');
+
+      // Check ANOMALY record event
+      const recFile = path.join(process.env.RECORD_DIR, '2026-10-05.jsonl');
+      const lines = fs.readFileSync(recFile, 'utf8').trim().split('\n');
+      const errEv = lines.map((l) => JSON.parse(l)).find((e) => e.data?.type === 'COST_STOP_MOVE_FAILED');
+      assert.notEqual(errEv, undefined);
+    } finally {
+      process.env.BTC_TEST_MODE = prevMode;
+      process.env.BTC_STATE_DIR = prevStateDir;
+      process.env.RECORD_DIR = prevRecDir;
+      process.env.BTC_ALERTS_DIR = prevAlertsDir;
+      try {
+        fs.rmSync(tmpBase, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  it('Criterion 4: Restart safety — after move, restart accepts cost stop and does NOT re-arm 2x stop', async () => {
+    // Surviving leg state has been updated to stopLossPrice = 400
+    const survivingLeg: ActiveLeg = {
+      legType: 'PUT',
+      symbol: 'BTC-5OCT26-85250-P-USDT',
+      entryPrice: 400,
+      entryPriceSource: 'fill',
+      stopLossPrice: 400, // Updated in state!
+      quantity: 0.01,
+      confirmedOpen: true,
+      status: 'open',
+      currentPrice: 220,
+    };
+
+    // Venue has the cost stop armed at 400
+    const venueOrders = [
+      {
+        id: 'venue-cost-stop-id',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        orderType: 'Stop-Market',
+        triggerPrice: 400,
+        qty: 0.01,
+        reduceOnly: true,
+        status: 'Untriggered',
+      },
+    ];
+
+    const check = verifyStopOrderArmed(venueOrders, survivingLeg);
+    assert.equal(check.armed, true, 'verifyStopOrderArmed must report armed: true');
+    assert.equal(check.reason, undefined);
+  });
 });
+});
+

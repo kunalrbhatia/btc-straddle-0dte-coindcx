@@ -10,6 +10,7 @@ import {
   safeCloseLeg,
   verifyStopOrderArmed,
   rearmStopOrderIfMissing,
+  moveStopToCostOnSurvivingLeg,
 } from './reconciliation';
 import { CycleRecordWriter } from './records/cycleRecordWriter';
 import { parseContractExpiryDate as parseExpiryString } from './reports/reportDataCollector';
@@ -454,6 +455,29 @@ export async function monitorStraddleRisk(
                   runningPnL: leg.entryPrice - leg.exitPrice,
                 });
               }
+
+              // Cost stop rule (§1): When one leg's SL is hit, move the surviving leg's stop to COST
+              const otherLeg = leg.legType === 'CALL' ? state.putLeg : state.callLeg;
+              if (
+                config.riskConfig.costStopEnabled !== false &&
+                otherLeg.status === 'open' &&
+                otherLeg.confirmedOpen
+              ) {
+                const otherExpiry = parseContractExpiryDate(otherLeg.symbol, config.dailyExpiryHourUTC);
+                const otherExpired = otherExpiry !== null && Date.now() >= otherExpiry.getTime();
+                if (!otherExpired) {
+                  console.log(
+                    `[Risk Manager] 🛡️ Triggering cost stop on surviving leg ${otherLeg.legType} (${otherLeg.symbol}) after ${leg.legType} SL hit.`
+                  );
+                  void moveStopToCostOnSurvivingLeg(
+                    client,
+                    otherLeg,
+                    state,
+                    config,
+                    notifier
+                  );
+                }
+              }
             } else {
               // C. Leg is still open on venue: Verify stop order is armed
               const stopCheck = verifyStopOrderArmed(venueOrders, leg);
@@ -673,6 +697,29 @@ export async function monitorStraddleRisk(
                   reason: 'SL_FALLBACK_CLOSE',
                   exitPrice: leg.exitPrice ?? leg.currentPrice,
                 });
+
+                // Cost stop rule (§1): When one leg's SL is hit (fallback close), move the surviving leg's stop to COST
+                const otherLeg = leg.legType === 'CALL' ? state.putLeg : state.callLeg;
+                if (
+                  config.riskConfig.costStopEnabled !== false &&
+                  otherLeg.status === 'open' &&
+                  otherLeg.confirmedOpen
+                ) {
+                  const otherExpiry = parseContractExpiryDate(otherLeg.symbol, config.dailyExpiryHourUTC);
+                  const otherExpired = otherExpiry !== null && Date.now() >= otherExpiry.getTime();
+                  if (!otherExpired) {
+                    console.log(
+                      `[Risk Manager] 🛡️ Triggering cost stop on surviving leg ${otherLeg.legType} (${otherLeg.symbol}) after ${leg.legType} SL_FALLBACK_CLOSE.`
+                    );
+                    void moveStopToCostOnSurvivingLeg(
+                      client,
+                      otherLeg,
+                      state,
+                      config,
+                      notifier
+                    );
+                  }
+                }
               }
 
               state.updatedAt = new Date().toISOString();

@@ -151,6 +151,9 @@ PROFIT_TARGET_RATIO=0.55
 POLL_INTERVAL_MS=2000
 MAX_MONITOR_MINUTES=1380      # Optional (default 1380 = 23h): Max monitor window before cutoff
 SL_OVERRUN_TOLERANCE=0.10     # Optional (default 0.10 = 10%): Overrun tolerance beyond SL trigger before fallback close
+COST_STOP_ENABLED=true        # Optional (default true): Move surviving leg's venue stop to COST on other leg SL hit
+COST_STOP_BUFFER_POINTS=0     # Optional (default 0): Buffer added to entry basis
+COST_STOP_ON_OVERDUE=keep     # Optional ('keep' | 'close', default keep): Handling when mark is already above cost trigger
 
 # Safe Mode / Testing
 DRY_RUN=false

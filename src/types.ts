@@ -195,7 +195,7 @@ export interface ActiveLeg {
   readonly entryPrice: number;
   readonly venueAvgPrice?: number;
   readonly entryPriceSource: EntryPriceSource;
-  readonly stopLossPrice: number;
+  stopLossPrice: number;
   readonly quantity: number;
   readonly orderId?: string;
   readonly confirmedOpen: boolean;
@@ -213,6 +213,9 @@ export interface RiskManagementConfig {
   readonly pollIntervalMs: number;
   readonly maxMonitorMinutes?: number; // End-of-life cutoff for monitor
   readonly slOverrunTolerance?: number; // Overrun beyond SL trigger before fallback close (default 0.10 = 10%)
+  readonly costStopEnabled?: boolean;
+  readonly costStopBufferPoints?: number;
+  readonly costStopOnOverdue?: 'keep' | 'close';
 }
 
 export interface StraddlePositionState {

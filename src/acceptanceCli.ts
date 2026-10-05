@@ -553,6 +553,380 @@ export async function runAcceptanceGate(): Promise<boolean> {
     });
 
     // -------------------------------------------------------------
+    // D1 - D7: After one leg's SL fires, move the other leg's stop to COST (§1 - §3)
+    // -------------------------------------------------------------
+    const { moveStopToCostOnSurvivingLeg, roundToTickSize, verifyStopOrderArmed } = await import('./reconciliation');
+
+    // D1: Move happens: CALL SL hit -> PUT stop moved to cost + buffer, reduceOnly, Untriggered
+    let d1PlacedOrder: any = null;
+    let d1CancelledOrderId: string | null = null;
+    const d1VenueOrders: any[] = [
+      {
+        id: 'd1-old-stop',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        orderType: 'Stop-Market',
+        triggerPrice: 800,
+        qty: 0.01,
+        reduceOnly: true,
+        status: 'Untriggered',
+      },
+    ];
+
+    const d1Client = {
+      getOptionsInstruments: async () => [{ symbol: 'BTC-5OCT26-85250-P-USDT', priceFilter: { tickSize: 5 } }],
+      getOptionsWalletTransactions: async () => [],
+      getOpenOptionsOrders: async () => d1VenueOrders,
+      placeOptionsOrder: async (sym: string, side: string, qty: number, type: string, _p: any, sl: string, _tp: any, _cr: any, ro: boolean) => {
+        d1PlacedOrder = { sym, side, qty, type, sl, ro };
+        const newOrd = {
+          id: 'd1-new-cost-stop',
+          symbol: sym,
+          orderType: 'Stop-Market',
+          triggerPrice: Number(sl),
+          qty,
+          reduceOnly: ro,
+          status: 'Untriggered',
+        };
+        d1VenueOrders.push(newOrd);
+        return { symbol: sym, side, success: true, orderId: 'd1-new-cost-stop', rawResponse: {} };
+      },
+      cancelOptionsOrder: async (ordId: string) => {
+        d1CancelledOrderId = ordId;
+        const idx = d1VenueOrders.findIndex((o) => o.id === ordId);
+        if (idx !== -1) d1VenueOrders.splice(idx, 1);
+        return true;
+      },
+    } as unknown as CoinDCXClient;
+
+    const d1State: StraddlePositionState = {
+      date: '2026-10-05',
+      entryExecuted: true,
+      callLeg: {
+        legType: 'CALL',
+        symbol: 'BTC-5OCT26-85250-C-USDT',
+        entryPrice: 535,
+        entryPriceSource: 'fill',
+        stopLossPrice: 1070,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'closed',
+        currentPrice: 1080,
+        exitPrice: 1080,
+        closeReason: 'SL_HIT',
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        entryPrice: 395,
+        venueAvgPrice: 400, // Cost basis = 400
+        entryPriceSource: 'fill',
+        stopLossPrice: 800,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 250, // Below cost
+      },
+      totalCreditReceived: 935,
+      targetProfitPoints: 500,
+      combinedPnLPoints: 0,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const d1Res = await moveStopToCostOnSurvivingLeg(d1Client, d1State.putLeg, d1State, config);
+    const d1RecPath = path.join(testRecordsDir, '2026-10-05.jsonl');
+    const d1RecContent = fs.existsSync(d1RecPath) ? fs.readFileSync(d1RecPath, 'utf8') : '';
+    const passD1 = d1Res.moved === true &&
+      d1Res.newTrigger === 400 &&
+      d1PlacedOrder?.ro === true &&
+      d1CancelledOrderId === 'd1-old-stop' &&
+      d1VenueOrders.length === 1 &&
+      d1State.putLeg.stopLossPrice === 400 &&
+      d1RecContent.includes('STOP_MOVED_TO_COST');
+    results.push({
+      id: 'D1',
+      description: 'cost stop move executed with reduceOnly, single stop retained, record written',
+      passed: passD1,
+      detail: `Trigger moved to ${d1Res.newTrigger}, orderId: ${d1Res.orderId}`,
+    });
+
+    // D2: Already through cost: mark >= newTrigger -> skipped, logged, old stop untouched
+    let d2PlaceAttempted = false;
+    const d2Client = {
+      getOptionsInstruments: async () => [{ symbol: 'BTC-5OCT26-85250-P-USDT', priceFilter: { tickSize: 5 } }],
+      getOptionsWalletTransactions: async () => [],
+      getOpenOptionsOrders: async () => [],
+      placeOptionsOrder: async () => {
+        d2PlaceAttempted = true;
+        return { success: true };
+      },
+      cancelOptionsOrder: async () => true,
+    } as unknown as CoinDCXClient;
+
+    const d2State: StraddlePositionState = {
+      date: '2026-10-05',
+      entryExecuted: true,
+      callLeg: {
+        legType: 'CALL',
+        symbol: 'BTC-5OCT26-85250-C-USDT',
+        entryPrice: 535,
+        entryPriceSource: 'fill',
+        stopLossPrice: 1070,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'closed',
+        currentPrice: 1080,
+        exitPrice: 1080,
+        closeReason: 'SL_HIT',
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        entryPrice: 400,
+        entryPriceSource: 'fill',
+        stopLossPrice: 800,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 420, // Mark (420) >= newTrigger (400)
+      },
+      totalCreditReceived: 935,
+      targetProfitPoints: 500,
+      combinedPnLPoints: 0,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const d2Res = await moveStopToCostOnSurvivingLeg(d2Client, d2State.putLeg, d2State, config);
+    const passD2 = d2Res.moved === false &&
+      d2Res.skippedAlreadyThroughCost === true &&
+      !d2PlaceAttempted &&
+      d2State.putLeg.stopLossPrice === 800;
+    results.push({
+      id: 'D2',
+      description: 'already through cost skips move, logs anomaly, keeps existing stop',
+      passed: passD2,
+      detail: `Skipped: ${d2Res.skippedAlreadyThroughCost}, Stop remained: ${d2State.putLeg.stopLossPrice}`,
+    });
+
+    // D3: No unprotected window: if new stop placement fails, old stop preserved
+    let d3CancelAttempted = false;
+    const d3VenueOrders: any[] = [
+      {
+        id: 'd3-old-stop',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        orderType: 'Stop-Market',
+        triggerPrice: 800,
+        qty: 0.01,
+        reduceOnly: true,
+        status: 'Untriggered',
+      },
+    ];
+    const d3Client = {
+      getOptionsInstruments: async () => [{ symbol: 'BTC-5OCT26-85250-P-USDT', priceFilter: { tickSize: 5 } }],
+      getOptionsWalletTransactions: async () => [],
+      getOpenOptionsOrders: async () => d3VenueOrders,
+      placeOptionsOrder: async () => ({ success: false, message: 'Simulated venue reject' }),
+      cancelOptionsOrder: async () => {
+        d3CancelAttempted = true;
+        return true;
+      },
+    } as unknown as CoinDCXClient;
+
+    const d3State: StraddlePositionState = {
+      date: '2026-10-05',
+      entryExecuted: true,
+      callLeg: {
+        legType: 'CALL',
+        symbol: 'BTC-5OCT26-85250-C-USDT',
+        entryPrice: 535,
+        entryPriceSource: 'fill',
+        stopLossPrice: 1070,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'closed',
+        currentPrice: 1080,
+        exitPrice: 1080,
+        closeReason: 'SL_HIT',
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        entryPrice: 400,
+        entryPriceSource: 'fill',
+        stopLossPrice: 800,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 200,
+      },
+      totalCreditReceived: 935,
+      targetProfitPoints: 500,
+      combinedPnLPoints: 0,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const d3Res = await moveStopToCostOnSurvivingLeg(d3Client, d3State.putLeg, d3State, config);
+    const passD3 = d3Res.moved === false && !d3CancelAttempted && d3VenueOrders.length === 1 && d3State.putLeg.stopLossPrice === 800;
+    results.push({
+      id: 'D3',
+      description: 'no unprotected window: placement failure preserves existing stop and logs anomaly',
+      passed: passD3,
+      detail: `Cancelled called: ${d3CancelAttempted}, Stops remaining: ${d3VenueOrders.length}`,
+    });
+
+    // D4: Restart safety: after move, verification accepts cost stop, no re-arm or second stop
+    const d4Leg: ActiveLeg = {
+      legType: 'PUT',
+      symbol: 'BTC-5OCT26-85250-P-USDT',
+      entryPrice: 400,
+      entryPriceSource: 'fill',
+      stopLossPrice: 400, // Updated in state
+      quantity: 0.01,
+      confirmedOpen: true,
+      status: 'open',
+      currentPrice: 250,
+    };
+    const d4Orders = [
+      {
+        id: 'd4-cost-stop',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        orderType: 'Stop-Market',
+        triggerPrice: 400,
+        qty: 0.01,
+        reduceOnly: true,
+        status: 'Untriggered',
+      },
+    ];
+    const d4Check = verifyStopOrderArmed(d4Orders, d4Leg);
+    const passD4 = d4Check.armed === true && d4Check.reason === undefined;
+    results.push({
+      id: 'D4',
+      description: 'restart safety: post-move verification accepts cost stop without re-arming 2x',
+      passed: passD4,
+      detail: `Armed: ${d4Check.armed}`,
+    });
+
+    // D5: Both legs stopped: no move attempted, resolves scenario
+    const d5State: StraddlePositionState = {
+      date: '2026-10-05',
+      entryExecuted: true,
+      callLeg: {
+        legType: 'CALL',
+        symbol: 'BTC-5OCT26-85250-C-USDT',
+        entryPrice: 320,
+        entryPriceSource: 'fill',
+        stopLossPrice: 640,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'closed',
+        currentPrice: 640,
+        exitPrice: 640,
+        closeReason: 'SL_HIT',
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        entryPrice: 365,
+        entryPriceSource: 'fill',
+        stopLossPrice: 730,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'closed',
+        currentPrice: 730,
+        exitPrice: 730,
+        closeReason: 'SL_HIT',
+      },
+      totalCreditReceived: 685,
+      targetProfitPoints: 376.75,
+      combinedPnLPoints: 0,
+      updatedAt: new Date().toISOString(),
+    };
+    let d5MoveAttempted = false;
+    const d5Client = {
+      getContractPrice: async () => 700,
+      getOptionsPositions: async () => [],
+      getOpenOptionsOrders: async () => [],
+      placeOptionsOrder: async () => {
+        d5MoveAttempted = true;
+        return { success: true };
+      },
+    } as unknown as CoinDCXClient;
+    const { monitorStraddleRisk } = await import('./riskManager');
+    const d5Scenario = await monitorStraddleRisk(d5Client, d5State, {
+      ...config,
+      riskConfig: { ...config.riskConfig, pollIntervalMs: 20, maxMonitorMinutes: 0.002 },
+    });
+    const passD5 = d5Scenario === 'BOTH_LEGS_SL' && !d5MoveAttempted;
+    results.push({
+      id: 'D5',
+      description: 'both legs stopped: scenario resolves BOTH_LEGS_SL and no cost stop is moved',
+      passed: passD5,
+      detail: `Scenario: ${d5Scenario}, moveAttempted: ${d5MoveAttempted}`,
+    });
+
+    // D6: Cost basis is the venue fill (quote 530 vs fill 535 -> new trigger from 535)
+    let d6CapturedTrigger: number | null = null;
+    const d6Client = {
+      getOptionsInstruments: async () => [{ symbol: 'BTC-5OCT26-85250-C-USDT', priceFilter: { tickSize: 5 } }],
+      getOptionsWalletTransactions: async () => [],
+      getOpenOptionsOrders: async () => [],
+      placeOptionsOrder: async (_s: string, _sd: string, _q: number, _t: string, _p: any, sl: string) => {
+        d6CapturedTrigger = Number(sl);
+        return { success: true, orderId: 'd6-order' };
+      },
+      cancelOptionsOrder: async () => true,
+    } as unknown as CoinDCXClient;
+    const d6State: StraddlePositionState = {
+      date: '2026-10-05',
+      entryExecuted: true,
+      callLeg: {
+        legType: 'CALL',
+        symbol: 'BTC-5OCT26-85250-C-USDT',
+        entryPrice: 530, // quote
+        venueAvgPrice: 535, // venue fill!
+        entryPriceSource: 'fill',
+        stopLossPrice: 1060,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'open',
+        currentPrice: 300,
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: 'BTC-5OCT26-85250-P-USDT',
+        entryPrice: 400,
+        entryPriceSource: 'fill',
+        stopLossPrice: 800,
+        quantity: 0.01,
+        confirmedOpen: true,
+        status: 'closed',
+        currentPrice: 800,
+        exitPrice: 800,
+        closeReason: 'SL_HIT',
+      },
+      totalCreditReceived: 930,
+      targetProfitPoints: 500,
+      combinedPnLPoints: 0,
+      updatedAt: new Date().toISOString(),
+    };
+    await moveStopToCostOnSurvivingLeg(d6Client, d6State.callLeg, d6State, config);
+    const passD6 = d6CapturedTrigger === 535;
+    results.push({
+      id: 'D6',
+      description: 'cost basis is the venue fill (535 venue fill vs 530 quote basis)',
+      passed: passD6,
+      detail: `Captured trigger: ${d6CapturedTrigger}`,
+    });
+
+    // D7: Tick rounding multiple of instrument tickSize
+    const passD7 = roundToTickSize(532.4, 5) === 530 &&
+      roundToTickSize(533, 5) === 535 &&
+      roundToTickSize(537.5, 5) === 540;
+    results.push({
+      id: 'D7',
+      description: 'tick rounding: trigger rounded to instrument tickSize multiples',
+      passed: passD7,
+      detail: `532.4->${roundToTickSize(532.4, 5)}, 533->${roundToTickSize(533, 5)}, 537.5->${roundToTickSize(537.5, 5)}`,
+    });
     // C1: Test isolation self-defending guard blocks in-repo paths
     // -------------------------------------------------------------
     const { assertSafeTestDirectory } = await import('./testIsolationGuard');

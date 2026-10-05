@@ -11,6 +11,7 @@ export type CycleEventType =
   | 'TARGET_HIT'
   | 'EXPIRY_SETTLEMENT'
   | 'CYCLE_CLOSED'
+  | 'STOP_MOVED_TO_COST'
   | 'ANOMALY';
 
 export interface CycleEventPayload {
