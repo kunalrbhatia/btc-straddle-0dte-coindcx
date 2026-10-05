@@ -5,6 +5,7 @@ import { scheduleAtIST } from './scheduler';
 import { getTodayDateStringIST, hasTodayExecuted, loadStraddleState } from './stateStore';
 import { executeShortStraddle } from './straddle';
 import { monitorStraddleRisk } from './riskManager';
+import { reconcileAndResurrectState } from './reconciliation';
 import { acquireInstanceLock, InstanceLock } from './instanceLock';
 
 async function main(): Promise<void> {
@@ -60,21 +61,39 @@ async function main(): Promise<void> {
 
   const todayStr = getTodayDateStringIST();
 
-  // Startup Reconciliation: Check if today has an open straddle from a prior run or crash
+  // Startup Reconciliation: Check if exchange or local state has an open straddle from a prior run or crash
   try {
-    const existingState = await loadStraddleState(todayStr);
-    if (existingState && existingState.entryExecuted) {
-      const hasOpenLeg = existingState.callLeg.status === 'open' || existingState.putLeg.status === 'open';
-      if (hasOpenLeg && !existingState.resolvedScenario) {
-        const reconcileMsg = `Found existing OPEN position for today (${todayStr})! Resuming risk monitor without re-entering.`;
+    const reconciled = await reconcileAndResurrectState(client, config, notifier);
+    if (reconciled && reconciled.state) {
+      const stateToResume = reconciled.state;
+      const hasOpenLeg = stateToResume.callLeg.status === 'open' || stateToResume.putLeg.status === 'open';
+      if (hasOpenLeg && !stateToResume.resolvedScenario) {
+        const reconcileMsg = reconciled.resurrected
+          ? `Adopted/Resurrected OPEN position from exchange! Resuming risk monitor without re-entering.`
+          : `Found existing OPEN position (${stateToResume.date})! Resuming risk monitor without re-entering.`;
         console.warn(`[Startup Reconciliation] ⚠️ ${reconcileMsg}`);
         void notifier.notifyReconciliation(reconcileMsg);
 
         // Resume monitoring
-        void monitorStraddleRisk(client, existingState, config, notifier);
+        void monitorStraddleRisk(client, stateToResume, config, notifier);
         return;
-      } else {
-        console.log(`[Startup Reconciliation] Position for today (${todayStr}) is already completed or resolved (${existingState.resolvedScenario || 'DONE'}).`);
+      }
+    } else {
+      // Fallback check on today's local state file
+      const existingState = await loadStraddleState(todayStr);
+      if (existingState && existingState.entryExecuted) {
+        const hasOpenLeg = existingState.callLeg.status === 'open' || existingState.putLeg.status === 'open';
+        if (hasOpenLeg && !existingState.resolvedScenario) {
+          const reconcileMsg = `Found existing OPEN position for today (${todayStr})! Resuming risk monitor without re-entering.`;
+          console.warn(`[Startup Reconciliation] ⚠️ ${reconcileMsg}`);
+          void notifier.notifyReconciliation(reconcileMsg);
+
+          // Resume monitoring
+          void monitorStraddleRisk(client, existingState, config, notifier);
+          return;
+        } else {
+          console.log(`[Startup Reconciliation] Position for today (${todayStr}) is already completed or resolved (${existingState.resolvedScenario || 'DONE'}).`);
+        }
       }
     }
   } catch (err) {

@@ -782,13 +782,33 @@ export class CoinDCXClient {
         };
       }
 
-      const errObj = data.error as Record<string, unknown> | undefined;
-      const errorMsg =
-        typeof errObj?.message === 'string'
+      const errObj = (data.error as Record<string, unknown> | undefined) ?? {};
+      const errCode = errObj.code ?? data.code;
+      const errErrorCode = errObj.errorCode ?? data.errorCode;
+      const traceId = data.traceId ?? data.trace_id ?? errObj.traceId ?? errObj.trace_id;
+      const rawMsg =
+        typeof errObj.message === 'string'
           ? errObj.message
           : typeof data.message === 'string'
           ? data.message
           : `HTTP ${response.status}: ${response.statusText}`;
+
+      const errorParts: string[] = [rawMsg];
+      if (errCode !== undefined) errorParts.push(`code: ${errCode}`);
+      if (errErrorCode !== undefined) errorParts.push(`errorCode: ${errErrorCode}`);
+      if (traceId !== undefined) errorParts.push(`traceId: ${traceId}`);
+      if (!response.ok) errorParts.push(`HTTP ${response.status}`);
+      const errorMsg = errorParts.join(' | ');
+
+      console.error(
+        `[CoinDCXClient] ❌ Order placement rejected (${side} ${qty} ${symbol}) HTTP ${response.status}: ${errorMsg}`
+      );
+
+      const enhancedRaw: Record<string, unknown> = {
+        ...data,
+        httpStatus: response.status,
+        requestPayload: body,
+      };
 
       return {
         symbol,
@@ -797,20 +817,21 @@ export class CoinDCXClient {
         orderId,
         limitPrice: numPrice,
         message: errorMsg,
-        rawResponse: data,
+        rawResponse: enhancedRaw,
       };
     } catch (err) {
       if (err instanceof SessionTokenExpiredError) {
         throw err;
       }
       const msg = err instanceof Error ? err.message : 'Network error';
+      console.error(`[CoinDCXClient] ❌ Order placement network/exception (${side} ${qty} ${symbol}): ${msg}`);
       return {
         symbol,
         side,
         success: false,
         limitPrice: numPrice,
         message: msg,
-        rawResponse: {},
+        rawResponse: { error: msg, requestPayload: body },
       };
     }
   }

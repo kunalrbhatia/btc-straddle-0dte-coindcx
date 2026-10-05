@@ -4,6 +4,7 @@ import { Notifier } from './notifier';
 import { saveStraddleState } from './stateStore';
 import { recordMtmLog } from './mtmWatcher';
 import { appendAlert } from './fileAlerter';
+import { parseContractExpiryDate, safeCloseLeg } from './reconciliation';
 import {
   ActiveLeg,
   EntryPriceSource,
@@ -178,6 +179,7 @@ export function calculateLegPnL(leg: ActiveLeg): number {
 /**
  * Closes an individual active leg.
  * Guarded against closing unconfirmed or already closed legs.
+ * NEVER marks closed in state if the exchange rejects the exit.
  */
 export async function closeLeg(
   client: CoinDCXClient,
@@ -186,53 +188,9 @@ export async function closeLeg(
   reason: LegCloseReason,
   config: AppConfig,
   notifier?: Notifier
-): Promise<void> {
-  if (!leg.confirmedOpen) {
-    console.warn(`[Risk Manager] ⚠️ Refusing to close leg ${leg.symbol} because confirmedOpen is false.`);
-    return;
-  }
-  if (leg.status === 'closed') {
-    console.warn(`[Risk Manager] ⚠️ Leg ${leg.symbol} is already closed.`);
-    return;
-  }
-
-  leg.status = 'closed';
-  leg.exitPrice = currentPrice;
-  leg.closeReason = reason;
-
-  console.log(
-    `[Risk Manager] 🚨 Closing ${leg.legType} (${leg.symbol}) at $${currentPrice.toFixed(
-      2
-    )} | Reason: ${reason}`
-  );
-
-  const result = await client.closePosition(
-    leg.symbol,
-    leg.quantity,
-    config.leverage
-  );
-
-  if (result.success) {
-    leg.exitOrderId = result.orderId;
-    console.log(
-      `[Risk Manager] ✅ ${leg.legType} buy-to-close order placed. Order ID: ${result.orderId || 'N/A'}`
-    );
-  } else {
-    console.error(
-      `[Risk Manager] ⚠️ ${leg.legType} close order response: ${result.message || 'Check terminal'}`
-    );
-  }
-
-  if (notifier) {
-    const runningPnL = calculateLegPnL(leg);
-    void notifier.notifyLegClosed({
-      legType: leg.legType,
-      symbol: leg.symbol,
-      reason,
-      exitPrice: currentPrice,
-      runningPnL,
-    });
-  }
+): Promise<boolean> {
+  const result = await safeCloseLeg(client, leg, currentPrice, reason, config, notifier);
+  return result.success;
 }
 
 /**
@@ -294,19 +252,6 @@ export async function monitorStraddleRisk(
 
     timer = setInterval(async () => {
       try {
-        // End-of-life cutoff check
-        if (Date.now() - startTime >= maxMonitorMs) {
-          console.warn(`[Risk Manager] ⏰ Max monitor duration reached (${config.riskConfig.maxMonitorMinutes ?? 720} mins). Squaring off.`);
-          if (state.callLeg.status === 'open') {
-            await closeLeg(client, state.callLeg, state.callLeg.currentPrice, 'EXPIRED', config, notifier);
-          }
-          if (state.putLeg.status === 'open') {
-            await closeLeg(client, state.putLeg, state.putLeg.currentPrice, 'EXPIRED', config, notifier);
-          }
-          await cleanupAndResolve('MAX_TIME_REACHED');
-          return;
-        }
-
         // Fetch current prices for open legs
         let anyFeedMissing = false;
         if (state.callLeg.status === 'open') {
@@ -341,6 +286,38 @@ export async function monitorStraddleRisk(
 
         if (anyFeedMissing) {
           console.warn('[Risk Manager] ⚠️ Position valuation is degraded due to missing mark price(s).');
+        }
+
+        // End-of-life cutoff check
+        if (Date.now() - startTime >= maxMonitorMs) {
+          // Check if contract has actually expired or if only the monitor window elapsed
+          const sampleSymbol = (state.callLeg.status === 'open' ? state.callLeg.symbol : state.putLeg.symbol) || '';
+          const contractExpiry = parseContractExpiryDate(sampleSymbol, config.dailyExpiryHourUTC);
+          const isActualContractExpired = contractExpiry ? Date.now() >= contractExpiry.getTime() : false;
+          const closeReason: LegCloseReason = isActualContractExpired ? 'EXPIRED' : 'MONITOR_WINDOW_ELAPSED';
+
+          console.warn(
+            `[Risk Manager] ⏰ Max monitor duration reached (${config.riskConfig.maxMonitorMinutes ?? 1380} mins). ` +
+            `Contract expiry: ${contractExpiry ? contractExpiry.toISOString() : 'unknown'} -> Reason: ${closeReason}`
+          );
+
+          if (state.callLeg.status === 'open') {
+            await closeLeg(client, state.callLeg, state.callLeg.currentPrice, closeReason, config, notifier);
+          }
+          if (state.putLeg.status === 'open') {
+            await closeLeg(client, state.putLeg, state.putLeg.currentPrice, closeReason, config, notifier);
+          }
+
+          state.updatedAt = new Date().toISOString();
+          await saveStraddleState(state, state.date);
+
+          // Only resolve and stop monitoring if all legs are confirmed closed!
+          if (state.callLeg.status === 'closed' && state.putLeg.status === 'closed') {
+            await cleanupAndResolve('MAX_TIME_REACHED');
+            return;
+          } else {
+            console.warn('[Risk Manager] ⚠️ Legs still open after window cutoff close attempt — continuing monitor!');
+          }
         }
 
         // Check Individual Leg Stop Losses (100% SL)
@@ -415,8 +392,15 @@ export async function monitorStraddleRisk(
             await closeLeg(client, state.putLeg, state.putLeg.currentPrice, 'PROFIT_TARGET_HIT', config, notifier);
           }
 
-          await cleanupAndResolve(resolvedScenario);
-          return;
+          state.updatedAt = new Date().toISOString();
+          await saveStraddleState(state, state.date);
+
+          if (state.callLeg.status === 'closed' && state.putLeg.status === 'closed') {
+            await cleanupAndResolve(resolvedScenario);
+            return;
+          } else {
+            console.warn('[Risk Manager] ⚠️ Leg(s) failed to close during profit target squareoff — continuing monitor!');
+          }
         }
 
         // Scenario 3: Check if both legs hit Stop Loss
