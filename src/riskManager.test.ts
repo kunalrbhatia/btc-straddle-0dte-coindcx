@@ -844,5 +844,100 @@ describe('Risk Manager Unit Tests', () => {
       assert.equal(flattenOrderCalled, true, 'must attempt to flatten unexpected long position');
       assert.equal(flattenReduceOnly, true, 'flatten order must carry reduceOnly: true');
     });
+
+    it('Criterion 5: Both legs stopped out (BOTH_LEGS_SL) -> no cost stop move attempted, resolves scenario', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const os = await import('os');
+      const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'both-sl-test-'));
+
+      const prevMode = process.env.BTC_TEST_MODE;
+      const prevStateDir = process.env.BTC_STATE_DIR;
+      const prevRecDir = process.env.RECORD_DIR;
+      const prevAlertsDir = process.env.BTC_ALERTS_DIR;
+
+      process.env.BTC_TEST_MODE = '1';
+      process.env.BTC_STATE_DIR = path.join(tmpBase, 'state');
+      process.env.RECORD_DIR = path.join(tmpBase, 'records');
+      process.env.BTC_ALERTS_DIR = path.join(tmpBase, 'logs');
+      fs.mkdirSync(process.env.BTC_STATE_DIR, { recursive: true });
+      fs.mkdirSync(process.env.RECORD_DIR, { recursive: true });
+      fs.mkdirSync(process.env.BTC_ALERTS_DIR, { recursive: true });
+
+      try {
+        const future = contractSymbolsAt(daysFromNow(90));
+        let moveAttempted = false;
+
+        const client = {
+          getContractPrice: async () => 700,
+          getOptionsPositions: async () => [], // Both absent from venue -> both executed SL
+          getOpenOptionsOrders: async () => [],
+          getOptionsWalletTransactions: async () => [],
+          placeOptionsOrder: async () => {
+            moveAttempted = true;
+            return { success: true, rawResponse: {} };
+          },
+          closePosition: async () => ({ success: true }),
+        } as unknown as CoinDCXClient;
+
+        const state: StraddlePositionState = {
+          date: '2026-10-05',
+          entryExecuted: true,
+          callLeg: {
+            legType: 'CALL',
+            symbol: future.call,
+            entryPrice: 320,
+            entryPriceSource: 'fill',
+            stopLossPrice: 640,
+            quantity: 0.01,
+            confirmedOpen: true,
+            status: 'closed',
+            currentPrice: 640,
+            exitPrice: 640,
+            closeReason: 'SL_HIT',
+          },
+          putLeg: {
+            legType: 'PUT',
+            symbol: future.put,
+            entryPrice: 365,
+            entryPriceSource: 'fill',
+            stopLossPrice: 730,
+            quantity: 0.01,
+            confirmedOpen: true,
+            status: 'closed',
+            currentPrice: 730,
+            exitPrice: 730,
+            closeReason: 'SL_HIT',
+          },
+          totalCreditReceived: 685,
+          targetProfitPoints: 376.75,
+          combinedPnLPoints: 0,
+          updatedAt: new Date().toISOString(),
+        };
+
+        const fastConfig = {
+          ...mockConfig,
+          riskConfig: {
+            ...mockConfig.riskConfig,
+            pollIntervalMs: 20,
+            maxMonitorMinutes: 0.002,
+          },
+        };
+
+        const { monitorStraddleRisk } = await import('./riskManager');
+        const scenario = await monitorStraddleRisk(client, state, fastConfig);
+
+        assert.equal(scenario, 'BOTH_LEGS_SL', 'resolves BOTH_LEGS_SL when both legs hit SL');
+        assert.equal(moveAttempted, false, 'no cost stop move attempted when both legs are closed');
+      } finally {
+        process.env.BTC_TEST_MODE = prevMode;
+        process.env.BTC_STATE_DIR = prevStateDir;
+        process.env.RECORD_DIR = prevRecDir;
+        process.env.BTC_ALERTS_DIR = prevAlertsDir;
+        try {
+          fs.rmSync(tmpBase, { recursive: true, force: true });
+        } catch {}
+      }
+    });
   });
 });

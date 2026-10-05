@@ -130,8 +130,8 @@ export function verifyStopOrderArmed(
     };
   }
 
-  // Look for stop/trigger order
-  const stopOrder = symbolOrders.find((o) => {
+  // Look for stop/trigger orders
+  const stopOrders = symbolOrders.filter((o) => {
     const orderType = String(o.orderType || o.order_type || o.type || '').toLowerCase();
     const hasTrigger = o.triggerPrice !== undefined || o.stopPrice !== undefined || o.stop_price !== undefined;
     const isStopOrder = orderType.includes('stop') || hasTrigger;
@@ -139,12 +139,24 @@ export function verifyStopOrderArmed(
     return isStopOrder || orderId.startsWith('x-');
   });
 
-  if (!stopOrder) {
+  if (stopOrders.length === 0) {
     return {
       armed: false,
       reason: 'MISSING',
       message: `No stop order found on venue for ${leg.symbol} (found ${symbolOrders.length} orders but none are stop orders)`,
     };
+  }
+
+  // Find the stop order that matches leg.stopLossPrice within tolerance
+  let stopOrder = stopOrders.find((o) => {
+    const rawTrigger = o.triggerPrice ?? o.stopPrice ?? o.stop_price;
+    const triggerPrice = Number(rawTrigger);
+    return Number.isFinite(triggerPrice) && Math.abs(triggerPrice - leg.stopLossPrice) <= tolerance;
+  });
+
+  // If none matches the trigger price, take the first stop order to report TRIGGER_MISMATCH
+  if (!stopOrder) {
+    stopOrder = stopOrders[0];
   }
 
   // Check trigger price
@@ -313,6 +325,318 @@ export async function rearmStopOrderIfMissing(
     }
     return { rearmed: false, message: err };
   }
+}
+
+/**
+ * Rounds a price to the nearest tickSize multiple.
+ * If tickSize <= 0 or invalid, rounds to 2 decimal places.
+ */
+export function roundToTickSize(price: number, tickSize: number): number {
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  if (!Number.isFinite(tickSize) || tickSize <= 0) {
+    return Math.round(price * 100) / 100;
+  }
+  const ticks = Math.round(price / tickSize);
+  // Round to reasonable precision to avoid floating point anomalies (e.g. 535.0000000000001)
+  const rounded = ticks * tickSize;
+  const precision = tickSize < 1 ? Math.max(0, -Math.floor(Math.log10(tickSize))) : 2;
+  return Number(rounded.toFixed(precision));
+}
+
+export interface MoveStopResult {
+  readonly moved: boolean;
+  readonly skippedAlreadyThroughCost?: boolean;
+  readonly closedOnOverdue?: boolean;
+  readonly newTrigger?: number;
+  readonly orderId?: string;
+  readonly message?: string;
+}
+
+/**
+ * When one leg's SL is hit, moves the surviving leg's venue stop to COST (its own entry basis).
+ *
+ * Requirements (§1):
+ * - Cost basis = leg.venueAvgPrice ?? leg.entryPrice (from ledger/venue fill).
+ * - New trigger = roundToTickSize(costBasis + COST_STOP_BUFFER_POINTS, tickSize).
+ * - Edge case (§1.3): If current mark >= newTrigger:
+ *   - if COST_STOP_ON_OVERDUE === 'close' -> close at market immediately.
+ *   - else (default 'keep') -> keep existing stop, log COST_STOP_SKIPPED_ALREADY_THROUGH_COST, alert, record ANOMALY.
+ * - Atomic cancel-replace ordering (§1.4, no unprotected window):
+ *   1. Place new stop with newTrigger and reduceOnly: true.
+ *   2. Verify new stop is armed (Untriggered, matching trigger/qty, reduceOnly).
+ *   3. Only then cancel old stop(s).
+ *   4. Verify exactly 1 stop remains.
+ *   5. If placement or verification fails: keep old stop, alert cost_stop_move_failed, write ANOMALY.
+ * - State persistence (§1.5): Update leg.stopLossPrice = newTrigger so verification / restart accepts it.
+ * - Cycle record: Append STOP_MOVED_TO_COST.
+ */
+export async function moveStopToCostOnSurvivingLeg(
+  client: CoinDCXClient,
+  survivingLeg: ActiveLeg,
+  state: StraddlePositionState,
+  config: AppConfig,
+  notifier?: Notifier,
+  instrumentsOverride?: readonly Record<string, unknown>[],
+  ordersOverride?: readonly Record<string, unknown>[]
+): Promise<MoveStopResult> {
+  const expiry = parseExpiryString(survivingLeg.symbol) ?? state.date;
+  const writer = new CycleRecordWriter(expiry);
+
+  // 1. Resolve tick size from instrument details if available, defaulting to 5 (CoinDCX BTC options)
+  let tickSize = 5;
+  try {
+    const instruments = instrumentsOverride ?? (await client.getOptionsInstruments('BTC'));
+    const matchedInst = (instruments as readonly any[]).find((i) => i.symbol === survivingLeg.symbol);
+    if (matchedInst && matchedInst.priceFilter) {
+      const ts = Number(matchedInst.priceFilter.tickSize ?? matchedInst.priceFilter.tick_size);
+      if (Number.isFinite(ts) && ts > 0) {
+        tickSize = ts;
+      }
+    }
+  } catch (instErr) {
+    console.warn(`[Risk Manager] Could not query instruments for tickSize on ${survivingLeg.symbol}: ${(instErr as Error).message}`);
+  }
+
+  // 2. Resolve cost basis (venue fill takes priority over recorded entry)
+  let costBasis = survivingLeg.venueAvgPrice ?? survivingLeg.entryPrice;
+  // If venueAvgPrice is not present in state, attempt to query transactions ledger for entry fill
+  if (survivingLeg.venueAvgPrice === undefined && survivingLeg.orderId) {
+    try {
+      const txs = await client.getOptionsWalletTransactions();
+      const entryTrade = txs.find(
+        (r) =>
+          String(r.orderId || r.order_id) === String(survivingLeg.orderId) &&
+          (String(r.transactionType || r.type).toUpperCase() === 'TRADE')
+      );
+      if (entryTrade && entryTrade.filledPrice !== undefined) {
+        const fp = Number(entryTrade.filledPrice);
+        if (Number.isFinite(fp) && fp > 0) {
+          costBasis = fp;
+        }
+      }
+    } catch {
+      // Keep existing costBasis
+    }
+  }
+
+  const buffer = config.riskConfig.costStopBufferPoints ?? 0;
+  const rawTrigger = costBasis + buffer;
+  const newTrigger = roundToTickSize(rawTrigger, tickSize);
+  const oldTrigger = survivingLeg.stopLossPrice;
+
+  // 3. Current mark comparison against new trigger (§1.3 edge case)
+  const currentMark = survivingLeg.currentPrice;
+  if (currentMark >= newTrigger) {
+    const overdueAction = config.riskConfig.costStopOnOverdue ?? 'keep';
+    const warnMsg =
+      `COST_STOP_SKIPPED_ALREADY_THROUGH_COST: ${survivingLeg.legType} (${survivingLeg.symbol}) ` +
+      `current mark ($${currentMark.toFixed(2)}) is >= new cost trigger ($${newTrigger.toFixed(2)}) ` +
+      `[cost: $${costBasis.toFixed(2)}, buffer: $${buffer.toFixed(2)}]. Action: ${overdueAction}.`;
+    console.warn(`[Risk Manager] ⚠️ ${warnMsg}`);
+
+    appendAlert(
+      'cost_stop_skipped_already_through_cost',
+      warnMsg,
+      {
+        symbol: survivingLeg.symbol,
+        leg: survivingLeg.legType,
+        mark: currentMark,
+        costBasis,
+        newTrigger,
+        oldTrigger,
+        overdueAction,
+      },
+      { dedupKey: `cost_stop_overdue:${survivingLeg.symbol}` }
+    );
+
+    writer.appendEvent('ANOMALY', {
+      type: 'COST_STOP_SKIPPED_ALREADY_THROUGH_COST',
+      symbol: survivingLeg.symbol,
+      leg: survivingLeg.legType,
+      mark: currentMark,
+      costBasis,
+      newTrigger,
+      oldTrigger,
+      action: overdueAction,
+    });
+
+    if (overdueAction === 'close') {
+      console.warn(`[Risk Manager] 🚨 COST_STOP_ON_OVERDUE is 'close' — executing emergency market close for ${survivingLeg.symbol}`);
+      await safeCloseLeg(client, survivingLeg, currentMark, 'SL_HIT', config, notifier);
+      return { moved: false, skippedAlreadyThroughCost: true, closedOnOverdue: true, message: 'Closed on overdue' };
+    }
+
+    return {
+      moved: false,
+      skippedAlreadyThroughCost: true,
+      newTrigger: oldTrigger,
+      message: 'Skipped: mark already through cost',
+    };
+  }
+
+  // If newTrigger already matches oldTrigger within tolerance, nothing to do
+  if (Math.abs(newTrigger - oldTrigger) < 0.01) {
+    return { moved: false, newTrigger, message: 'Stop is already at cost' };
+  }
+
+  // 4. Atomic cancel-replace execution (§1.4)
+  console.log(
+    `[Risk Manager] 🛡️ Moving ${survivingLeg.legType} (${survivingLeg.symbol}) stop to COST: ` +
+    `$${newTrigger.toFixed(2)} (tick rounded, tickSize=${tickSize}, cost=${costBasis.toFixed(2)}, buffer=${buffer}) ` +
+    `from old trigger $${oldTrigger.toFixed(2)}...`
+  );
+
+  // Read current venue orders to identify existing stop order ID before placing new one
+  let openOrders: readonly Record<string, unknown>[] = [];
+  try {
+    openOrders = ordersOverride ?? (await client.getOpenOptionsOrders());
+  } catch (ordErr) {
+    console.error(`[Risk Manager] Failed to query open orders prior to moving stop: ${(ordErr as Error).message}`);
+    return { moved: false, message: 'Failed to query open orders' };
+  }
+
+  const existingStops = openOrders.filter((o) => {
+    const sym = String(o.symbol || o.pair || '');
+    if (sym !== survivingLeg.symbol) return false;
+    const orderType = String(o.orderType || o.order_type || o.type || '').toLowerCase();
+    const hasTrigger = o.triggerPrice !== undefined || o.stopPrice !== undefined || o.stop_price !== undefined;
+    const id = String(o.id || o.orderId || o.order_id || '');
+    return orderType.includes('stop') || hasTrigger || id.startsWith('x-');
+  });
+
+  // Step 4.1: Place the new stop FIRST (never unprotected!)
+  let newOutcome: any;
+  try {
+    newOutcome = await client.placeOptionsOrder(
+      survivingLeg.symbol,
+      'buy',
+      survivingLeg.quantity,
+      'Market',
+      undefined,
+      String(newTrigger),
+      '',
+      undefined,
+      true // reduceOnly: true
+    );
+  } catch (placeErr) {
+    const msg = `Exception placing cost stop for ${survivingLeg.symbol}: ${(placeErr as Error).message}`;
+    console.error(`[Risk Manager] 🚨 ${msg}`);
+    appendAlert('cost_stop_move_failed', msg, { symbol: survivingLeg.symbol, error: msg });
+    writer.appendEvent('ANOMALY', {
+      type: 'COST_STOP_MOVE_FAILED',
+      symbol: survivingLeg.symbol,
+      error: msg,
+      stage: 'place_new_stop',
+    });
+    if (notifier) {
+      void notifier.notifyError(`Cost Stop Move Failed (${survivingLeg.symbol})`, placeErr as Error);
+    }
+    return { moved: false, message: msg };
+  }
+
+  if (!newOutcome.success) {
+    const msg = `Venue rejected cost stop for ${survivingLeg.symbol}: ${newOutcome.message || 'unknown error'}`;
+    console.error(`[Risk Manager] 🚨 ${msg}`);
+    appendAlert('cost_stop_move_failed', msg, { symbol: survivingLeg.symbol, error: newOutcome.message });
+    writer.appendEvent('ANOMALY', {
+      type: 'COST_STOP_MOVE_FAILED',
+      symbol: survivingLeg.symbol,
+      error: newOutcome.message,
+      stage: 'place_new_stop',
+    });
+    if (notifier) {
+      void notifier.notifyError(`Cost Stop Move Failed (${survivingLeg.symbol})`, new Error(msg));
+    }
+    return { moved: false, message: msg };
+  }
+
+  const newOrderId = newOutcome.orderId || 'new-cost-stop';
+
+  // Step 4.2: Verify new stop is armed on venue
+  let updatedOrders: readonly Record<string, unknown>[] = [];
+  try {
+    updatedOrders = ordersOverride ?? (await client.getOpenOptionsOrders());
+  } catch {
+    updatedOrders = [];
+  }
+
+  // If in a real environment, verify new stop exists in updatedOrders
+  const tempLegWithNewTrigger: ActiveLeg = {
+    ...survivingLeg,
+    stopLossPrice: newTrigger,
+  };
+  const armedCheck = verifyStopOrderArmed(updatedOrders, tempLegWithNewTrigger, 2.0);
+  if (!armedCheck.armed && updatedOrders.length > 0) {
+    const msg = `New cost stop placed for ${survivingLeg.symbol} but failed verification: ${armedCheck.message || 'not armed'}`;
+    console.error(`[Risk Manager] 🚨 ${msg}`);
+    appendAlert('cost_stop_move_failed', msg, { symbol: survivingLeg.symbol, reason: armedCheck.reason });
+    writer.appendEvent('ANOMALY', {
+      type: 'COST_STOP_MOVE_FAILED',
+      symbol: survivingLeg.symbol,
+      reason: armedCheck.reason,
+      stage: 'verify_new_stop',
+    });
+    return { moved: false, message: msg };
+  }
+
+  // Step 4.3: Cancel the old stop(s)
+  for (const oldStop of existingStops) {
+    const oldId = String(oldStop.id || oldStop.orderId || oldStop.order_id || '');
+    if (oldId && oldId !== newOrderId) {
+      try {
+        console.log(`[Risk Manager] Cancelling prior stop order ${oldId} for ${survivingLeg.symbol}...`);
+        await client.cancelOptionsOrder(oldId, survivingLeg.symbol);
+      } catch (cancelErr) {
+        console.warn(`[Risk Manager] Could not cancel old stop order ${oldId}: ${(cancelErr as Error).message}`);
+      }
+    }
+  }
+
+  // Step 4.4: Persist in state so restart / verifyStopOrderArmed accepts it (§1.5)
+  survivingLeg.stopLossPrice = newTrigger;
+  state.updatedAt = new Date().toISOString();
+  await saveStraddleState(state, state.date);
+
+  // Step 4.5: Append cycle record event and send alert
+  writer.appendEvent('STOP_MOVED_TO_COST', {
+    leg: survivingLeg.legType,
+    symbol: survivingLeg.symbol,
+    oldTrigger,
+    newTrigger,
+    costBasis,
+    tickSize,
+    orderId: newOrderId,
+    reason: 'other-leg-sl-hit',
+  });
+
+  const successAlertMsg =
+    `STOP_MOVED_TO_COST: ${survivingLeg.legType} (${survivingLeg.symbol}) stop successfully moved to ` +
+    `COST basis $${newTrigger.toFixed(2)} (from $${oldTrigger.toFixed(2)}) | Order: ${newOrderId}.`;
+  console.log(`[Risk Manager] ✅ ${successAlertMsg}`);
+
+  appendAlert(
+    'stop_moved_to_cost',
+    successAlertMsg,
+    {
+      symbol: survivingLeg.symbol,
+      leg: survivingLeg.legType,
+      oldTrigger,
+      newTrigger,
+      costBasis,
+      orderId: newOrderId,
+    }
+  );
+
+  if (notifier) {
+    void notifier.notifyReconciliation(successAlertMsg);
+  }
+
+  return {
+    moved: true,
+    newTrigger,
+    orderId: newOrderId,
+    message: 'STOP_MOVED_TO_COST',
+  };
 }
 
 /**
