@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "cycle": "2026-10-07",
+  "entryDate": "2026-10-06",
+  "updatedAt": "2026-10-07T08:00:07.830Z",
+  "status": "CLOSED",
+  "totalCreditReceived": 840,
+  "targetProfitPoints": 462.00000000000006,
+  "callLeg": {
+    "symbol": "BTC-7OCT26-85500-C-USDT",
+    "entryPrice": 225,
+    "status": "closed",
+    "closeReason": "EXPIRED",
+    "orderId": "cd0178c0-ed8c-4be2-a2c9-2af530c6bf5a",
+    "pnlPoints": null
+  },
+  "putLeg": {
+    "symbol": "BTC-7OCT26-86000-P-USDT",
+    "entryPrice": 440,
+    "status": "closed",
+    "exitPrice": 465,
+    "closeReason": "SL_HIT",
+    "orderId": "ef29b40d-d7ec-4b92-8419-46f109285765",
+    "closeOrderId": "x-5d76f5b1-a6e0",
+    "pnlPoints": -25
+  },
+  "combinedPnLPoints": -250,
+  "resolvedScenario": "MAX_TIME_REACHED"
+}
