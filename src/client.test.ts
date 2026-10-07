@@ -350,6 +350,46 @@ describe('CoinDCXClient Options Unit Tests', () => {
       assert.equal(outcome.success, false);
       assert.equal(outcome.isAlreadyFlat, true);
     });
+
+    it('rejects BUY payload locally when stopLoss is higher than or equal to price', async () => {
+      const client = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+      await assert.rejects(
+        async () => {
+          await client.placeOptionsOrder(
+            'BTC-6OCT26-85750-C-USDT',
+            'buy',
+            0.01,
+            'Limit',
+            155,
+            '440', // stopLoss > price -> invalid on BUY
+            '',
+            '102',
+            true
+          );
+        },
+        /StopLoss \(440\) for buy position must be lower than base_price \(155\)/
+      );
+    });
+
+    it('rejects SELL payload locally when stopLoss is lower than or equal to price', async () => {
+      const client = new CoinDCXClient('key', 'secret', 'https://api.coindcx.com', 'valid-token');
+      await assert.rejects(
+        async () => {
+          await client.placeOptionsOrder(
+            'BTC-6OCT26-85750-C-USDT',
+            'sell',
+            0.01,
+            'Limit',
+            400,
+            '350', // stopLoss < price -> invalid on SELL
+            '',
+            '102',
+            false
+          );
+        },
+        /StopLoss \(350\) for sell position must be higher than base_price \(400\)/
+      );
+    });
   });
 
   describe('conversionRate resolution', () => {

@@ -465,8 +465,9 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
     fs.mkdirSync(process.env.BTC_ALERTS_DIR, { recursive: true });
 
     try {
-      let placedOrder: any = null;
       let cancelledOrderId: string | null = null;
+      let buyBackPlaced = false;
+      let reopenedPlaced = false;
 
       // Existing orders on venue: has old 2x stop @ 800
       const venueOrders: any[] = [
@@ -488,38 +489,59 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
             priceFilter: { tickSize: 5 },
           },
         ],
+        getOptionsTicker: async () => [
+          {
+            symbol: 'BTC-5OCT26-85250-P-USDT',
+            bidPrice: '380',
+            askPrice: '385',
+          },
+        ],
         getOptionsWalletTransactions: async () => [],
         getOpenOptionsOrders: async () => venueOrders,
+        getOptionsPositions: async () => [],
         placeOptionsOrder: async (
           symbol: string,
           side: string,
           qty: number,
-          type: string,
-          _price: any,
+          _orderType: string,
+          price: any,
           stopLoss: string,
           _tp: any,
           _cr: any,
           reduceOnly: boolean
         ) => {
-          placedOrder = { symbol, side, qty, type, stopLoss, reduceOnly };
-          // Add newly placed stop to venue orders
-          const newOrder = {
-            id: 'mock-cost-stop-1',
-            symbol,
-            orderType: 'Stop-Market',
-            triggerPrice: Number(stopLoss),
-            qty,
-            reduceOnly,
-            status: 'Untriggered',
-          };
-          venueOrders.push(newOrder);
-          return {
-            symbol,
-            side: side as any,
-            success: true,
-            orderId: 'mock-cost-stop-1',
-            rawResponse: {},
-          };
+          if (side === 'buy' && reduceOnly) {
+            buyBackPlaced = true;
+            return {
+              symbol,
+              side: 'buy' as const,
+              success: true,
+              orderId: 'buyback-order-1',
+              rawResponse: {},
+            };
+          }
+          if (side === 'sell' && !reduceOnly) {
+            reopenedPlaced = true;
+            const newStopOrder = {
+              id: 'mock-reopened-stop-1',
+              symbol,
+              orderType: 'Stop-Market',
+              triggerPrice: Number(stopLoss),
+              qty,
+              reduceOnly: true,
+              status: 'Untriggered',
+            };
+            venueOrders.push(newStopOrder);
+            return {
+              symbol,
+              side: 'sell' as const,
+              success: true,
+              orderId: 'reopened-order-1',
+              limitPrice: Number(price),
+              rawResponse: {},
+            };
+          }
+          return { symbol, side: side as any, success: false, rawResponse: {} };
         },
         cancelOptionsOrder: async (orderId: string) => {
           cancelledOrderId = orderId;
@@ -529,7 +551,7 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
         },
       } as unknown as CoinDCXClient;
 
-      // State: PUT is surviving, venue fill is 400 (even though entry was quoted at 395)
+      // State: PUT is surviving
       const state: StraddlePositionState = {
         date: '2026-10-05',
         entryExecuted: true,
@@ -549,14 +571,14 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
         putLeg: {
           legType: 'PUT',
           symbol: 'BTC-5OCT26-85250-P-USDT',
-          entryPrice: 395, // quote
-          venueAvgPrice: 400, // actual venue fill! Criterion 6
+          entryPrice: 395,
+          venueAvgPrice: 400,
           entryPriceSource: 'fill',
           stopLossPrice: 800,
           quantity: 0.01,
           confirmedOpen: true,
           status: 'open',
-          currentPrice: 250, // comfortably below cost (400)
+          currentPrice: 250,
         },
         totalCreditReceived: 935,
         targetProfitPoints: 500,
@@ -566,22 +588,23 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
 
       const result = await moveStopToCostOnSurvivingLeg(mockClient, state.putLeg, state, mockConfig);
       assert.equal(result.moved, true);
-      assert.equal(result.newTrigger, 400, 'must move trigger to venueAvgPrice 400');
-      assert.notEqual(placedOrder, null);
-      assert.equal(placedOrder.reduceOnly, true, 'new stop must carry reduceOnly: true');
-      assert.equal(placedOrder.stopLoss, '400');
-      assert.equal(cancelledOrderId, 'old-put-stop-id', 'old stop must be cancelled after new stop verified');
-      assert.equal(venueOrders.length, 1, 'exactly one stop must remain');
+      assert.equal(result.reopened, true);
+      // newTrigger = roundToTickSize(bid 380 + buffer 20, 5) = 400
+      assert.equal(result.newTrigger, 400, 'must set new trigger to bid + buffer (400)');
+      assert.equal(cancelledOrderId, 'old-put-stop-id', 'must cancel old resting orders');
+      assert.equal(buyBackPlaced, true, 'must buy back surviving leg');
+      assert.equal(reopenedPlaced, true, 'must re-open short leg with armed stop');
       assert.equal(state.putLeg.stopLossPrice, 400, 'state.putLeg.stopLossPrice must be updated to 400');
+      assert.equal(state.putLeg.status, 'open', 'state.putLeg must be open');
 
       // Check record JSONL
       const recFile = path.join(process.env.RECORD_DIR, '2026-10-05.jsonl');
       assert.equal(fs.existsSync(recFile), true);
       const lines = fs.readFileSync(recFile, 'utf8').trim().split('\n');
-      const stopMovedEv = lines.map((l) => JSON.parse(l)).find((e) => e.event === 'STOP_MOVED_TO_COST');
-      assert.notEqual(stopMovedEv, undefined);
-      assert.equal(stopMovedEv.data.newTrigger, 400);
-      assert.equal(stopMovedEv.data.costBasis, 400);
+      const reopenEv = lines.map((l) => JSON.parse(l)).find((e) => e.event === 'COST_STOP_REOPENED');
+      assert.notEqual(reopenEv, undefined);
+      assert.equal(reopenEv.data.newTrigger, 400);
+      assert.equal(reopenEv.data.buffer, 20);
     } finally {
       process.env.BTC_TEST_MODE = prevMode;
       process.env.BTC_STATE_DIR = prevStateDir;
@@ -593,11 +616,32 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
     }
   });
 
-  it('Criterion 2: mark >= newTrigger skips move, logs COST_STOP_SKIPPED_ALREADY_THROUGH_COST, leaves old stop', async () => {
+  it('rejects COST_STOP_BUFFER_POINTS = 0 at config or runtime execution', async () => {
+    const invalidConfig: AppConfig = {
+      ...mockConfig,
+      riskConfig: {
+        ...mockConfig.riskConfig,
+        costStopBufferPoints: 0,
+      },
+    };
+    const mockClient = {
+      getOptionsInstruments: async () => [],
+      getOptionsTicker: async () => [],
+    } as unknown as CoinDCXClient;
+    const state: any = { date: '2026-10-05', callLeg: { symbol: 'C' }, putLeg: { symbol: 'P' } };
+    await assert.rejects(
+      async () => {
+        await moveStopToCostOnSurvivingLeg(mockClient, { symbol: 'BTC-5OCT26-85250-P-USDT', stopLossPrice: 800 } as any, state, invalidConfig);
+      },
+      /COST_STOP_BUFFER_POINTS must be > 0/
+    );
+  });
+
+  it('Safe failure: if re-open placement fails, leg is flat with banked PnL and ANOMALY logged', async () => {
     const fs = await import('fs');
     const path = await import('path');
     const os = await import('os');
-    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'cost-stop-skip-'));
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'cost-stop-reopen-fail-'));
 
     const prevMode = process.env.BTC_TEST_MODE;
     const prevStateDir = process.env.BTC_STATE_DIR;
@@ -613,24 +657,22 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
     fs.mkdirSync(process.env.BTC_ALERTS_DIR, { recursive: true });
 
     try {
-      let placeAttempted = false;
-      let cancelAttempted = false;
-
       const mockClient = {
         getOptionsInstruments: async () => [{ symbol: 'BTC-5OCT26-85250-P-USDT', priceFilter: { tickSize: 5 } }],
+        getOptionsTicker: async () => [{ symbol: 'BTC-5OCT26-85250-P-USDT', bidPrice: '380', askPrice: '385' }],
         getOptionsWalletTransactions: async () => [],
         getOpenOptionsOrders: async () => [],
-        placeOptionsOrder: async () => {
-          placeAttempted = true;
-          return { success: true };
-        },
-        cancelOptionsOrder: async () => {
-          cancelAttempted = true;
-          return true;
+        getOptionsPositions: async () => [],
+        cancelOptionsOrder: async () => true,
+        placeOptionsOrder: async (_sym: string, side: string, _qty: number, _type: string, _p: any, _sl: any, _tp: any, _cr: any, reduceOnly: boolean) => {
+          if (side === 'buy' && reduceOnly) {
+            return { symbol: 'BTC-5OCT26-85250-P-USDT', side: 'buy' as const, success: true, orderId: 'buyback-1', rawResponse: {} };
+          }
+          // Re-open fails!
+          return { symbol: 'BTC-5OCT26-85250-P-USDT', side: 'sell' as const, success: false, message: 'Venue rejected reopen', rawResponse: {} };
         },
       } as unknown as CoinDCXClient;
 
-      // Mark is 450, while cost basis is 400 -> already crossed!
       const state: StraddlePositionState = {
         date: '2026-10-05',
         entryExecuted: true,
@@ -656,7 +698,7 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
           quantity: 0.01,
           confirmedOpen: true,
           status: 'open',
-          currentPrice: 450, // >= newTrigger (400)
+          currentPrice: 380,
         },
         totalCreditReceived: 935,
         targetProfitPoints: 500,
@@ -666,124 +708,14 @@ describe('Cost Stop on Surviving Leg Unit Tests (§1 - §3)', () => {
 
       const result = await moveStopToCostOnSurvivingLeg(mockClient, state.putLeg, state, mockConfig);
       assert.equal(result.moved, false);
-      assert.equal(result.skippedAlreadyThroughCost, true);
-      assert.equal(placeAttempted, false, 'no order placement must be attempted');
-      assert.equal(cancelAttempted, false, 'no order cancellation must be attempted');
-      assert.equal(state.putLeg.stopLossPrice, 800, 'existing stopLossPrice must be retained');
+      assert.equal(state.putLeg.status, 'closed', 'leg must be marked closed on safe failure');
+      assert.equal(state.putLeg.closeReason, 'SL_COST_STOP_CLOSED');
 
       // Check ANOMALY record event
       const recFile = path.join(process.env.RECORD_DIR, '2026-10-05.jsonl');
       const lines = fs.readFileSync(recFile, 'utf8').trim().split('\n');
-      const anomalyEv = lines.map((l) => JSON.parse(l)).find((e) => e.data?.type === 'COST_STOP_SKIPPED_ALREADY_THROUGH_COST');
+      const anomalyEv = lines.map((l) => JSON.parse(l)).find((e) => e.data?.type === 'COST_STOP_REOPEN_ABORTED_LEG_FLAT');
       assert.notEqual(anomalyEv, undefined);
-    } finally {
-      process.env.BTC_TEST_MODE = prevMode;
-      process.env.BTC_STATE_DIR = prevStateDir;
-      process.env.RECORD_DIR = prevRecDir;
-      process.env.BTC_ALERTS_DIR = prevAlertsDir;
-      try {
-        fs.rmSync(tmpBase, { recursive: true, force: true });
-      } catch {}
-    }
-  });
-
-  it('Criterion 3: No unprotected window — if new stop fails, old stop remains and ANOMALY is recorded', async () => {
-    const fs = await import('fs');
-    const path = await import('path');
-    const os = await import('os');
-    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'cost-stop-err-'));
-
-    const prevMode = process.env.BTC_TEST_MODE;
-    const prevStateDir = process.env.BTC_STATE_DIR;
-    const prevRecDir = process.env.RECORD_DIR;
-    const prevAlertsDir = process.env.BTC_ALERTS_DIR;
-
-    process.env.BTC_TEST_MODE = '1';
-    process.env.BTC_STATE_DIR = path.join(tmpBase, 'state');
-    process.env.RECORD_DIR = path.join(tmpBase, 'records');
-    process.env.BTC_ALERTS_DIR = path.join(tmpBase, 'logs');
-    fs.mkdirSync(process.env.BTC_STATE_DIR, { recursive: true });
-    fs.mkdirSync(process.env.RECORD_DIR, { recursive: true });
-    fs.mkdirSync(process.env.BTC_ALERTS_DIR, { recursive: true });
-
-    try {
-      let cancelCalled = false;
-      const venueOrders: any[] = [
-        {
-          id: 'old-put-stop-id',
-          symbol: 'BTC-5OCT26-85250-P-USDT',
-          orderType: 'Stop-Market',
-          triggerPrice: 800,
-          qty: 0.01,
-          reduceOnly: true,
-          status: 'Untriggered',
-        },
-      ];
-
-      const mockClient = {
-        getOptionsInstruments: async () => [{ symbol: 'BTC-5OCT26-85250-P-USDT', priceFilter: { tickSize: 5 } }],
-        getOptionsWalletTransactions: async () => [],
-        getOpenOptionsOrders: async () => venueOrders,
-        placeOptionsOrder: async () => {
-          // Placement fails!
-          return {
-            symbol: 'BTC-5OCT26-85250-P-USDT',
-            side: 'buy' as const,
-            success: false,
-            message: 'Simulated venue reject',
-            rawResponse: {},
-          };
-        },
-        cancelOptionsOrder: async () => {
-          cancelCalled = true;
-          return true;
-        },
-      } as unknown as CoinDCXClient;
-
-      const state: StraddlePositionState = {
-        date: '2026-10-05',
-        entryExecuted: true,
-        callLeg: {
-          legType: 'CALL',
-          symbol: 'BTC-5OCT26-85250-C-USDT',
-          entryPrice: 535,
-          entryPriceSource: 'fill',
-          stopLossPrice: 1070,
-          quantity: 0.01,
-          confirmedOpen: true,
-          status: 'closed',
-          currentPrice: 1080,
-          exitPrice: 1080,
-          closeReason: 'SL_HIT',
-        },
-        putLeg: {
-          legType: 'PUT',
-          symbol: 'BTC-5OCT26-85250-P-USDT',
-          entryPrice: 400,
-          entryPriceSource: 'fill',
-          stopLossPrice: 800,
-          quantity: 0.01,
-          confirmedOpen: true,
-          status: 'open',
-          currentPrice: 200,
-        },
-        totalCreditReceived: 935,
-        targetProfitPoints: 500,
-        combinedPnLPoints: 0,
-        updatedAt: new Date().toISOString(),
-      };
-
-      const result = await moveStopToCostOnSurvivingLeg(mockClient, state.putLeg, state, mockConfig);
-      assert.equal(result.moved, false);
-      assert.equal(cancelCalled, false, 'must NOT cancel old stop when new placement fails');
-      assert.equal(venueOrders.length, 1, 'old stop must remain untouched');
-      assert.equal(state.putLeg.stopLossPrice, 800, 'state stopLossPrice must not be changed');
-
-      // Check ANOMALY record event
-      const recFile = path.join(process.env.RECORD_DIR, '2026-10-05.jsonl');
-      const lines = fs.readFileSync(recFile, 'utf8').trim().split('\n');
-      const errEv = lines.map((l) => JSON.parse(l)).find((e) => e.data?.type === 'COST_STOP_MOVE_FAILED');
-      assert.notEqual(errEv, undefined);
     } finally {
       process.env.BTC_TEST_MODE = prevMode;
       process.env.BTC_STATE_DIR = prevStateDir;

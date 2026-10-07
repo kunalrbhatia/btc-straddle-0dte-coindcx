@@ -33,6 +33,7 @@ export interface AppConfig {
   readonly verificationTolerance?: number;
   readonly checkpointIntervalMs?: number;
   readonly walletPageCap?: number;
+  readonly positionTruthGraceMs?: number;
 }
 
 export function parseRequiredIntInRange(key: string, min: number, max: number): number {
@@ -137,7 +138,19 @@ export const config: AppConfig = {
     maxMonitorMinutes: getEnvNumber('MAX_MONITOR_MINUTES', 1380), // 23 hours cutoff by default (accommodates 14:15 IST entry to 13:30 IST expiry)
     slOverrunTolerance: getEnvNumber('SL_OVERRUN_TOLERANCE', 0.10), // 10% overrun before emergency fallback close
     costStopEnabled: process.env.COST_STOP_ENABLED !== 'false', // Enabled by default
-    costStopBufferPoints: getEnvNumber('COST_STOP_BUFFER_POINTS', 0),
+    costStopBufferPoints: (() => {
+      const rawVal = process.env.COST_STOP_BUFFER_POINTS;
+      if (rawVal !== undefined && rawVal.trim() !== '') {
+        const parsed = Number(rawVal.trim());
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          throw new Error(
+            `COST_STOP_BUFFER_POINTS must be > 0 (buffer of 0 is unconstructible for short stops, received "${rawVal}")`
+          );
+        }
+        return parsed;
+      }
+      return 20;
+    })(),
     costStopOnOverdue: (process.env.COST_STOP_ON_OVERDUE === 'close' ? 'close' : 'keep') as 'keep' | 'close',
   },
   customCallSymbol: process.env.CUSTOM_CALL_SYMBOL || undefined,
@@ -149,5 +162,6 @@ export const config: AppConfig = {
   verificationTolerance: getEnvNumber('VERIFICATION_TOLERANCE', 1.0),
   checkpointIntervalMs: getEnvNumber('CHECKPOINT_INTERVAL_MS', 300_000), // 5 minutes
   walletPageCap: parseOptionalIntInRange('WALLET_PAGE_CAP', 10, 1, 50),
+  positionTruthGraceMs: getEnvNumber('POSITION_TRUTH_GRACE_MS', 60000),
 };
 

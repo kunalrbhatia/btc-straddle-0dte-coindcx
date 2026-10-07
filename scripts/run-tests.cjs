@@ -54,10 +54,15 @@ function collectTestFiles(dir, acc = []) {
   return acc;
 }
 
-const testFiles = collectTestFiles(path.join(__dirname, '..', 'src')).sort();
+const allTestFiles = collectTestFiles(path.join(__dirname, '..', 'src')).sort();
+
+const filterArgs = process.argv.slice(2);
+const testFiles = filterArgs.length > 0
+  ? allTestFiles.filter((f) => filterArgs.some((arg) => f.includes(arg)))
+  : allTestFiles;
 
 if (testFiles.length === 0) {
-  console.error('[run-tests] No *.test.ts files found under src/ — refusing to report success.');
+  console.error('[run-tests] No matching *.test.ts files found under src/ — refusing to report success.');
   process.exit(1);
 }
 

@@ -790,6 +790,26 @@ export class CoinDCXClient {
         ? '0.00'
         : '0';
 
+    // Offline payload validation against venue rules:
+    // 1. Buy position stopLoss must be strictly lower than price/base_price.
+    // 2. Sell position stopLoss must be strictly higher than price.
+    if (stopLoss && stopLoss.trim() !== '') {
+      const slNum = Number(stopLoss);
+      const effectivePrice = numPrice ?? Number(priceStr);
+      if (Number.isFinite(slNum) && Number.isFinite(effectivePrice) && effectivePrice > 0) {
+        if (side === 'buy' && slNum >= effectivePrice) {
+          throw new Error(
+            `Invalid order payload: StopLoss (${slNum}) for buy position must be lower than base_price (${effectivePrice})`
+          );
+        }
+        if (side === 'sell' && slNum <= effectivePrice) {
+          throw new Error(
+            `Invalid order payload: StopLoss (${slNum}) for sell position must be higher than base_price (${effectivePrice})`
+          );
+        }
+      }
+    }
+
     // Verified against the live API: conversionRate is REQUIRED (its absence is a 400).
     // Resolve it live (USDT -> INR) unless the caller supplied one explicitly.
     const resolvedConversionRate = conversionRate ?? (await this.resolveConversionRate());

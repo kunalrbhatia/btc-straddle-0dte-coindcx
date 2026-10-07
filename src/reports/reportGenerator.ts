@@ -211,6 +211,8 @@ export async function generateDailyReport(
           detail = `${ev.data?.legType} settled at expiry @ $${Number(ev.data?.settlementPrice ?? 0).toFixed(2)} [${ev.data?.settlementReason ?? 'EXPIRED'}]`;
         } else if (ev.event === 'STOP_MOVED_TO_COST') {
           detail = `${ev.data?.leg} stop moved to COST ($${Number(ev.data?.newTrigger ?? 0).toFixed(2)}) from $${Number(ev.data?.oldTrigger ?? 0).toFixed(2)} [${ev.data?.reason ?? 'cost-stop'}]`;
+        } else if (ev.event === 'COST_STOP_REOPENED') {
+          detail = `${ev.data?.legType || 'Leg'} (${ev.data?.symbol}) reopened @ $${Number(ev.data?.newEntry ?? 0).toFixed(2)} with stop @ $${Number(ev.data?.newTrigger ?? 0).toFixed(2)} (buffer: +${Number(ev.data?.buffer ?? 0).toFixed(2)} pts, banked PnL: ${Number(ev.data?.bankedPnlPoints ?? 0).toFixed(2)} pts) [Order: ${ev.data?.orderId ?? 'N/A'}]`;
         } else if (ev.event === 'CYCLE_CLOSED') {
           recordCycleClosedEvent = ev;
           detail = `Cycle closed [${ev.data?.resolvedScenario ?? 'CLOSED'}], Realised P&L: ${Number(ev.data?.realisedPnlPoints ?? 0).toFixed(2)} pts`;
