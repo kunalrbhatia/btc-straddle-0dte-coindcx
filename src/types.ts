@@ -175,6 +175,7 @@ export type LegStatus = 'open' | 'closed';
 export type LegCloseReason =
   | 'SL_HIT'
   | 'SL_FALLBACK_CLOSE'
+  | 'SL_COST_STOP_CLOSED'
   | 'PROFIT_TARGET_HIT'
   | 'MANUAL'
   | 'UNWOUND_PARTIAL'
@@ -199,6 +200,7 @@ export interface ActiveLeg {
   readonly quantity: number;
   readonly orderId?: string;
   readonly confirmedOpen: boolean;
+  seenOpenOnVenue?: boolean;
   status: LegStatus;
   currentPrice: number;
   exitPrice?: number;

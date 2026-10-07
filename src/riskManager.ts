@@ -232,6 +232,8 @@ export async function monitorStraddleRisk(
   const recordWriter = new CycleRecordWriter(cycleExpiryStr);
   let lastCheckpointTime = Date.now();
   const checkpointInterval = config.checkpointIntervalMs ?? 300_000;
+  const absentCounts = new Map<string, number>();
+  const loggedGraceFeedLag = new Set<string>();
 
   return new Promise<TradeScenario>((resolve) => {
     let timer: NodeJS.Timeout | null = null;
@@ -392,22 +394,109 @@ export async function monitorStraddleRisk(
             const venueQty = Number(posOnVenue?.qty ?? posOnVenue?.quantity ?? 0);
             const isStillOpenOnVenue = Boolean(posOnVenue) && venueQty !== 0;
 
-            if (!isStillOpenOnVenue) {
-              // Position was open in state, but is gone on venue before expiry!
-              // The venue stop order executed, or it was closed on exchange.
-              console.log(
-                `[Risk Manager] 🎯 ${leg.legType} (${leg.symbol}) is ABSENT from venue positions. Adopting as closed via venue stop execution.`
-              );
+            if (isStillOpenOnVenue) {
+              // Mark seen on venue once observed
+              leg.seenOpenOnVenue = true;
+              absentCounts.set(leg.symbol, 0);
+              continue;
+            }
 
-              // Resolve venue fill price from transactions or last known mark
-              let fillPrice = leg.currentPrice;
-              let fillOrderId = leg.exitOrderId;
+            // The position is ABSENT from venue positions.
+            // Part A5: Post-fill grace period: for POSITION_TRUTH_GRACE_MS after confirmed fill / start,
+            // absence from the positions feed is treated as feed lag, never as a close.
+            const graceMs = config.positionTruthGraceMs ?? 60000;
+            const elapsedSinceStart = Date.now() - startTime;
+            if (elapsedSinceStart < graceMs) {
+              if (!loggedGraceFeedLag.has(leg.symbol)) {
+                loggedGraceFeedLag.add(leg.symbol);
+                console.log(
+                  `[Risk Manager] ⏳ Feed lag: ${leg.legType} (${leg.symbol}) absent from positions feed during post-fill grace period (${Math.round(elapsedSinceStart / 1000)}s < ${Math.round(graceMs / 1000)}s). Not adopting as closed.`
+                );
+              }
+              continue;
+            }
+
+            // Part A1: A leg may only be adopted as closed-by-venue if the venue has EVER been observed
+            // holding it since the fill was confirmed.
+            if (!leg.seenOpenOnVenue) {
+              const currentAbsent = (absentCounts.get(leg.symbol) ?? 0) + 1;
+              absentCounts.set(leg.symbol, currentAbsent);
+              const msg = `Position ${leg.legType} (${leg.symbol}) absent from venue positions feed after grace period but has NEVER been observed open on venue (poll ${currentAbsent}). Keeping leg open.`;
+              console.warn(`[Risk Manager] ⚠️ ${msg}`);
+              appendAlert('position_vanished_after_fill', msg, {
+                symbol: leg.symbol,
+                leg: leg.legType,
+                absentCount: currentAbsent,
+                seenOpenOnVenue: false,
+              }, { dedupKey: `vanished_before_seen:${leg.symbol}` });
+              continue;
+            }
+
+            // Part A2: Check corroboration (resting stop order gone OR TRADE row in wallet/transactions after fill)
+            const restingStop = venueOrders.find((o) => {
+              const sym = String(o.symbol || o.pair || '');
+              if (sym !== leg.symbol) return false;
+              const orderType = String(o.orderType || o.order_type || o.type || '').toLowerCase();
+              const hasTrigger = o.triggerPrice !== undefined || o.stopPrice !== undefined || o.stop_price !== undefined;
+              const id = String(o.id || o.orderId || o.order_id || '');
+              return orderType.includes('stop') || hasTrigger || id.startsWith('x-');
+            });
+            const restingStopGone = !restingStop;
+
+            let tradeRowFound: Record<string, unknown> | undefined;
+            try {
+              const txs = await client.getOptionsWalletTransactions();
+              tradeRowFound = txs.find(
+                (r) =>
+                  r.symbol === leg.symbol &&
+                  String(r.transactionType || r.type).toUpperCase() === 'TRADE'
+              );
+            } catch (txErr) {
+              console.warn(`[Risk Manager] Could not query wallet transactions for corroboration: ${(txErr as Error).message}`);
+            }
+
+            const isCorroborated = restingStopGone || Boolean(tradeRowFound);
+            const currentAbsent = (absentCounts.get(leg.symbol) ?? 0) + 1;
+            absentCounts.set(leg.symbol, currentAbsent);
+
+            // Require two consecutive confirms separated by a poll, OR corroboration before finalising.
+            if (currentAbsent < 2 && !isCorroborated) {
+              const msg = `Position ${leg.legType} (${leg.symbol}) vanished from positions feed (first absent read, uncorroborated). Keeping open and re-checking.`;
+              console.warn(`[Risk Manager] ⚠️ ${msg}`);
+              appendAlert('position_vanished_after_fill', msg, {
+                symbol: leg.symbol,
+                leg: leg.legType,
+                absentCount: currentAbsent,
+              }, { dedupKey: `position_vanished_after_fill:${leg.symbol}` });
+              continue;
+            }
+
+            // Position is confirmed closed on venue!
+            console.log(
+              `[Risk Manager] 🎯 ${leg.legType} (${leg.symbol}) is CONFIRMED ABSENT from venue positions (absentCount: ${currentAbsent}, corroborated: ${isCorroborated}). Adopting as closed via venue stop execution.`
+            );
+
+            // Part A4: Resolve genuine venue fill price. NEVER write exitPrice = entryPrice with combinedPnLPoints = 0.
+            let fillPrice: number | undefined;
+            let fillOrderId = leg.exitOrderId;
+
+            if (tradeRowFound && tradeRowFound.filledPrice !== undefined) {
+              const p = Number(tradeRowFound.filledPrice);
+              if (Number.isFinite(p) && p > 0) {
+                fillPrice = p;
+                fillOrderId = String(tradeRowFound.orderId || tradeRowFound.order_id || '') || fillOrderId;
+                console.log(`[Risk Manager] Found venue fill price for ${leg.symbol}: $${fillPrice.toFixed(2)} (order: ${fillOrderId || 'n/a'})`);
+              }
+            }
+
+            if (fillPrice === undefined) {
+              // Try querying wallet transactions if not already queried
               try {
                 const txs = await client.getOptionsWalletTransactions();
                 const tradeRow = txs.find(
                   (r) =>
                     r.symbol === leg.symbol &&
-                    (String(r.transactionType || r.type).toUpperCase() === 'TRADE')
+                    String(r.transactionType || r.type).toUpperCase() === 'TRADE'
                 );
                 if (tradeRow && tradeRow.filledPrice !== undefined) {
                   const p = Number(tradeRow.filledPrice);
@@ -420,99 +509,114 @@ export async function monitorStraddleRisk(
               } catch (txErr) {
                 console.warn(`[Risk Manager] Could not query wallet transactions for venue fill: ${(txErr as Error).message}`);
               }
+            }
 
-              leg.status = 'closed';
-              leg.exitPrice = fillPrice;
-              leg.closeReason = 'SL_HIT';
-              leg.exitOrderId = fillOrderId;
+            if (fillPrice === undefined) {
+              // If still undefined, use currentPrice only if it is > 0 and not equal to entryPrice, or fallback to stopLossPrice
+              if (leg.currentPrice > 0 && Math.abs(leg.currentPrice - leg.entryPrice) > 0.01) {
+                fillPrice = leg.currentPrice;
+              } else if (leg.stopLossPrice > 0) {
+                fillPrice = leg.stopLossPrice;
+              } else {
+                fillPrice = leg.currentPrice;
+              }
+            }
 
-              recordWriter.appendEvent('LEG_CLOSED', {
+            leg.status = 'closed';
+            leg.exitPrice = fillPrice;
+            leg.closeReason = 'SL_HIT';
+            leg.exitOrderId = fillOrderId;
+
+            recordWriter.appendEvent('LEG_CLOSED', {
+              legType: leg.legType,
+              symbol: leg.symbol,
+              reason: 'SL_HIT',
+              exitPrice: leg.exitPrice,
+              source: 'venue',
+              orderId: fillOrderId,
+            });
+
+            state.updatedAt = new Date().toISOString();
+            await saveStraddleState(state, state.date);
+
+            const msg = `${leg.legType} (${leg.symbol}) closed by venue stop order at $${leg.exitPrice.toFixed(2)}.`;
+            appendAlert('leg_closed_venue', msg, {
+              symbol: leg.symbol,
+              leg: leg.legType,
+              exitPrice: leg.exitPrice,
+              orderId: fillOrderId,
+            });
+
+            if (notifier) {
+              void notifier.notifyLegClosed({
                 legType: leg.legType,
                 symbol: leg.symbol,
                 reason: 'SL_HIT',
                 exitPrice: leg.exitPrice,
-                source: 'venue',
-                orderId: fillOrderId,
+                runningPnL: leg.entryPrice - leg.exitPrice,
               });
+            }
 
-              state.updatedAt = new Date().toISOString();
-              await saveStraddleState(state, state.date);
-
-              const msg = `${leg.legType} (${leg.symbol}) closed by venue stop order at $${leg.exitPrice.toFixed(2)}.`;
-              appendAlert('leg_closed_venue', msg, {
-                symbol: leg.symbol,
-                leg: leg.legType,
-                exitPrice: leg.exitPrice,
-                orderId: fillOrderId,
-              });
-
-              if (notifier) {
-                void notifier.notifyLegClosed({
-                  legType: leg.legType,
-                  symbol: leg.symbol,
-                  reason: 'SL_HIT',
-                  exitPrice: leg.exitPrice,
-                  runningPnL: leg.entryPrice - leg.exitPrice,
-                });
-              }
-
-              // Cost stop rule (§1): When one leg's SL is hit, move the surviving leg's stop to COST
-              const otherLeg = leg.legType === 'CALL' ? state.putLeg : state.callLeg;
-              if (
-                config.riskConfig.costStopEnabled !== false &&
-                otherLeg.status === 'open' &&
-                otherLeg.confirmedOpen
-              ) {
-                const otherExpiry = parseContractExpiryDate(otherLeg.symbol, config.dailyExpiryHourUTC);
-                const otherExpired = otherExpiry !== null && Date.now() >= otherExpiry.getTime();
-                if (!otherExpired) {
-                  console.log(
-                    `[Risk Manager] 🛡️ Triggering cost stop on surviving leg ${otherLeg.legType} (${otherLeg.symbol}) after ${leg.legType} SL hit.`
-                  );
-                  void moveStopToCostOnSurvivingLeg(
-                    client,
-                    otherLeg,
-                    state,
-                    config,
-                    notifier
-                  );
-                }
-              }
-            } else {
-              // C. Leg is still open on venue: Verify stop order is armed
-              const stopCheck = verifyStopOrderArmed(venueOrders, leg);
-              if (!stopCheck.armed) {
-                const stopAlertMsg = `STOP ORDER ALERT for ${leg.legType} (${leg.symbol}): ${stopCheck.message || 'Not armed'}`;
-                console.error(`[Risk Manager] 🚨 ${stopAlertMsg}`);
-                appendAlert(
-                  stopCheck.reason === 'MISSING' ? 'stop_missing' : 'stop_mismatch',
-                  stopAlertMsg,
-                  {
-                    symbol: leg.symbol,
-                    leg: leg.legType,
-                    reason: stopCheck.reason,
-                    expectedTrigger: leg.stopLossPrice,
-                  },
-                  { dedupKey: `stop_alert:${leg.symbol}:${stopCheck.reason}` }
+            // Cost stop rule: When one leg's SL is hit, move the surviving leg's stop to COST
+            const otherLeg = leg.legType === 'CALL' ? state.putLeg : state.callLeg;
+            if (
+              config.riskConfig.costStopEnabled !== false &&
+              otherLeg.status === 'open' &&
+              otherLeg.confirmedOpen
+            ) {
+              const otherExpiry = parseContractExpiryDate(otherLeg.symbol, config.dailyExpiryHourUTC);
+              const otherExpired = otherExpiry !== null && Date.now() >= otherExpiry.getTime();
+              if (!otherExpired) {
+                console.log(
+                  `[Risk Manager] 🛡️ Triggering cost stop on surviving leg ${otherLeg.legType} (${otherLeg.symbol}) after ${leg.legType} SL hit.`
                 );
-                if (notifier) {
-                  void notifier.notifyError(
-                    `Stop Order Alert (${leg.symbol})`,
-                    new Error(stopAlertMsg)
-                  );
-                }
+                void moveStopToCostOnSurvivingLeg(
+                  client,
+                  otherLeg,
+                  state,
+                  config,
+                  notifier
+                );
+              }
+            }
+          }
 
-                // If stop is missing, re-arm it automatically (naked-leg risk mitigation)
-                if (stopCheck.reason === 'MISSING') {
-                  void rearmStopOrderIfMissing(
-                    client,
-                    leg,
-                    venueOrders,
-                    config,
-                    cycleExpiryStr,
-                    notifier
-                  );
-                }
+          // C. Verify armed stop order for any legs that remain open
+          for (const leg of [state.callLeg, state.putLeg]) {
+            if (leg.status !== 'open') continue;
+            const stopCheck = verifyStopOrderArmed(venueOrders, leg);
+            if (!stopCheck.armed) {
+              const stopAlertMsg = `STOP ORDER ALERT for ${leg.legType} (${leg.symbol}): ${stopCheck.message || 'Not armed'}`;
+              console.error(`[Risk Manager] 🚨 ${stopAlertMsg}`);
+              appendAlert(
+                stopCheck.reason === 'MISSING' ? 'stop_missing' : 'stop_mismatch',
+                stopAlertMsg,
+                {
+                  symbol: leg.symbol,
+                  leg: leg.legType,
+                  reason: stopCheck.reason,
+                  expectedTrigger: leg.stopLossPrice,
+                },
+                { dedupKey: `stop_alert:${leg.symbol}:${stopCheck.reason}` }
+              );
+              if (notifier) {
+                void notifier.notifyError(
+                  `Stop Order Alert (${leg.symbol})`,
+                  new Error(stopAlertMsg)
+                );
+              }
+
+              // If stop is missing, re-arm it automatically (naked-leg risk mitigation)
+              if (stopCheck.reason === 'MISSING') {
+                void rearmStopOrderIfMissing(
+                  client,
+                  leg,
+                  venueOrders,
+                  config,
+                  cycleExpiryStr,
+                  notifier,
+                  state
+                );
               }
             }
           }

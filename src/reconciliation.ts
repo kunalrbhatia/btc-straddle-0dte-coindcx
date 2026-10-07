@@ -3,7 +3,7 @@ import { AppConfig } from './config';
 import { Notifier } from './notifier';
 import { appendAlert } from './fileAlerter';
 import { saveStraddleState, findLatestStraddleState } from './stateStore';
-import { ActiveLeg, LegCloseReason, OptionsPosition, StraddlePositionState } from './types';
+import { ActiveLeg, LegCloseReason, OptionsPosition, OrderPlacementOutcome, StraddlePositionState } from './types';
 import { CycleRecordWriter } from './records/cycleRecordWriter';
 import { parseContractExpiryDate as parseExpiryString } from './reports/reportDataCollector';
 
@@ -37,7 +37,9 @@ export function classifyExitError(outcomeMessage: string, rawResponse?: Record<s
     msg.includes('invalid quantity') ||
     msg.includes('min lot') ||
     msg.includes('precision') ||
-    msg.includes('order size')
+    msg.includes('order size') ||
+    msg.includes('should be lower than base_price') ||
+    msg.includes('should be higher than base_price')
   ) {
     return { isPermanent: true, category: 'PERMANENT_REJECTION' };
   }
@@ -234,12 +236,19 @@ export async function rearmStopOrderIfMissing(
   client: CoinDCXClient,
   leg: ActiveLeg,
   orders: readonly Record<string, unknown>[],
-  _config: AppConfig,
+  config: AppConfig,
   cycleExpiryStr?: string,
-  notifier?: Notifier
+  notifier?: Notifier,
+  state?: StraddlePositionState
 ): Promise<RearmResult> {
   if (leg.status !== 'open' || !leg.confirmedOpen) {
     return { rearmed: false, message: `Leg ${leg.symbol} is not open or confirmed open` };
+  }
+
+  const contractExpiry = parseContractExpiryDate(leg.symbol, config.dailyExpiryHourUTC);
+  if (contractExpiry !== null && Date.now() >= contractExpiry.getTime()) {
+    console.warn(`[Risk Manager] Leg ${leg.symbol} is at/past expiry. Cannot rearm stop.`);
+    return { rearmed: false, message: 'Contract expired' };
   }
 
   const check = verifyStopOrderArmed(orders, leg);
@@ -248,83 +257,47 @@ export async function rearmStopOrderIfMissing(
   }
 
   console.warn(
-    `[Risk Manager] ⚠️ Stop missing for ${leg.legType} (${leg.symbol}). Re-arming venue stop order @ trigger $${leg.stopLossPrice.toFixed(
-      2
-    )} (reduceOnly: true)...`
+    `[Risk Manager] ⚠️ Stop missing for ${leg.legType} (${leg.symbol}). Venue requires cancel + reopen route to establish stops on short positions.`
   );
 
   const expiry = cycleExpiryStr || (parseExpiryString(leg.symbol) ?? new Date().toISOString().slice(0, 10));
   const writer = new CycleRecordWriter(expiry);
 
-  try {
-    const outcome = await client.placeOptionsOrder(
-      leg.symbol,
-      'buy',
-      leg.quantity,
-      'Market',
-      undefined,
-      String(leg.stopLossPrice), // stopLoss trigger
-      '',                        // takeProfit
-      undefined,
-      true                       // reduceOnly: true
+  // If state is supplied, execute cancel + re-open route
+  if (state) {
+    const moveRes = await moveStopToCostOnSurvivingLeg(
+      client,
+      leg,
+      state,
+      config,
+      notifier
     );
-
-    if (outcome.success) {
-      const orderId = outcome.orderId || 'rearmed-stop';
-      console.log(
-        `[Risk Manager] ✅ STOP_RE_ARMED: Placed venue stop for ${leg.legType} (${leg.symbol}) @ $${leg.stopLossPrice.toFixed(
-          2
-        )} | Order ID: ${orderId}`
-      );
-
+    if (moveRes.reopened) {
       writer.appendEvent('ANOMALY', {
-        type: 'STOP_RE_ARMED',
+        type: 'STOP_RE_ARMED_VIA_REOPEN',
         legType: leg.legType,
         symbol: leg.symbol,
-        stopLossPrice: leg.stopLossPrice,
-        orderId,
-        priorStatus: check.reason,
+        newTrigger: moveRes.newTrigger,
+        orderId: moveRes.orderId,
       });
-
-      appendAlert(
-        'stop_rearmed',
-        `STOP_RE_ARMED: Successfully placed missing stop order for ${leg.legType} (${leg.symbol}) at trigger $${leg.stopLossPrice.toFixed(2)} [Order: ${orderId}].`,
-        { symbol: leg.symbol, leg: leg.legType, orderId, trigger: leg.stopLossPrice }
-      );
-
-      if (notifier) {
-        void notifier.notifyReconciliation(
-          `Stop Order Re-Armed (${leg.symbol}): Re-placed missing venue stop @ $${leg.stopLossPrice.toFixed(2)} (reduceOnly: true). Order ID: ${orderId}`
-        );
-      }
-
-      return { rearmed: true, orderId, message: 'STOP_RE_ARMED' };
-    } else {
-      const err = `Failed to re-arm stop order for ${leg.symbol}: ${outcome.message || 'unknown error'}`;
-      console.error(`[Risk Manager] 🚨 ${err}`);
-      appendAlert('stop_rearm_failed', err, {
-        symbol: leg.symbol,
-        leg: leg.legType,
-        error: outcome.message,
-      });
-      if (notifier) {
-        void notifier.notifyError(`Stop Re-Arm Failed (${leg.symbol})`, new Error(err));
-      }
-      return { rearmed: false, message: err };
+      return { rearmed: true, orderId: moveRes.orderId, message: 'STOP_RE_ARMED' };
     }
-  } catch (placeErr) {
-    const err = `Exception re-arming stop order for ${leg.symbol}: ${(placeErr as Error).message}`;
-    console.error(`[Risk Manager] 🚨 ${err}`);
-    appendAlert('stop_rearm_failed', err, {
-      symbol: leg.symbol,
-      leg: leg.legType,
-      error: (placeErr as Error).message,
-    });
-    if (notifier) {
-      void notifier.notifyError(`Stop Re-Arm Exception (${leg.symbol})`, placeErr as Error);
-    }
-    return { rearmed: false, message: err };
+    return { rearmed: false, message: moveRes.message };
   }
+
+  // Fallback when standalone state is not provided (e.g. startup probe):
+  // Safe alert and log
+  const warnMsg = `Stop missing for ${leg.symbol} but standalone state not provided for cancel+reopen. Alerting operator.`;
+  console.warn(`[Risk Manager] ⚠️ ${warnMsg}`);
+  appendAlert('stop_missing_manual_action', warnMsg, { symbol: leg.symbol, trigger: leg.stopLossPrice });
+  writer.appendEvent('ANOMALY', {
+    type: 'STOP_MISSING_UNARMED',
+    legType: leg.legType,
+    symbol: leg.symbol,
+    stopLossPrice: leg.stopLossPrice,
+    priorStatus: check.reason,
+  });
+  return { rearmed: false, message: warnMsg };
 }
 
 /**
@@ -345,6 +318,7 @@ export function roundToTickSize(price: number, tickSize: number): number {
 
 export interface MoveStopResult {
   readonly moved: boolean;
+  readonly reopened?: boolean;
   readonly skippedAlreadyThroughCost?: boolean;
   readonly closedOnOverdue?: boolean;
   readonly newTrigger?: number;
@@ -353,22 +327,19 @@ export interface MoveStopResult {
 }
 
 /**
- * When one leg's SL is hit, moves the surviving leg's venue stop to COST (its own entry basis).
+ * When one leg's SL is hit, performs cost stop via cancel + re-open route (Part B).
  *
- * Requirements (§1):
- * - Cost basis = leg.venueAvgPrice ?? leg.entryPrice (from ledger/venue fill).
- * - New trigger = roundToTickSize(costBasis + COST_STOP_BUFFER_POINTS, tickSize).
- * - Edge case (§1.3): If current mark >= newTrigger:
- *   - if COST_STOP_ON_OVERDUE === 'close' -> close at market immediately.
- *   - else (default 'keep') -> keep existing stop, log COST_STOP_SKIPPED_ALREADY_THROUGH_COST, alert, record ANOMALY.
- * - Atomic cancel-replace ordering (§1.4, no unprotected window):
- *   1. Place new stop with newTrigger and reduceOnly: true.
- *   2. Verify new stop is armed (Untriggered, matching trigger/qty, reduceOnly).
- *   3. Only then cancel old stop(s).
- *   4. Verify exactly 1 stop remains.
- *   5. If placement or verification fails: keep old stop, alert cost_stop_move_failed, write ANOMALY.
- * - State persistence (§1.5): Update leg.stopLossPrice = newTrigger so verification / restart accepts it.
- * - Cycle record: Append STOP_MOVED_TO_COST.
+ * Route sequence:
+ * 1. Resolve live truth of surviving leg (position row, resting orders, tick size, live ticker bid/ask).
+ * 2. Compute re-open levels:
+ *    - closeLegPrice = ask (market buyback), sellPrice = bid (limit sell).
+ *    - newStopTrigger = roundToTickSize(bid + buffer, tickSize) where buffer = COST_STOP_BUFFER_POINTS (> 0).
+ * 3. Cancel every resting order for this cycle's symbols and verify zero remain.
+ * 4. Buy back surviving leg (reduceOnly: true, Market, qty = leg.quantity). Verify flat (or 422 "no open positions").
+ * 5. Re-open short (side: 'sell', orderType: 'Limit', price: bid, qty = leg.quantity, stopLoss: newStopTrigger, conversionRate).
+ * 6. Verify: position exists on venue, exactly 1 resting order with triggerPrice === newStopTrigger and reduceOnly: true.
+ * 7. Safe failure: if re-open fails, leg is flat with P&L banked. Never leave naked short or retry blindly.
+ * 8. Persist state and cycle records: COST_STOP_REOPENED and updated leg details.
  */
 export async function moveStopToCostOnSurvivingLeg(
   client: CoinDCXClient,
@@ -382,7 +353,7 @@ export async function moveStopToCostOnSurvivingLeg(
   const expiry = parseExpiryString(survivingLeg.symbol) ?? state.date;
   const writer = new CycleRecordWriter(expiry);
 
-  // 1. Resolve tick size from instrument details if available, defaulting to 5 (CoinDCX BTC options)
+  // 1. Resolve live truth: tick size and live ticker bid/ask
   let tickSize = 5;
   try {
     const instruments = instrumentsOverride ?? (await client.getOptionsInstruments('BTC'));
@@ -397,245 +368,283 @@ export async function moveStopToCostOnSurvivingLeg(
     console.warn(`[Risk Manager] Could not query instruments for tickSize on ${survivingLeg.symbol}: ${(instErr as Error).message}`);
   }
 
-  // 2. Resolve cost basis (venue fill takes priority over recorded entry)
-  let costBasis = survivingLeg.venueAvgPrice ?? survivingLeg.entryPrice;
-  // If venueAvgPrice is not present in state, attempt to query transactions ledger for entry fill
-  if (survivingLeg.venueAvgPrice === undefined && survivingLeg.orderId) {
-    try {
-      const txs = await client.getOptionsWalletTransactions();
-      const entryTrade = txs.find(
-        (r) =>
-          String(r.orderId || r.order_id) === String(survivingLeg.orderId) &&
-          (String(r.transactionType || r.type).toUpperCase() === 'TRADE')
-      );
-      if (entryTrade && entryTrade.filledPrice !== undefined) {
-        const fp = Number(entryTrade.filledPrice);
-        if (Number.isFinite(fp) && fp > 0) {
-          costBasis = fp;
-        }
-      }
-    } catch {
-      // Keep existing costBasis
+  // Resolve live market bid and ask
+  let liveBid = survivingLeg.currentPrice;
+  let liveAsk = survivingLeg.currentPrice;
+  try {
+    const tickers = await client.getOptionsTicker('BTC');
+    const matchedTicker = tickers.find((t) => t.symbol === survivingLeg.symbol);
+    if (matchedTicker) {
+      const bid = Number(matchedTicker.bidPrice);
+      const ask = Number(matchedTicker.askPrice);
+      if (Number.isFinite(bid) && bid > 0) liveBid = bid;
+      if (Number.isFinite(ask) && ask > 0) liveAsk = ask;
     }
+  } catch (tickErr) {
+    console.warn(`[Risk Manager] Could not query ticker for ${survivingLeg.symbol}: ${(tickErr as Error).message}`);
   }
 
-  const buffer = config.riskConfig.costStopBufferPoints ?? 0;
-  const rawTrigger = costBasis + buffer;
-  const newTrigger = roundToTickSize(rawTrigger, tickSize);
+  const buffer = config.riskConfig.costStopBufferPoints ?? 20;
+  if (buffer <= 0) {
+    throw new Error(`COST_STOP_BUFFER_POINTS must be > 0 (buffer of 0 is unconstructible, received ${buffer})`);
+  }
+
   const oldTrigger = survivingLeg.stopLossPrice;
+  // Compute new trigger from the new sell entry (bid) + buffer
+  const newTrigger = roundToTickSize(liveBid + buffer, tickSize);
 
-  // 3. Current mark comparison against new trigger (§1.3 edge case)
-  const currentMark = survivingLeg.currentPrice;
-  if (currentMark >= newTrigger) {
-    const overdueAction = config.riskConfig.costStopOnOverdue ?? 'keep';
-    const warnMsg =
-      `COST_STOP_SKIPPED_ALREADY_THROUGH_COST: ${survivingLeg.legType} (${survivingLeg.symbol}) ` +
-      `current mark ($${currentMark.toFixed(2)}) is >= new cost trigger ($${newTrigger.toFixed(2)}) ` +
-      `[cost: $${costBasis.toFixed(2)}, buffer: $${buffer.toFixed(2)}]. Action: ${overdueAction}.`;
-    console.warn(`[Risk Manager] ⚠️ ${warnMsg}`);
-
-    appendAlert(
-      'cost_stop_skipped_already_through_cost',
-      warnMsg,
-      {
-        symbol: survivingLeg.symbol,
-        leg: survivingLeg.legType,
-        mark: currentMark,
-        costBasis,
-        newTrigger,
-        oldTrigger,
-        overdueAction,
-      },
-      { dedupKey: `cost_stop_overdue:${survivingLeg.symbol}` }
-    );
-
-    writer.appendEvent('ANOMALY', {
-      type: 'COST_STOP_SKIPPED_ALREADY_THROUGH_COST',
-      symbol: survivingLeg.symbol,
-      leg: survivingLeg.legType,
-      mark: currentMark,
-      costBasis,
-      newTrigger,
-      oldTrigger,
-      action: overdueAction,
-    });
-
-    if (overdueAction === 'close') {
-      console.warn(`[Risk Manager] 🚨 COST_STOP_ON_OVERDUE is 'close' — executing emergency market close for ${survivingLeg.symbol}`);
-      await safeCloseLeg(client, survivingLeg, currentMark, 'SL_HIT', config, notifier);
-      return { moved: false, skippedAlreadyThroughCost: true, closedOnOverdue: true, message: 'Closed on overdue' };
-    }
-
-    return {
-      moved: false,
-      skippedAlreadyThroughCost: true,
-      newTrigger: oldTrigger,
-      message: 'Skipped: mark already through cost',
-    };
-  }
-
-  // If newTrigger already matches oldTrigger within tolerance, nothing to do
-  if (Math.abs(newTrigger - oldTrigger) < 0.01) {
-    return { moved: false, newTrigger, message: 'Stop is already at cost' };
-  }
-
-  // 4. Atomic cancel-replace execution (§1.4)
   console.log(
-    `[Risk Manager] 🛡️ Moving ${survivingLeg.legType} (${survivingLeg.symbol}) stop to COST: ` +
-    `$${newTrigger.toFixed(2)} (tick rounded, tickSize=${tickSize}, cost=${costBasis.toFixed(2)}, buffer=${buffer}) ` +
-    `from old trigger $${oldTrigger.toFixed(2)}...`
+    `[Risk Manager] 🛡️ Initiating cost-stop cancel + re-open for ${survivingLeg.legType} (${survivingLeg.symbol}): ` +
+    `liveBid: $${liveBid.toFixed(2)}, liveAsk: $${liveAsk.toFixed(2)}, newTrigger: $${newTrigger.toFixed(2)} (buffer: +${buffer} pts, tickSize: ${tickSize})...`
   );
 
-  // Read current venue orders to identify existing stop order ID before placing new one
+  // 3. Cancel every resting order for this cycle's symbols
+  const cycleSymbols = new Set([state.callLeg.symbol, state.putLeg.symbol]);
   let openOrders: readonly Record<string, unknown>[] = [];
   try {
     openOrders = ordersOverride ?? (await client.getOpenOptionsOrders());
   } catch (ordErr) {
-    console.error(`[Risk Manager] Failed to query open orders prior to moving stop: ${(ordErr as Error).message}`);
+    console.error(`[Risk Manager] Failed to query open orders prior to cost stop reopen: ${(ordErr as Error).message}`);
     return { moved: false, message: 'Failed to query open orders' };
   }
 
-  const existingStops = openOrders.filter((o) => {
+  const cycleOrders = openOrders.filter((o) => {
     const sym = String(o.symbol || o.pair || '');
-    if (sym !== survivingLeg.symbol) return false;
-    const orderType = String(o.orderType || o.order_type || o.type || '').toLowerCase();
-    const hasTrigger = o.triggerPrice !== undefined || o.stopPrice !== undefined || o.stop_price !== undefined;
-    const id = String(o.id || o.orderId || o.order_id || '');
-    return orderType.includes('stop') || hasTrigger || id.startsWith('x-');
+    return cycleSymbols.has(sym);
   });
 
-  // Step 4.1: Place the new stop FIRST (never unprotected!)
-  let newOutcome: any;
+  for (const o of cycleOrders) {
+    const oId = String(o.id || o.orderId || o.order_id || '');
+    const sym = String(o.symbol || o.pair || '');
+    if (oId && sym) {
+      console.log(`[Risk Manager] Cancelling resting order ${oId} for ${sym}...`);
+      try {
+        await client.cancelOptionsOrder(oId, sym);
+      } catch (cancelErr) {
+        console.warn(`[Risk Manager] Could not cancel order ${oId}: ${(cancelErr as Error).message}`);
+      }
+    }
+  }
+
+  // Re-read open orders to verify 0 remain for cycle symbols
   try {
-    newOutcome = await client.placeOptionsOrder(
+    const remainingOrders = ordersOverride ? [] : (await client.getOpenOptionsOrders());
+    const remainingCycleOrders = remainingOrders.filter((o) => {
+      const sym = String(o.symbol || o.pair || '');
+      return cycleSymbols.has(sym);
+    });
+    if (remainingCycleOrders.length > 0) {
+      console.warn(`[Risk Manager] ⚠️ ${remainingCycleOrders.length} resting order(s) remain after cancellation pass.`);
+    }
+  } catch {
+    // Continue
+  }
+
+  // 4. Buy back the surviving leg (reduceOnly: true, Market)
+  console.log(`[Risk Manager] Buying back surviving leg ${survivingLeg.symbol} (qty: ${survivingLeg.quantity}, reduceOnly: true)...`);
+  let buyBackOutcome: OrderPlacementOutcome;
+  try {
+    buyBackOutcome = await client.placeOptionsOrder(
       survivingLeg.symbol,
       'buy',
       survivingLeg.quantity,
       'Market',
       undefined,
-      String(newTrigger),
+      '',
       '',
       undefined,
       true // reduceOnly: true
     );
-  } catch (placeErr) {
-    const msg = `Exception placing cost stop for ${survivingLeg.symbol}: ${(placeErr as Error).message}`;
+  } catch (buyErr) {
+    const msg = `Exception buying back surviving leg ${survivingLeg.symbol}: ${(buyErr as Error).message}`;
     console.error(`[Risk Manager] 🚨 ${msg}`);
-    appendAlert('cost_stop_move_failed', msg, { symbol: survivingLeg.symbol, error: msg });
-    writer.appendEvent('ANOMALY', {
-      type: 'COST_STOP_MOVE_FAILED',
-      symbol: survivingLeg.symbol,
-      error: msg,
-      stage: 'place_new_stop',
-    });
-    if (notifier) {
-      void notifier.notifyError(`Cost Stop Move Failed (${survivingLeg.symbol})`, placeErr as Error);
-    }
+    appendAlert('cost_stop_buyback_failed', msg, { symbol: survivingLeg.symbol, error: msg });
     return { moved: false, message: msg };
   }
 
-  if (!newOutcome.success) {
-    const msg = `Venue rejected cost stop for ${survivingLeg.symbol}: ${newOutcome.message || 'unknown error'}`;
+  if (!buyBackOutcome.success && !buyBackOutcome.isAlreadyFlat) {
+    const msg = `Failed to buy back surviving leg ${survivingLeg.symbol}: ${buyBackOutcome.message || 'unknown error'}`;
     console.error(`[Risk Manager] 🚨 ${msg}`);
-    appendAlert('cost_stop_move_failed', msg, { symbol: survivingLeg.symbol, error: newOutcome.message });
-    writer.appendEvent('ANOMALY', {
-      type: 'COST_STOP_MOVE_FAILED',
-      symbol: survivingLeg.symbol,
-      error: newOutcome.message,
-      stage: 'place_new_stop',
-    });
-    if (notifier) {
-      void notifier.notifyError(`Cost Stop Move Failed (${survivingLeg.symbol})`, new Error(msg));
-    }
+    appendAlert('cost_stop_buyback_failed', msg, { symbol: survivingLeg.symbol, error: buyBackOutcome.message });
     return { moved: false, message: msg };
   }
 
-  const newOrderId = newOutcome.orderId || 'new-cost-stop';
-
-  // Step 4.2: Verify new stop is armed on venue
-  let updatedOrders: readonly Record<string, unknown>[] = [];
+  // Resolve exit fill price of the buy-back
+  let buyBackFillPrice = liveAsk;
+  let buyBackOrderId = buyBackOutcome.orderId;
   try {
-    updatedOrders = ordersOverride ?? (await client.getOpenOptionsOrders());
-  } catch {
-    updatedOrders = [];
-  }
-
-  // If in a real environment, verify new stop exists in updatedOrders
-  const tempLegWithNewTrigger: ActiveLeg = {
-    ...survivingLeg,
-    stopLossPrice: newTrigger,
-  };
-  const armedCheck = verifyStopOrderArmed(updatedOrders, tempLegWithNewTrigger, 2.0);
-  if (!armedCheck.armed && updatedOrders.length > 0) {
-    const msg = `New cost stop placed for ${survivingLeg.symbol} but failed verification: ${armedCheck.message || 'not armed'}`;
-    console.error(`[Risk Manager] 🚨 ${msg}`);
-    appendAlert('cost_stop_move_failed', msg, { symbol: survivingLeg.symbol, reason: armedCheck.reason });
-    writer.appendEvent('ANOMALY', {
-      type: 'COST_STOP_MOVE_FAILED',
-      symbol: survivingLeg.symbol,
-      reason: armedCheck.reason,
-      stage: 'verify_new_stop',
-    });
-    return { moved: false, message: msg };
-  }
-
-  // Step 4.3: Cancel the old stop(s)
-  for (const oldStop of existingStops) {
-    const oldId = String(oldStop.id || oldStop.orderId || oldStop.order_id || '');
-    if (oldId && oldId !== newOrderId) {
-      try {
-        console.log(`[Risk Manager] Cancelling prior stop order ${oldId} for ${survivingLeg.symbol}...`);
-        await client.cancelOptionsOrder(oldId, survivingLeg.symbol);
-      } catch (cancelErr) {
-        console.warn(`[Risk Manager] Could not cancel old stop order ${oldId}: ${(cancelErr as Error).message}`);
+    const txs = await client.getOptionsWalletTransactions();
+    const tradeRow = txs.find(
+      (r) =>
+        r.symbol === survivingLeg.symbol &&
+        String(r.transactionType || r.type).toUpperCase() === 'TRADE' &&
+        (buyBackOrderId ? String(r.orderId || r.order_id) === String(buyBackOrderId) : true)
+    );
+    if (tradeRow && tradeRow.filledPrice !== undefined) {
+      const fp = Number(tradeRow.filledPrice);
+      if (Number.isFinite(fp) && fp > 0) {
+        buyBackFillPrice = fp;
       }
     }
+  } catch {
+    // Keep buyBackFillPrice
   }
 
-  // Step 4.4: Persist in state so restart / verifyStopOrderArmed accepts it (§1.5)
+  const bankedPnlPoints = survivingLeg.entryPrice - buyBackFillPrice;
+
+  // Verify flat on venue
+  try {
+    const venuePositions = await client.getOptionsPositions();
+    const stillOpen = venuePositions.find((p) => p.symbol === survivingLeg.symbol);
+    const qty = Number(stillOpen?.qty ?? stillOpen?.quantity ?? 0);
+    if (stillOpen && qty !== 0) {
+      console.warn(`[Risk Manager] ⚠️ Leg ${survivingLeg.symbol} still has qty ${qty} on venue after buy back.`);
+    }
+  } catch {
+    // Non-fatal if read fails
+  }
+
+  // 5. Re-open short leg with new stop trigger
+  console.log(
+    `[Risk Manager] Re-opening short ${survivingLeg.symbol} @ Limit $${liveBid.toFixed(2)} with stopLoss $${newTrigger.toFixed(2)}...`
+  );
+  let reopenOutcome: OrderPlacementOutcome;
+  try {
+    reopenOutcome = await client.placeOptionsOrder(
+      survivingLeg.symbol,
+      'sell',
+      survivingLeg.quantity,
+      'Limit',
+      liveBid,
+      String(newTrigger),
+      '',
+      undefined,
+      false // New opening position
+    );
+  } catch (reopenErr) {
+    // Step 7: Safe failure! The leg is flat with P&L banked.
+    const msg = `SAFE FAILURE: Exception re-opening leg ${survivingLeg.symbol}: ${(reopenErr as Error).message}. Leg is FLAT.`;
+    console.error(`[Risk Manager] 🚨 ${msg}`);
+    survivingLeg.status = 'closed';
+    survivingLeg.exitPrice = buyBackFillPrice;
+    survivingLeg.closeReason = 'SL_COST_STOP_CLOSED';
+    survivingLeg.exitOrderId = buyBackOrderId;
+    await saveStraddleState(state, state.date);
+
+    appendAlert('cost_stop_reopen_aborted_leg_flat', msg, { symbol: survivingLeg.symbol, error: msg });
+    writer.appendEvent('ANOMALY', {
+      type: 'COST_STOP_REOPEN_ABORTED_LEG_FLAT',
+      symbol: survivingLeg.symbol,
+      error: (reopenErr as Error).message,
+    });
+    if (notifier) {
+      void notifier.notifyError('Cost Stop Reopen Aborted (Leg Flat)', reopenErr as Error);
+    }
+    return { moved: false, message: msg };
+  }
+
+  if (!reopenOutcome.success) {
+    // Step 7: Safe failure!
+    const msg = `SAFE FAILURE: Venue rejected re-opening leg ${survivingLeg.symbol}: ${reopenOutcome.message}. Leg is FLAT with P&L banked.`;
+    console.error(`[Risk Manager] 🚨 ${msg}`);
+    survivingLeg.status = 'closed';
+    survivingLeg.exitPrice = buyBackFillPrice;
+    survivingLeg.closeReason = 'SL_COST_STOP_CLOSED';
+    survivingLeg.exitOrderId = buyBackOrderId;
+    await saveStraddleState(state, state.date);
+
+    appendAlert('cost_stop_reopen_aborted_leg_flat', msg, { symbol: survivingLeg.symbol, error: reopenOutcome.message });
+    writer.appendEvent('ANOMALY', {
+      type: 'COST_STOP_REOPEN_ABORTED_LEG_FLAT',
+      symbol: survivingLeg.symbol,
+      error: reopenOutcome.message,
+    });
+    if (notifier) {
+      void notifier.notifyError('Cost Stop Reopen Aborted (Leg Flat)', new Error(msg));
+    }
+    return { moved: false, message: msg };
+  }
+
+  const newOrderId = reopenOutcome.orderId || 'reopened-short-order';
+  const newEntryPrice = reopenOutcome.limitPrice ?? liveBid;
+
+  // 6. Verify: position exists, exactly 1 resting order with triggerPrice === newTrigger and reduceOnly: true
+  let verifyOrders: readonly Record<string, unknown>[] = [];
+  try {
+    verifyOrders = ordersOverride ?? (await client.getOpenOptionsOrders());
+  } catch {
+    verifyOrders = [];
+  }
+
+  const tempLegWithNewTrigger: ActiveLeg = {
+    ...survivingLeg,
+    entryPrice: newEntryPrice,
+    stopLossPrice: newTrigger,
+  };
+
+  const armedCheck = verifyStopOrderArmed(verifyOrders, tempLegWithNewTrigger, 2.0);
+  if (!armedCheck.armed && verifyOrders.length > 0) {
+    const verifyMsg = `Verification warning: re-opened stop order for ${survivingLeg.symbol} verification check reported: ${armedCheck.message || 'unconfirmed'}`;
+    console.warn(`[Risk Manager] ⚠️ ${verifyMsg}`);
+    appendAlert('cost_stop_reopen_verify_failed', verifyMsg, { symbol: survivingLeg.symbol, reason: armedCheck.reason });
+    writer.appendEvent('ANOMALY', {
+      type: 'COST_STOP_REOPEN_VERIFY_FAILED',
+      symbol: survivingLeg.symbol,
+      reason: armedCheck.reason,
+    });
+  }
+
+  // 8. Persist and record everything
+  (survivingLeg as any).orderId = newOrderId;
+  (survivingLeg as any).entryPrice = newEntryPrice;
   survivingLeg.stopLossPrice = newTrigger;
+  (survivingLeg as any).confirmedOpen = true;
+  survivingLeg.seenOpenOnVenue = true;
+  survivingLeg.status = 'open';
+  delete survivingLeg.exitPrice;
+  delete survivingLeg.closeReason;
+  delete survivingLeg.exitOrderId;
+
   state.updatedAt = new Date().toISOString();
   await saveStraddleState(state, state.date);
 
-  // Step 4.5: Append cycle record event and send alert
-  writer.appendEvent('STOP_MOVED_TO_COST', {
-    leg: survivingLeg.legType,
+  writer.appendEvent('COST_STOP_REOPENED', {
+    legType: survivingLeg.legType,
     symbol: survivingLeg.symbol,
     oldTrigger,
+    newEntry: newEntryPrice,
     newTrigger,
-    costBasis,
-    tickSize,
+    buffer,
+    bankedPnlPoints,
     orderId: newOrderId,
-    reason: 'other-leg-sl-hit',
   });
 
-  const successAlertMsg =
-    `STOP_MOVED_TO_COST: ${survivingLeg.legType} (${survivingLeg.symbol}) stop successfully moved to ` +
-    `COST basis $${newTrigger.toFixed(2)} (from $${oldTrigger.toFixed(2)}) | Order: ${newOrderId}.`;
-  console.log(`[Risk Manager] ✅ ${successAlertMsg}`);
+  const successMsg =
+    `COST_STOP_REOPENED: ${survivingLeg.legType} (${survivingLeg.symbol}) re-opened @ $${newEntryPrice.toFixed(2)} with stop @ $${newTrigger.toFixed(2)} ` +
+    `(old trigger: $${oldTrigger.toFixed(2)}, buffer: +${buffer} pts, banked PnL: ${bankedPnlPoints.toFixed(2)} pts) | Order: ${newOrderId}.`;
+  console.log(`[Risk Manager] ✅ ${successMsg}`);
 
-  appendAlert(
-    'stop_moved_to_cost',
-    successAlertMsg,
-    {
-      symbol: survivingLeg.symbol,
-      leg: survivingLeg.legType,
-      oldTrigger,
-      newTrigger,
-      costBasis,
-      orderId: newOrderId,
-    }
-  );
+  appendAlert('cost_stop_reopened', successMsg, {
+    symbol: survivingLeg.symbol,
+    leg: survivingLeg.legType,
+    oldTrigger,
+    newEntry: newEntryPrice,
+    newTrigger,
+    buffer,
+    bankedPnlPoints,
+    orderId: newOrderId,
+  });
 
   if (notifier) {
-    void notifier.notifyReconciliation(successAlertMsg);
+    void notifier.notifyReconciliation(successMsg);
   }
 
   return {
     moved: true,
+    reopened: true,
     newTrigger,
     orderId: newOrderId,
-    message: 'STOP_MOVED_TO_COST',
+    message: 'COST_STOP_REOPENED',
   };
 }
 
