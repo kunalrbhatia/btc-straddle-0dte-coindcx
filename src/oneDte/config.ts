@@ -35,6 +35,10 @@ export interface OneDteConfig {
   readonly stopLossMultiplier: number; // 2.0 = 100% loss (stop at 2x premium)
   readonly pollIntervalMs: number;
   readonly slOverrunTolerance: number;
+
+  // Profit target: close the cycle once this share of the credit sold has been earned
+  // (0.5 = exit as soon as the combined gain reaches 50% of the total credit).
+  readonly profitTargetRatio: number;
 }
 
 function getEnvNumber(key: string, defaultValue: number): number {
@@ -89,4 +93,7 @@ export const oneDteConfig: OneDteConfig = {
   stopLossMultiplier: getEnvNumber('ONEDTE_SL_MULTIPLIER', 2.0),
   pollIntervalMs: getEnvNumber('ONEDTE_POLL_INTERVAL_MS', 3000),
   slOverrunTolerance: getEnvNumber('SL_OVERRUN_TOLERANCE', 0.10),
+
+  // Exit once this share of the credit sold has been earned (0.5 = 50%).
+  profitTargetRatio: getEnvNumber('ONEDTE_PROFIT_TARGET_RATIO', 0.5),
 };

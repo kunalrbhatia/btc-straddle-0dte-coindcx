@@ -4,15 +4,42 @@ import { OneDteConfig } from './config';
 import { OneDtePositionState, OneDteLeg } from './types';
 import { saveOneDteState } from './stateStore';
 
+/**
+ * Combined gain of the cycle so far, in points: (entry - current) for each open leg and
+ * (entry - exit) for each closed leg.
+ *
+ * Returns null when any leg's price is unknown, so the profit target is never acted on with
+ * partial or stale data — a missing mark must not look like a winning position.
+ */
+export function combinedGainPoints(state: OneDtePositionState): number | null {
+  let gain = 0;
+  for (const leg of [state.callLeg, state.putLeg]) {
+    if (leg.status === 'closed') {
+      if (leg.exitPrice === undefined || leg.exitPrice === null) return null;
+      gain += leg.entryPrice - leg.exitPrice;
+    } else {
+      if (!(leg.currentPrice > 0)) return null;
+      gain += leg.entryPrice - leg.currentPrice;
+    }
+  }
+  return gain;
+}
+
 export async function monitorOneDteRisk(
   client: CoinDCXClient,
   state: OneDtePositionState,
   config: OneDteConfig,
   notifier?: TelegramNotifier
 ): Promise<void> {
+  const targetPoints = state.totalCreditReceived * config.profitTargetRatio;
+
   console.log('==================================================');
   console.log('       1 DTE POSITION MONITORING ACTIVE           ');
   console.log(` Target Exit Time: ${new Date(state.targetExitUtcMs).toISOString()}`);
+  console.log(
+    ` Profit Target   : ${(config.profitTargetRatio * 100).toFixed(0)}% of credit sold ` +
+      `($${state.totalCreditReceived.toFixed(2)} pts credit -> exit at $${targetPoints.toFixed(2)} pts)`
+  );
   console.log('==================================================');
 
   const checkIntervalMs = config.pollIntervalMs;
@@ -26,6 +53,8 @@ export async function monitorOneDteRisk(
         `[1DTE Monitor] ⏰ Reached scheduled exit time (${config.exitHourIST}:${String(config.exitMinuteIST).padStart(2, '0')} IST). Closing remaining open legs...`
       );
       await closeRemainingLegs(client, state, 'MONITOR_WINDOW_ELAPSED', notifier);
+      const finalGain = combinedGainPoints(state);
+      if (finalGain !== null) state.combinedPnLPoints = finalGain;
       state.status = 'closed';
       await saveOneDteState(state, state.date);
       break;
@@ -94,9 +123,35 @@ export async function monitorOneDteRisk(
         }
       }
 
+      // 3. Profit target: bank the cycle once the combined gain reaches the configured share of the
+      //    credit sold (sold 125 + 125 = 250 -> exit at 125 when PROFIT_TARGET_RATIO = 0.5).
+      //    Only fires while at least one leg is still open, and only on complete price data.
+      const gain = combinedGainPoints(state);
+      const stillOpen = state.callLeg.status === 'open' || state.putLeg.status === 'open';
+      if (stillOpen && gain !== null && targetPoints > 0 && gain >= targetPoints) {
+        console.log(
+          `[1DTE Monitor] 🎯 Profit target reached: ${gain.toFixed(2)} pts >= ${targetPoints.toFixed(2)} pts ` +
+            `(${(config.profitTargetRatio * 100).toFixed(0)}% of $${state.totalCreditReceived.toFixed(2)} credit). Closing remaining legs...`
+        );
+        await closeRemainingLegs(client, state, 'PROFIT_TARGET_HIT', notifier);
+        state.combinedPnLPoints = gain;
+        state.status = 'closed';
+        await saveOneDteState(state, state.date);
+
+        if (notifier) {
+          void notifier.notifyError(
+            '1 DTE Profit Target Hit',
+            new Error(`Combined gain ${gain.toFixed(2)} pts reached the ${targetPoints.toFixed(2)} pts target — cycle closed.`)
+          );
+        }
+        break;
+      }
+
       // If both legs closed, cycle complete
       if (state.callLeg.status === 'closed' && state.putLeg.status === 'closed') {
         console.log('[1DTE Monitor] ✅ Both legs closed. 1 DTE cycle resolved.');
+        const finalGain = combinedGainPoints(state);
+        if (finalGain !== null) state.combinedPnLPoints = finalGain;
         state.status = 'closed';
         await saveOneDteState(state, state.date);
         break;
@@ -112,7 +167,7 @@ export async function monitorOneDteRisk(
 async function closeLeg(
   client: CoinDCXClient,
   leg: OneDteLeg,
-  reason: 'SL_FALLBACK_CLOSE' | 'MONITOR_WINDOW_ELAPSED'
+  reason: 'SL_FALLBACK_CLOSE' | 'MONITOR_WINDOW_ELAPSED' | 'PROFIT_TARGET_HIT'
 ): Promise<void> {
   console.log(`[1DTE Monitor] Closing ${leg.legType} (${leg.symbol}) via buy market order (reduceOnly)...`);
   try {
@@ -140,7 +195,7 @@ async function closeLeg(
 async function closeRemainingLegs(
   client: CoinDCXClient,
   state: OneDtePositionState,
-  reason: 'MONITOR_WINDOW_ELAPSED',
+  reason: 'MONITOR_WINDOW_ELAPSED' | 'PROFIT_TARGET_HIT',
   notifier?: TelegramNotifier
 ): Promise<void> {
   for (const leg of [state.callLeg, state.putLeg]) {
