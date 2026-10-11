@@ -6,8 +6,10 @@
   "scripts": {
     "build": "tsc",
     "start": "ts-node src/index.ts",
+    "start:1dte": "ts-node src/oneDte/index.ts",
     "plan": "ts-node src/plan.ts",
     "run-once": "RUN_ONCE=true ts-node src/index.ts",
+    "run-once:1dte": "RUN_ONCE=true ts-node src/oneDte/index.ts",
     "typecheck": "tsc --noEmit",
     "test:auth": "ts-node src/testAuth.ts",
     "refresh-session": "node scripts/refresh-session.cjs",

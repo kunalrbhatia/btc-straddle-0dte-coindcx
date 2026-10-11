@@ -190,9 +190,19 @@ TELEGRAM_CHAT_ID=
   ALLOW_INSTANT_EXECUTION=true npm run run-once
   ```
 
-- **Start Daily Scheduler (6:15 PM IST)**:
+- **Start Daily 0 DTE Scheduler (6:15 PM IST)**:
   ```bash
   npm start
+  ```
+
+- **Start Daily 1 DTE Options Seller (10:45 PM IST)**:
+  ```bash
+  npm run start:1dte
+  ```
+
+- **Run 1 DTE Once (Immediate Execution)**:
+  ```bash
+  ALLOW_INSTANT_EXECUTION=true npm run run-once:1dte
   ```
 
 - **Compile TypeScript**:
