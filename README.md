@@ -195,11 +195,6 @@ TELEGRAM_CHAT_ID=
   npm start
   ```
 
-- **Run Tests**:
-  ```bash
-  npm test
-  ```
-
 - **Compile TypeScript**:
   ```bash
   npm run build
