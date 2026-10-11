@@ -9,7 +9,6 @@
     "plan": "ts-node src/plan.ts",
     "run-once": "RUN_ONCE=true ts-node src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/run-tests.cjs",
     "test:auth": "ts-node src/testAuth.ts",
     "refresh-session": "node scripts/refresh-session.cjs",
     "scan-secrets": "node scripts/pre-commit-secrets.cjs",
