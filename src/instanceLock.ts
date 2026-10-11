@@ -17,8 +17,8 @@ export function getLockDir(): string {
   return dir;
 }
 
-export function getLockFilePath(): string {
-  return path.join(getLockDir(), 'bot.lock');
+export function getLockFilePath(lockFileName = 'bot.lock'): string {
+  return path.join(getLockDir(), lockFileName);
 }
 
 export interface InstanceLock {
@@ -47,9 +47,12 @@ export function isProcessRunning(pid: number): boolean {
  * If another live process holds the lock, throws an Error.
  * If a stale lock exists from a terminated process, cleans it up.
  */
-export function acquireInstanceLock(instanceId = `bot-${process.pid}-${Date.now()}`): InstanceLock {
+export function acquireInstanceLock(
+  instanceId = `bot-${process.pid}-${Date.now()}`,
+  lockFileName = 'bot.lock'
+): InstanceLock {
   const lockDir = getLockDir();
-  const lockFile = getLockFilePath();
+  const lockFile = getLockFilePath(lockFileName);
 
   if (!fs.existsSync(lockDir)) {
     fs.mkdirSync(lockDir, { recursive: true });
