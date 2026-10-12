@@ -44,6 +44,10 @@ export async function monitorOneDteRisk(
 
   const checkIntervalMs = config.pollIntervalMs;
 
+  // Symbols this process has actually observed open at the venue. A closure is only ever adopted
+  // for one of these, so a glitched or empty positions read can never write off a live position.
+  const seenOpen = new Set<string>();
+
   while (state.status === 'active') {
     const nowMs = Date.now();
 
@@ -63,14 +67,23 @@ export async function monitorOneDteRisk(
     // 2. Fetch live positions from CoinDCX
     try {
       const positions = await client.getOptionsPositions();
+      // A position row on this venue carries NO qty/quantity field — only positionValue, a string.
+      // Filtering on qty matched nothing and made every open leg look closed ("closed by venue SL"):
+      // that one line is what blinded the bot in both 1 DTE cycles (22:45:01 and 06:56:23) and in the
+      // 0 DTE era before it. A row's *presence* is the signal; only an explicitly flat row is absent.
       const openVenueSymbols = new Set(
         positions
           .filter((p) => {
-            const q = Number(p.qty ?? (p as Record<string, unknown>).quantity ?? 0);
-            return Math.abs(q) > 0;
+            const raw = p as Record<string, unknown>;
+            const pv = Number(raw.positionValue);
+            if (Number.isFinite(pv)) return pv !== 0;
+            const q = Number(raw.qty ?? raw.quantity);
+            if (Number.isFinite(q)) return q !== 0;
+            return true; // no size fields at all (the normal case here): the row itself is the signal
           })
           .map((p) => p.symbol)
       );
+      for (const sym of openVenueSymbols) seenOpen.add(sym);
 
       // Check each leg
       for (const leg of [state.callLeg, state.putLeg]) {
@@ -78,6 +91,12 @@ export async function monitorOneDteRisk(
 
         // Has position vanished from venue? (e.g. SL hit on exchange)
         if (!openVenueSymbols.has(leg.symbol)) {
+          if (!seenOpen.has(leg.symbol)) {
+            console.warn(
+              `[1DTE Monitor] ⚠️ Leg ${leg.legType} (${leg.symbol}) not visible at the venue yet — NOT adopting it as closed.`
+            );
+            continue;
+          }
           console.log(`[1DTE Monitor] 🎯 Leg ${leg.legType} (${leg.symbol}) no longer open on exchange (closed by venue SL).`);
           leg.status = 'closed';
           leg.closeReason = 'SL_HIT';
