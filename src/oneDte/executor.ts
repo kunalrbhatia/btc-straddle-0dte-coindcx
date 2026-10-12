@@ -7,9 +7,17 @@ import { OneDtePositionState, OneDteLeg } from './types';
 import { saveOneDteState } from './stateStore';
 import { getTodayDateStringIST } from '../stateStore';
 
+/**
+ * Snap a limit price to the venue's tick. FLOOR, not nearest: as the seller we want a *marketable* ask
+ * so both legs fill and the strangle is complete. Rounding up (129.44 -> 130) leaves the sell resting
+ * above the market, and an unfilled leg leaves the other side short on its own — verified live on
+ * 2026-10-12: a 105 limit rested unfilled while a 100 limit crossed and filled at 105.
+ * Note: reconciliation.ts has its own `roundToTickSize` which rounds to NEAREST (acceptance D7) — that
+ * one aligns stop prices while this one prices the entry, so the two intentionally differ.
+ */
 export const roundToTick = (price: number, tick: number): number => {
   const t = Number.isFinite(tick) && tick > 0 ? tick : 5;
-  return Math.round(price / t) * t;
+  return Math.floor(price / t) * t;
 };
 
 export async function buyBackFilledLeg(

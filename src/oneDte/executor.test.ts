@@ -92,8 +92,11 @@ describe('1 DTE Entry Integrity Tests', () => {
   };
 
   it('tick rounding meets exact acceptance requirements', () => {
-    assert.equal(roundToTick(129.44, 5), 130);
+    // FLOOR, not nearest: a marketable ask must not sit above the market or the leg never fills
+    // (live proof 2026-10-12: a 105 limit rested unfilled while a 100 limit crossed and filled at 105).
+    assert.equal(roundToTick(129.44, 5), 125);
     assert.equal(roundToTick(120.6, 5), 120);
+    assert.equal(roundToTick(107.69, 5), 105);
     assert.equal(roundToTick(129.44, 5) % 5, 0);
     assert.equal(roundToTick(120.6, 5) % 5, 0);
     assert.equal(roundToTick(100, 5) % 5, 0);
@@ -173,11 +176,12 @@ describe('1 DTE Entry Integrity Tests', () => {
     assert.ok(callPayload);
     assert.ok(putPayload);
 
-    // Call indicative was 129.44 -> rounded to 130 -> SL 260
-    assert.equal(callPayload.price, 130);
-    assert.equal(callPayload.stopLoss, '260');
+    // Call indicative was 129.44 -> FLOORED to 125 -> SL 250 (a marketable ask; the nearest 130 would
+    // rest above the market and leave the other side naked until it fills)
+    assert.equal(callPayload.price, 125);
+    assert.equal(callPayload.stopLoss, '250');
 
-    // Put indicative was 120.6 -> rounded to 120 -> SL 240
+    // Put indicative was 120.6 -> floored to 120 -> SL 240
     assert.equal(putPayload.price, 120);
     assert.equal(putPayload.stopLoss, '240');
   });
