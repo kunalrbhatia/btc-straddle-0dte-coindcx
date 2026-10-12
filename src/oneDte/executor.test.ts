@@ -120,6 +120,13 @@ describe('1 DTE Entry Integrity Tests', () => {
         { symbol: 'BTC-TOMORROW-85000-C-USDT', lastPrice: 129.44 },
         { symbol: 'BTC-TOMORROW-85000-P-USDT', lastPrice: 120.6 },
       ],
+      // The venue's own fills: 128 / 122, deliberately different from the 125 / 120 limits we quoted,
+      // so the test proves the record uses the fill and not the quote.
+      getOptionsPositions: async () =>
+        [
+          { symbol: 'BTC-TOMORROW-85000-C-USDT', positionValue: '-0.0125', avgPrice: '128', markPrice: '128' },
+          { symbol: 'BTC-TOMORROW-85000-P-USDT', positionValue: '-0.012', avgPrice: '122', markPrice: '122' },
+        ] as unknown as Awaited<ReturnType<CoinDCXClient['getOptionsPositions']>>,
       placeOptionsOrder: async (
         symbol: string,
         side: 'buy' | 'sell',
@@ -155,6 +162,10 @@ describe('1 DTE Entry Integrity Tests', () => {
     assert.equal(res.status, 'active');
     assert.equal(res.entryExecuted, true);
 
+    // The recorded entry price is the VENUE's fill, not our quoted limit
+    assert.equal(res.callLeg.entryPrice, 128);
+    assert.equal(res.putLeg.entryPrice, 122);
+
     // Assert on constructed payloads
     assert.equal(placedPayloads.length, 2);
 
@@ -184,6 +195,50 @@ describe('1 DTE Entry Integrity Tests', () => {
     // Put indicative was 120.6 -> floored to 120 -> SL 240
     assert.equal(putPayload.price, 120);
     assert.equal(putPayload.stopLoss, '240');
+  });
+
+  it('a leg accepted but never filled is cancelled and the filled leg unwound — no entry recorded', async () => {
+    const cancelled: string[] = [];
+    const buyBacks: string[] = [];
+    let putStillOpen = true;
+
+    const mockClient = {
+      getOptionsInstruments: async () => getMockInstruments(),
+      getOptionsTicker: async () => [
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', lastPrice: 129.44 },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', lastPrice: 120.6 },
+      ],
+      placeOptionsOrder: async (symbol: string, side: 'buy' | 'sell') => {
+        if (side === 'sell') {
+          return { symbol, side, success: true, orderId: `order-${symbol}`, limitPrice: 125 };
+        }
+        buyBacks.push(symbol);
+        putStillOpen = false;
+        return { symbol, side, success: true, orderId: `bb-${symbol}` };
+      },
+      // The CALL sell was accepted but never becomes a position: exactly the 2026-10-12 failure.
+      getOptionsPositions: async () =>
+        (putStillOpen
+          ? [{ symbol: 'BTC-TOMORROW-85000-P-USDT', positionValue: '-0.012', avgPrice: '122', markPrice: '122' }]
+          : []) as unknown as Awaited<ReturnType<CoinDCXClient['getOptionsPositions']>>,
+      cancelOptionsOrder: async (orderId: string) => {
+        cancelled.push(orderId);
+        return true;
+      },
+    } as unknown as CoinDCXClient;
+
+    const res = await executeOneDteEntry(mockClient, { ...dummyConfig, entryFillTimeoutMs: 150 });
+    assert.equal(res, null, 'an entry whose leg never filled must not return a state');
+    assert.ok(
+      cancelled.includes('order-BTC-TOMORROW-85000-C-USDT'),
+      `the resting CALL order must be cancelled, got: ${cancelled.join(',') || 'nothing'}`
+    );
+    assert.ok(buyBacks.includes('BTC-TOMORROW-85000-P-USDT'), 'the filled PUT must be bought back');
+
+    const st = await loadOneDteState(getTodayDateStringIST());
+    assert.ok(st);
+    assert.equal(st.entryExecuted, false);
+    assert.equal(st.status, 'closed');
   });
 
   it('half-filled strangle (Call fails, Put succeeds) issues buy-back for Put and finishes flat', async () => {
