@@ -21,6 +21,13 @@ export async function executeOneDteEntry(
   }
 
   const { call, put, expiryTimeMs } = contracts;
+  // The venue only accepts option prices in multiples of ONEDTE_PRICE_TICK (default 5). Anything else
+  // is rejected with 422 OCS-TECH-0013 "The min tick size should be 5." and the entry never happens.
+  const roundToTick = (price: number, tick: number): number => {
+    const t = Number.isFinite(tick) && tick > 0 ? tick : 5;
+    return Math.round(price / t) * t;
+  };
+
   console.log(`[1DTE Execution] Call: ${call.symbol} (indicative: $${call.premium.toFixed(2)})`);
   console.log(`[1DTE Execution] Put : ${put.symbol} (indicative: $${put.premium.toFixed(2)})`);
 
@@ -56,7 +63,7 @@ export async function executeOneDteEntry(
       'sell',
       config.orderQuantity,
       config.entryOrderType,
-      config.entryOrderType === 'Limit' ? Math.round(call.premium) : undefined,
+      config.entryOrderType === 'Limit' ? roundToTick(call.premium, config.priceTick) : undefined,
       '',
       '',
       undefined,
@@ -67,7 +74,7 @@ export async function executeOneDteEntry(
       'sell',
       config.orderQuantity,
       config.entryOrderType,
-      config.entryOrderType === 'Limit' ? Math.round(put.premium) : undefined,
+      config.entryOrderType === 'Limit' ? roundToTick(put.premium, config.priceTick) : undefined,
       '',
       '',
       undefined,

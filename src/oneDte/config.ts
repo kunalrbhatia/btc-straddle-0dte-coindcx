@@ -39,6 +39,10 @@ export interface OneDteConfig {
   // Profit target: close the cycle once this share of the credit sold has been earned
   // (0.5 = exit as soon as the combined gain reaches 50% of the total credit).
   readonly profitTargetRatio: number;
+
+  // The venue's price tick for option prices: limit prices must be a multiple of this
+  // (422 OCS-TECH-0013 "The min tick size should be 5." otherwise).
+  readonly priceTick: number;
 }
 
 function getEnvNumber(key: string, defaultValue: number): number {
@@ -96,4 +100,7 @@ export const oneDteConfig: OneDteConfig = {
 
   // Exit once this share of the credit sold has been earned (0.5 = 50%).
   profitTargetRatio: getEnvNumber('ONEDTE_PROFIT_TARGET_RATIO', 0.5),
+
+  // Option prices must be a multiple of this tick.
+  priceTick: getEnvNumber('ONEDTE_PRICE_TICK', 5),
 };
