@@ -25,7 +25,10 @@ export async function executeOneDteEntry(
   // is rejected with 422 OCS-TECH-0013 "The min tick size should be 5." and the entry never happens.
   const roundToTick = (price: number, tick: number): number => {
     const t = Number.isFinite(tick) && tick > 0 ? tick : 5;
-    return Math.round(price / t) * t;
+    // Floor, not nearest: as the seller we want a *marketable* ask so both legs fill and the strangle is
+    // complete. Rounding up (129.44 -> 130) leaves the sell resting above the market, and a resting leg
+    // is a one-sided naked short until it fills.
+    return Math.floor(price / t) * t;
   };
 
   console.log(`[1DTE Execution] Call: ${call.symbol} (indicative: $${call.premium.toFixed(2)})`);
