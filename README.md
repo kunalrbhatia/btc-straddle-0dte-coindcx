@@ -215,6 +215,11 @@ TELEGRAM_CHAT_ID=
   npm run typecheck
   ```
 
+- **Run Tests**:
+  ```bash
+  npm test
+  ```
+
 - **Generate Daily Trade Report**:
   ```bash
   # Print report for a cycle to stdout

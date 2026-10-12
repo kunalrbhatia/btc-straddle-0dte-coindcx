@@ -26,5 +26,6 @@ export interface OneDtePositionState {
   readonly totalCreditReceived: number;
   combinedPnLPoints: number;
   status: 'active' | 'closed';
+  failureReason?: string;
   updatedAt?: string;
 }
