@@ -11,6 +11,7 @@
     "run-once": "RUN_ONCE=true ts-node src/index.ts",
     "run-once:1dte": "RUN_ONCE=true ts-node src/oneDte/index.ts",
     "typecheck": "tsc --noEmit",
+    "test": "node --require ts-node/register --test src/oneDte/executor.test.ts",
     "test:auth": "ts-node src/testAuth.ts",
     "refresh-session": "node scripts/refresh-session.cjs",
     "scan-secrets": "node scripts/pre-commit-secrets.cjs",

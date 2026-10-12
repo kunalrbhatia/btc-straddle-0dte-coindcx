@@ -14,6 +14,17 @@ async function main(): Promise<void> {
   console.log('  CoinDCX BTC 0DTE ATM Straddle Automated Bot    ');
   console.log('==================================================');
 
+  // 0 DTE is RETIRED (2026-10-11). This entry point must never run by accident — `npm start`,
+  // `npm run run-once`, a stale ecosystem.config.js entry or a `pm2 resurrect` would otherwise open
+  // live positions on an account that has moved to the 1 DTE strategy. Opt in explicitly instead.
+  if (process.env.I_ACCEPT_0DTE_RISK !== 'true') {
+    console.error(
+      '[Runner] 🛑 0 DTE bot is retired and disabled. ' +
+        'Set I_ACCEPT_0DTE_RISK=true only if you deliberately intend to run the 0 DTE strategy.'
+    );
+    process.exit(2);
+  }
+
   // Acquire single-instance lock to ensure only one bot instance manages positions
   let lock: InstanceLock;
   try {
