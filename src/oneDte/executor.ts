@@ -7,9 +7,17 @@ import { OneDtePositionState, OneDteLeg } from './types';
 import { saveOneDteState } from './stateStore';
 import { getTodayDateStringIST } from '../stateStore';
 
+/**
+ * Snap a limit price to the venue's tick. FLOOR, not nearest: as the seller we want a *marketable* ask
+ * so both legs fill and the strangle is complete. Rounding up (129.44 -> 130) leaves the sell resting
+ * above the market, and an unfilled leg leaves the other side short on its own — verified live on
+ * 2026-10-12: a 105 limit rested unfilled while a 100 limit crossed and filled at 105.
+ * Note: reconciliation.ts has its own `roundToTickSize` which rounds to NEAREST (acceptance D7) — that
+ * one aligns stop prices while this one prices the entry, so the two intentionally differ.
+ */
 export const roundToTick = (price: number, tick: number): number => {
   const t = Number.isFinite(tick) && tick > 0 ? tick : 5;
-  return Math.round(price / t) * t;
+  return Math.floor(price / t) * t;
 };
 
 export async function buyBackFilledLeg(
@@ -81,6 +89,63 @@ export async function buyBackFilledLeg(
   }
 
   return false;
+}
+
+type PositionRows = Awaited<ReturnType<CoinDCXClient['getOptionsPositions']>>;
+
+/** A leg counts as filled only when the venue shows a position for it — and it reports the fill price. */
+function readLegFill(positions: PositionRows, symbol: string): { filled: boolean; price?: number } {
+  const row = (positions as unknown as Array<Record<string, unknown>>).find((p) => String(p.symbol) === symbol);
+  if (!row) return { filled: false };
+  const pv = Number(row.positionValue);
+  if (Number.isFinite(pv)) {
+    if (pv === 0) return { filled: false };
+  } else {
+    const q = Number(row.qty ?? row.quantity);
+    if (Number.isFinite(q) && q === 0) return { filled: false };
+  }
+  const avg = Number(row.avgPrice);
+  return { filled: true, price: Number.isFinite(avg) ? avg : undefined };
+}
+
+export interface FillCheck {
+  callFilled: boolean;
+  putFilled: boolean;
+  callFillPrice?: number;
+  putFillPrice?: number;
+}
+
+/**
+ * Polls the venue's positions until both legs are genuinely open, or the timeout expires.
+ *
+ * An order being ACCEPTED is not the same as it being FILLED: a limit priced above the market is accepted
+ * and then rests. That is not hypothetical — on 2026-10-12 the CALL sell rested unfilled while the PUT
+ * filled, which left a one-sided short until a deeper limit crossed. Returns the venue's own fill prices
+ * so the record reflects the fill, not the quote.
+ */
+export async function verifyFillsByPosition(
+  client: CoinDCXClient,
+  callSymbol: string,
+  putSymbol: string,
+  timeoutMs: number,
+  intervalMs = 2000
+): Promise<FillCheck> {
+  const start = Date.now();
+  let last: FillCheck = { callFilled: false, putFilled: false };
+  for (;;) {
+    try {
+      const positions = await client.getOptionsPositions();
+      const c = readLegFill(positions, callSymbol);
+      const p = readLegFill(positions, putSymbol);
+      last = { callFilled: c.filled, putFilled: p.filled, callFillPrice: c.price, putFillPrice: p.price };
+      if (last.callFilled && last.putFilled) return last;
+    } catch (err) {
+      console.warn(`[1DTE Execution] Fill check failed: ${(err as Error).message}`);
+    }
+    const elapsed = Date.now() - start;
+    if (elapsed >= timeoutMs) return last;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, timeoutMs - elapsed)));
+  }
 }
 
 export async function executeOneDteEntry(
@@ -303,9 +368,83 @@ export async function executeOneDteEntry(
     return null;
   }
 
-  // Case 3: Both legs succeeded!
-  const callEntry = callOrder.limitPrice ?? callBasePrice;
-  const putEntry = putOrder.limitPrice ?? putBasePrice;
+  // Case 3: both orders were ACCEPTED — now prove they actually filled.
+  // An accepted order can still be resting (a limit above the market), and a resting leg means the other
+  // side is short on its own. Verify against the venue; never record an entry that did not happen.
+  let callFillPrice: number | undefined;
+  let putFillPrice: number | undefined;
+  if (config.dryRun) {
+    console.log('[1DTE Execution] DRY RUN: skipping venue fill verification.');
+  } else {
+    const fills = await verifyFillsByPosition(client, call.symbol, put.symbol, config.entryFillTimeoutMs);
+    if (!fills.callFilled || !fills.putFilled) {
+      const missing = [!fills.callFilled ? call.symbol : '', !fills.putFilled ? put.symbol : ''].filter(Boolean).join(', ');
+      const failureReason = `Fill verification failed for ${missing}: order accepted but no venue position within ${config.entryFillTimeoutMs}ms.`;
+      console.error(`[1DTE Execution] 🚨 ${failureReason}`);
+
+      // Cancel whatever is still resting (only the legs that did NOT fill), then unwind whichever leg
+      // did fill — never leave a lone side.
+      for (const [sym, outcome, filled] of [
+        [call.symbol, callOrder, fills.callFilled] as const,
+        [put.symbol, putOrder, fills.putFilled] as const,
+      ]) {
+        if (filled || !outcome.orderId) continue;
+        try {
+          const cancelled = await client.cancelOptionsOrder(outcome.orderId, sym);
+          console.log(`[1DTE Execution] Cancelled resting order ${outcome.orderId} (${sym}): ${cancelled}`);
+        } catch (err) {
+          console.warn(`[1DTE Execution] Could not cancel ${outcome.orderId} (${sym}): ${(err as Error).message}`);
+        }
+      }
+      if (fills.callFilled) await buyBackFilledLeg(client, call.symbol, config.orderQuantity, 3, notifier);
+      if (fills.putFilled) await buyBackFilledLeg(client, put.symbol, config.orderQuantity, 3, notifier);
+
+      const unfilledState: OneDtePositionState = {
+        date: todayStr,
+        expiryTimeMs,
+        entryExecuted: false,
+        targetExitUtcMs,
+        callLeg: {
+          legType: 'CALL',
+          symbol: call.symbol,
+          strikePrice: call.strikePrice,
+          entryPrice: callBasePrice,
+          stopLossPrice: callStopLoss,
+          quantity: config.orderQuantity,
+          orderId: callOrder.orderId,
+          status: 'closed',
+          currentPrice: callBasePrice,
+        },
+        putLeg: {
+          legType: 'PUT',
+          symbol: put.symbol,
+          strikePrice: put.strikePrice,
+          entryPrice: putBasePrice,
+          stopLossPrice: putStopLoss,
+          quantity: config.orderQuantity,
+          orderId: putOrder.orderId,
+          status: 'closed',
+          currentPrice: putBasePrice,
+        },
+        totalCreditReceived: 0,
+        combinedPnLPoints: 0,
+        status: 'closed',
+        failureReason,
+      };
+      await saveOneDteState(unfilledState, todayStr);
+      console.log(`[1DTE Execution] Persisted aborted unfilled-leg state with entryExecuted: false to state/onedte-state-${todayStr}.json`);
+      if (notifier) {
+        void notifier.notifyError('1 DTE Entry Aborted (Leg Did Not Fill)', new Error(failureReason));
+      }
+      return null;
+    }
+    // Record the venue's own fill prices, not our quoted limits.
+    callFillPrice = fills.callFillPrice;
+    putFillPrice = fills.putFillPrice;
+  }
+
+  const callEntry = callFillPrice ?? callOrder.limitPrice ?? callBasePrice;
+  const putEntry = putFillPrice ?? putOrder.limitPrice ?? putBasePrice;
 
   console.log(`[1DTE Execution] Call entry: $${callEntry.toFixed(2)}, SL trigger: $${callStopLoss}`);
   console.log(`[1DTE Execution] Put entry : $${putEntry.toFixed(2)}, SL trigger: $${putStopLoss}`);
