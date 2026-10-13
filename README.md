@@ -1,245 +1,312 @@
-# CoinDCX BTC 0DTE ATM Straddle Automated Bot
+# CoinDCX BTC 1 DTE Options Selling Bot
 
-Clean and strictly-typed TypeScript application designed to execute a **Short ATM Straddle** (sell ATM Call and Put options) on Bitcoin at **6:15 PM IST** using the CoinDCX API.
+An automated **1 DTE short strangle** on CoinDCX bitcoin options. Every night it sells one Call and one
+Put — 0.01 BTC each, with premiums in a $100–150 band — collects the credit, arms a stop on the venue for
+each leg, and manages the position to one of three exits.
 
-📺 **Strategy Video Walkthrough**: [Bitcoin Daily Straddle Option Selling Strategy in Hindi (Theta Gainers)](https://www.youtube.com/watch?v=Mt0uebHIu7s)
+TypeScript, runs under PM2 on Linux with Node 22. A single long-lived process holds a once-a-day timer.
 
----
-
-## Verified Exchange Mechanics & Architecture
-
-1. **Option Expiry Timing & Dynamic Discovery**:
-   - CoinDCX BTC options typically expire at **08:00 UTC (13:30 IST)**, but the exchange skips calendar dates and follows a custom listing schedule (e.g. daily contracts for 3 days followed by weekly contracts).
-   - **Discover, Don't Compute**: The bot dynamically queries CoinDCX's public options instruments endpoint (`GET https://public.coindcx.com/api/v1/options/instruments?baseCurrency=BTC`), groups by `expiryTime`, filters out expiries within `EXPIRY_MIN_LEAD_MINUTES` (default 30m), and selects the earliest active expiry alongside verbatim API contract symbols.
-   - **Logged Fallback**: If the public instruments feed is temporarily unreachable, the bot logs a loud warning and falls back to arithmetic calendar derivation (`DAILY_EXPIRY_HOUR_UTC`, default 8 UTC). If neither works, it aborts cleanly with zero orders.
-   - The standalone position monitor (`scripts/btc-position-monitor.py`) also derives expiry directly from the contract's own symbol rather than independent arithmetic.
-2. **Session Authentication & IP Binding**:
-   - CoinDCX options endpoints (`https://api.coindcx.com/api/v1/options/*`) require web session Bearer tokens (`authorization: Bearer <token>`) and the web browser session's `User-Agent`.
-   - Standard API Key + HMAC is accepted for spot and margin endpoints, but rejected with 401 on options.
-   - The session token's JWT carries a source IP claim (`sip`). Requests originating from a different IP return `401 Unauthorized`.
-   - **Zero-Touch Headless Automation**: The bot can run fully headlessly on remote cloud servers (e.g. Oracle Linux / Ubuntu) by running `npm run refresh-session`. It uses Playwright with stealth evasions, retrieves the 6-digit email OTP from Gmail via IMAP, computes the Google Authenticator TOTP, submits 2FA, and captures the fresh session token into `session.token`.
-3. **Session Token Lifetime & Refresh**:
-   - Session tokens are valid for **~36 hours**.
-   - The token can be refreshed automatically via `npm run refresh-session` or set statically via `COINDCX_SESSION_TOKEN` in `.env` or `session.token`. The bot dynamically re-reads `session.token` on every request so a refreshed token takes effect immediately without restarting the bot.
-   - On HTTP 401, the bot logs an error, journals an alert, and refuses to enter retry storms.
-4. **Options Price Feed & Marketable Limit Orders**:
-   - Live mark prices, LTP, bid/ask are queried directly from CoinDCX's public options ticker (`https://public.coindcx.com/api/v1/options/ticker?baseCurrency=BTC&expiryTime=...`) and open positions (`GET /api/v1/options/positions`). The positions parser defensively unwraps nested payloads (`{ status: "success", data: { data: [...] } }`) as well as flat lists.
-   - **Mark-to-Market Watcher & Loud Alerting**: If mark prices cannot be resolved for open legs during risk monitoring, the bot logs an explicit error and writes to the alert journal (`feed_unavailable`) instead of silently echoing entry prices as +0.00 PnL.
-   - **Marketable Limit Entries**: The bot prices SELL entries from the public ticker's live `bidPrice` and places `Limit` orders (matching the CoinDCX web application). Selling directly into the bid ensures immediate marketable execution while eliminating undefined fill prices.
-   - **Quote Validation & Fail-Safe Abort**: If `bidPrice` is missing, zero, or non-numeric for either leg, the bot refuses to fabricate prices: entry aborts immediately with zero orders sent and an alert is raised.
-   - **Fill Confirmation & Unwind**: The bot polls `GET /api/v1/options/orders` (timeout configured via `ENTRY_FILL_TIMEOUT_MS`, default 15s). If neither leg fills, both are cancelled. If only one leg fills (partial fill timeout), the unfilled leg is cancelled and the filled leg is unwound immediately to avoid naked risk.
-   - **Escape Hatch**: `ENTRY_ORDER_TYPE=Market` can be configured if needed, which skips price quotes but logs loudly that exchange-side stops are disabled.
-5. **Venue-Side Stop Loss & Reduce-Only Closes**:
-   - **Venue-Side Stop Loss**: Along with the Limit order, the bot sends `stopLoss = limitPrice * SL_MULTIPLIER` (2 decimals, e.g. `416.00 -> 832.00`) directly in the order creation payload (`POST /api/v2/options/order/create`). This provides primary exchange-level stop protection (`reduceOnly: true`).
-   - **The Bot Never Races the Venue Stop**: When mark price touches or breaches stop-loss, the venue stop triggers and executes the close. The bot does not send a duplicate stop-loss market close order. Instead, on every risk poll cycle it checks venue truth: if an open leg in state disappears from venue positions before expiry, the bot adopts the close from the venue's ledger (`filledPrice`, reason `SL_HIT`, `source: "venue"`).
-   - **Arming Verification & Stuck-Stop Escalation**: The bot verifies that the venue stop order is active and armed post-entry and during risk monitoring. If a stop order is missing or mismatched, loud alerts (`stop_missing`, `stop_mismatch`) are raised. If the mark overshoots the stop by `SL_OVERRUN_TOLERANCE` (default 10%) while remaining open on the venue, the bot logs an anomaly and triggers a fallback close (`SL_FALLBACK_CLOSE`).
-   - **Reduce-Only Protection**: All close orders (profit target, cutoff, unwind, fallback) explicitly set `reduceOnly: true` to prevent any duplicate close order from accidentally flipping a short position into an open long. Unexpected long positions are automatically detected, alerted, and flattened with `reduceOnly: true`.
-   - **Bot-Side Profit Target**: The combined +55% profit target is a portfolio-level condition across both legs that exchange single-leg orders cannot express. Thus, `takeProfit: ''` is sent on order creation, and the bot's risk monitor manages the profit target.
-   - **Payload Match**: Order create payload matches the CoinDCX web application byte-for-byte (`{ symbol, side, orderType, qty, price, stopLoss, takeProfit }`), omitting `conversionRate`.
-6. **Exit Confirmation & State Reconciliation**:
-   - **Never Assume Closed Without Confirmation**: A leg is marked `closed` only after explicit confirmation (order return success or reconciliation check via `GET /api/v1/options/positions`). Rejection (e.g. HTTP 400 `"Please retry."`) leaves the leg open in state, retries transient failures with bounded backoff (3 attempts), and alerts loudly.
-   - **Reconcile & Resurrect**: On startup and resume, the bot reconciles stored state against live exchange positions. If an unmonitored live leg exists on the exchange (e.g. after a failed close or premature flat state), the bot adopts and resurrects it into state, resuming active monitoring and dispatching an immediate alert.
-   - **Monitor Window vs Expiry**: Distinguishes `MONITOR_WINDOW_ELAPSED` from actual contract `EXPIRED` status, preventing deceptive alerts. Default `MAX_MONITOR_MINUTES` is 1380 (23h) to allow holding until next-day settlement.
-7. **Margin Currency & Precision**:
-   - Options are quoted on a **250 strike step grid** (e.g. 84750, 85000).
-   - Position sizing: 0.01 BTC per leg at 10x leverage.
-   - Note on balance: verify whether margin is held in USDT or INR before enabling live ordering.
+> 📺 Background on selling BTC options daily:
+> [Bitcoin Daily Straddle Option Selling Strategy in Hindi (Theta Gainers)](https://www.youtube.com/watch?v=Mt0uebHIu7s)
 
 ---
 
-## Features
-
-- **Zero-Touch Headless Session Refresher**: Fully automated headless login using Playwright stealth, automated Gmail IMAP OTP extraction, and RFC 6238 Google Authenticator TOTP generation (`npm run refresh-session`).
-- **Strictly Typed**: Zero usage of the `any` keyword across the codebase (`strict: true`, `noImplicitAny: true`).
-- **Accurate IST Timing**: Automatically calculates delay to **6:15 PM IST** (`18:15:00 IST`) with daily re-arming scheduler.
-- **Dynamic Strike Selection**: Fetches live BTC price and rounds to the nearest ATM strike on CoinDCX's 250 grid.
-- **Fail-Safe Entry & Unwind**: If both legs fail, entry aborts cleanly. If only one leg fills (partial failure), the bot immediately unwinds the filled leg via buy-to-close to avoid naked exposure.
-- **Single-Instance Process Lock**: Exclusive PID lock file prevents duplicate local or PM2 instances from racing or cancelling each other's orders.
-- **Safe Development Modes**:
-  - `npm run plan`: Read-only inspection mode. Fetches spot, calculates strikes, validates contracts via margin preview, and displays projected SL/PT levels without placing any orders.
-  - `DRY_RUN=true`: Simulates all order placements and cancellations without sending order network requests.
-  - `npm run run-once`: Executes a single cycle.
-- **MTM Watcher Logging**: Appends tick-by-tick mark-to-market PnL tracking to `logs/mtm-<YYYY-MM-DD>.log`.
-- **Two-Layer Trade Record & Venue Verification**:
-  - **Layer 1 (Offline Write-Through)**: Per-cycle event ledger `records/<YYYY-MM-DD>.jsonl`, dedicated MTM tape `records/<YYYY-MM-DD>.mtm.jsonl`, and atomically materialized summary snapshot `records/<YYYY-MM-DD>.summary.json`. Built-in recursive secret scrubbing ensures bearer tokens and passwords are never written to disk. Restart and adoption resilient with `adopted: true`.
-  - **Layer 2 (Venue Verification)**: Cross-checks recorded orders and settlement against the CoinDCX broker terminal (`/api/v1/options/positions`, open orders, and `/api/v1/options/wallet/transactions`). Evaluates each claim as `MATCH`, `MISMATCH` (with delta), or `UNVERIFIED` (with reason). Produces an overall `VERIFIED`, `PARTIAL`, or `FAILED` verdict.
-  - **Verification CLI**: Run `npm run verify -- --cycle <YYYY-MM-DD> [--json]` to verify claims against the exchange. Historical cycles can be backfilled with `--backfill`.
-- **Daily Trade Reports & Git Publishing**: Automatically generates a detailed markdown report at contract expiry + 15 min (`REPORT_DELAY_MINUTES`, default 15m) and publishes it along with cycle records exclusively to the bot-owned `reports` branch via isolated git plumbing without touching `main` or active worktrees (`npm run report`). Reports embed the Broker Terminal Verification table, dual P&L, and cycle-scoped operator journals.
-- **Pre-Commit Secret Scanning & Hook Verification**: Automated git hook (`scripts/pre-commit-secrets.cjs`), `npm run scan-secrets`, and verification command `npm run verify:hooks`. Detects three-part base64url JWT/Bearer tokens and sensitive repository variables (`COINDCX_BEARER_TOKEN`, `COINDCX_API_SECRET`, etc.) without printing secret values, while allowing placeholders and test fixtures. Supports `SKIP_SECRET_SCAN=1` override and optional TruffleHog deep scans.
+> ## ⚠️ Read before you run this
+>
+> **It sells options, with real money.** The loss on a sold leg is not capped by the premium you collect.
+> The protection is a **venue-side stop at 2× the premium on each leg** plus a **50%-of-credit** profit
+> target, sized at 0.01 BTC per leg. A bad night has cost roughly the credit collected — on 13 Oct 2026
+> both legs stopped out and the cycle lost **₹267** at 0.01 BTC. Use a funded but *dedicated* account, not
+> the one you keep your coins in, and watch your first few cycles by hand.
+>
+> The older **0 DTE ATM straddle** strategy is retired and locked out in code. Its manual is preserved at
+> [`docs/0dte-retired.md`](docs/0dte-retired.md); much of the venue mechanics below is shared with it.
 
 ---
 
-## Setup & Configuration
+## 1. What it does, hour by hour
 
-### 1. Automated Headless Session Refresh (Recommended)
+| When (IST) | What happens |
+| --- | --- |
+| **22:15** | *(recommended)* `npm run refresh-session` renews the CoinDCX web-session token |
+| **22:45** | **Entry.** Discovers the nearest expiry the venue lists, selects one Call and one Put priced in `[$100, $150]`, sells both as **marketable Limit** orders, each carrying a **venue stop at 2× premium** |
+| 22:45→ | Confirms fills against **venue positions**, not the order list. A leg accepted but never filled is cancelled and the other leg is bought back |
+| every 3 s | Risk monitor: marks both legs, evaluates the exits |
+| **17:45 next day** | **Scheduled exit** — both legs bought back `reduceOnly` |
 
-To run the bot 100% autonomously without manually copying tokens from browser DevTools:
+Exits are: profit target, stop, or the scheduled exit (§6). Nothing else closes a position.
 
-1. Create a 16-character **Google App Password** at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) for your Gmail account.
-2. In your `.env`, configure:
-   ```env
-   COINDCX_WEB_EMAIL="your_email@gmail.com"
-   COINDCX_WEB_PASSWORD="your_coindcx_password"
-   COINDCX_TOTP_SECRET="your_authenticator_export_or_base32_secret"
-   GMAIL_USER="your_email@gmail.com"
-   GMAIL_APP_PASSWORD="your_16_char_app_password"
-   ```
-3. Run the automated session refresher:
-   ```bash
-   npm run refresh-session
-   ```
-   *(This automatically launches headless stealth Chromium, authenticates, polls Gmail for the 2FA email OTP, generates the Authenticator TOTP, logs in, and saves `session.token`).*
+The entry is a once-a-day timer **inside the process**. Each cycle is persisted to
+`state/onedte-state-<date>.json` and rebuilt from it on restart, so a restart resumes an open cycle
+instead of entering a new one.
 
-4. Optional Cron on Linux / Oracle Cloud (runs daily at 6:00 AM IST / 00:30 UTC):
-   ```cron
-   30 0 * * * cd /path/to/straddle-btc-0dte && npm run refresh-session >> logs/refresh.log 2>&1
-   ```
+---
 
-### 2. Manual DevTools Fallback (Alternative)
+## 2. Before you start
 
-If you prefer extracting manually:
-1. Open [CoinDCX](https://coindcx.com) in Google Chrome and log in.
-2. Open Chrome DevTools (`F12` or `Ctrl+Shift+I`) and navigate to the **Network** tab.
-3. Filter requests by `options` or visit the Options trading page.
-4. Click on any request to `https://api.coindcx.com/api/v1/options/...` (e.g. `positions` or `margin`).
-5. Copy the `authorization` header value and save it to `session.token`:
-   ```bash
-   echo "your_token_here" > session.token
-   ```
-   *(Note: `session.token` and `.env` are gitignored).*
+- A **CoinDCX account with options enabled**, funded with USDT margin. Tonight's 0.01 BTC strangle reserved
+  **≈₹7,800** (measured 13 Oct 2026) — keep a comfortable multiple of that in the account.
+- **Node 22** and **npm**.
+- **PM2 ≥ 7**.
+- For the headless token refresh: the CoinDCX web **email + password**, the **TOTP secret** behind Google
+  Authenticator, and a 16-character **Gmail app password**
+  ([myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)).
+- Optional: `npx playwright install chromium`.
 
-### 2. Configure Environment (`.env`)
+> ⚠️ **The session token is bound to the IP that created it.** CoinDCX rejects options requests from any
+> other IP with `401`. The bot must run on the machine whose IP you used when you refreshed. If your
+> server's IP changes, refresh again. This is a venue rule, not a bug in the bot.
 
-Copy `.env.example` to `.env`:
+---
+
+## 3. Install
+
 ```bash
-cp .env.example .env
+git clone <this repo> && cd <repo>
+npm ci                  # package-lock.json is committed
+cp .env.example .env    # then fill it in (§5)
+npm run build           # ⚠️ REQUIRED: dist/ is gitignored, and the bot runs dist/
 ```
 
-Edit `.env`:
-```env
-# CoinDCX API Credentials
-COINDCX_API_KEY=your_api_key_here
-COINDCX_API_SECRET=your_api_secret_here
+Get a session token and start it:
 
-# Options Web Session Token (or leave blank to read from session.token)
-COINDCX_SESSION_TOKEN=
-COINDCX_SESSION_FILE=./session.token
+```bash
+npm run refresh-session                                 # headless login -> session.token
+pm2 start ecosystem.config.js --only straddle-1dte
+pm2 save                                                # survive a PM2 daemon restart
+pm2 logs straddle-1dte --lines 40
+```
 
-# Strategy Settings
-ORDER_QUANTITY=0.01
-LEVERAGE=10
-MARGIN_CURRENCY=USDT
-# FALLBACK ONLY: the bot sends the live USDT/INR rate (read per entry from CoinDCX
-# public market data). This value is used solely when that lookup fails.
-CONVERSION_RATE=102
-STRIKE_STEP=250
+### The go/no-go line
 
-# Schedule & Expiry (Single Source of Truth: .env)
-# Changing these here and restarting moves the entry time, PM2 restart, contract rollover, and monitor together.
-EXECUTION_HOUR_IST=18        # Required (0-23): Entry hour in IST
-EXECUTION_MINUTE_IST=15      # Required (0-59): Entry minute in IST
-RESTART_LEAD_MINUTES=45      # Optional (default 45): PM2 pre-entry restart lead time
-DAILY_EXPIRY_HOUR_UTC=8      # Optional (default 8 = 13:30 IST): Fallback 0DTE daily options expiry boundary in UTC
-EXPIRY_MIN_LEAD_MINUTES=30   # Optional (default 30): Minimum minutes ahead required for chosen expiry
+After any start or restart you must see this — it is the single test that the bot will trade:
 
-ENTRY_ORDER_TYPE=Limit
-ENTRY_FILL_TIMEOUT_MS=15000
+```
+[1DTE Scheduler] Arming daily entry schedule at 22:45 IST...
+[Scheduler] Next execution set for: <today> 22:45:00 IST
+[Scheduler] Waiting <n> seconds...
+```
 
-# Risk Management
-SL_MULTIPLIER=2.0
-PROFIT_TARGET_RATIO=0.55
-POLL_INTERVAL_MS=2000
-MAX_MONITOR_MINUTES=1380      # Optional (default 1380 = 23h): Max monitor window before cutoff
-SL_OVERRUN_TOLERANCE=0.10     # Optional (default 0.10 = 10%): Overrun tolerance beyond SL trigger before fallback close
-COST_STOP_ENABLED=true        # Optional (default true): Move surviving leg's venue stop to COST on other leg SL hit via cancel + reopen
-COST_STOP_BUFFER_POINTS=20    # Required > 0 (default 20): Buffer added to entry basis (buffer 0 fires instantly upon short reopen)
-COST_STOP_ON_OVERDUE=keep     # Optional ('keep' | 'close', default keep): Handling when mark is already above cost trigger
-POSITION_TRUTH_GRACE_MS=60000 # Optional (default 60000 = 60s): Grace period post-fill during which absence from positions feed is treated as lag
+If it is missing, the bot will not enter, whatever else the log says. If the seconds don't land on 22:45,
+check `ONEDTE_ENTRY_HOUR_IST` / `ONEDTE_ENTRY_MINUTE_IST`.
 
-# Safe Mode / Testing
-DRY_RUN=false
-ALLOW_INSTANT_EXECUTION=false
+---
 
-# Daily Trade Reporting
-REPORT_DELAY_MINUTES=15        # Optional (default 15, range 0-180): Delay past contract expiry before generating trade report
-REPORT_GIT_AUTHOR_NAME="btc-straddle-0dte bot"
-REPORT_GIT_AUTHOR_EMAIL="bot@straddle-btc-0dte.local"
+## 4. Running it day to day
 
-# Optional Telegram Notifications
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
+- **It is a timer inside one process.** If that process dies, no entry happens, no exit happens, and
+  *nothing tells you*. This is the failure mode that matters most.
+- **The bot's own alerting is a file.** With no `TELEGRAM_BOT_TOKEN`, alerts are journaled to
+  `logs/alerts-<date>.jsonl` and nothing is sent anywhere. That file is *also* silent when the process
+  dies, so it is not sufficient on its own.
+- **Watch the process, not the journal.** The cheap reliable watchdog is a short cron (every 2 minutes)
+  that reads PM2's pid file (`~/.pm2/pids/straddle-1dte-0.pid`), confirms the pid is alive, and confirms
+  `/proc/<pid>/cmdline` still contains `dist/oneDte/index.js` — alerting **once** when it disappears and
+  **once** when it returns. This deployment runs exactly that, and it earned its place immediately: on
+  13 Oct the process died 20 minutes before the entry window and nothing else in the system noticed.
+- `pm2 save` after every change; `pm2 startup` if the box should come back after a reboot.
+- **Restart freely, except between 22:45 and 23:00** — the entry window. Any other time, a restart
+  reconciles `state/` against the venue and resumes. An instance lock (`state/bot-1dte.lock`) prevents two
+  copies running at once and self-heals a lock left by a dead pid.
+
+---
+
+## 5. Configuration (`.env`)
+
+Everything is environment-driven; there are no hidden constants. The keys that matter for this bot:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `ONEDTE_ENTRY_HOUR_IST` / `ONEDTE_ENTRY_MINUTE_IST` | 22 / 45 | Entry time |
+| `ONEDTE_EXIT_HOUR_IST` / `ONEDTE_EXIT_MINUTE_IST` | 17 / 45 | Scheduled exit, next day |
+| `ONEDTE_MIN_PREMIUM` / `ONEDTE_MAX_PREMIUM` | 100 / 150 | Band a leg's premium must sit in |
+| `ONEDTE_ORDER_QUANTITY` | 0.01 | BTC per leg |
+| `ONEDTE_LEVERAGE` | 10 | |
+| `ONEDTE_SL_MULTIPLIER` | 2.0 | Venue stop = entry × this |
+| `ONEDTE_PROFIT_TARGET_RATIO` | 0.50 | Exit when this share of the credit is earned |
+| `ONEDTE_POLL_INTERVAL_MS` | 3000 | Risk-monitor cadence |
+| `ONEDTE_PRICE_TICK` | 5 | **Required by the venue** — see §7.1 |
+| `ONEDTE_ENTRY_ORDER_TYPE` | `Limit` | Never `Market`: it skips quotes and loses the exchange stop |
+| `ONEDTE_STATE_DIR` | `./state` | Where cycles are persisted |
+| `COINDCX_SESSION_FILE` | `./session.token` | Where the refresher writes the token |
+| `COINDCX_API_KEY` / `COINDCX_API_SECRET` | — | HMAC keys; the **options** API rejects them (§7.5) |
+| `COINDCX_WEB_EMAIL` / `COINDCX_WEB_PASSWORD` / `COINDCX_TOTP_SECRET` | — | Only for `npm run refresh-session` |
+| `GMAIL_USER` / `GMAIL_APP_PASSWORD` | — | Only for the email OTP during refresh |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | empty | Optional; unset means alerts only reach the journal |
+| `DRY_RUN` | `false` | `true` = log orders, send nothing |
+
+`.env` and `session.token` are gitignored. **The retired 0 DTE bot is separately gated** behind
+`I_ACCEPT_0DTE_RISK=true` in `src/index.ts` — you never need it for this bot.
+
+---
+
+## 6. Exits, exactly
+
+A leg is bought back (`reduceOnly`) on the first of:
+
+1. **Profit target** — both legs together have earned `ONEDTE_PROFIT_TARGET_RATIO` × the credit collected.
+   Only evaluated when *every* leg has a live mark, so a stale or partial read can never look like a
+   winner. Reason `PROFIT_TARGET_HIT`.
+2. **Stop** — a leg's mark reaches `entry × ONEDTE_SL_MULTIPLIER`. In practice the **venue's own stop fires
+   first**; the bot acts only if it doesn't (`SL_HIT`, or `SL_FALLBACK_CLOSE` when the mark overshoots).
+3. **Scheduled exit** — 17:45 IST the next day (`MONITOR_WINDOW_ELAPSED`).
+
+Note the contract's own expiry can fall *after* the scheduled exit: the bot exits on the clock, not on
+expiry. (The selector picks the nearest expiry the venue lists, and CoinDCX skips calendar dates — on
+13 Oct 2026 a "1 DTE" entry selected the **15 OCT** expiry.)
+
+---
+
+## 7. Venue behaviours that will cost you a night if you don't know them
+
+All handled in code. Documented because you will meet them in logs — each one cost a night to learn.
+
+1. **Prices must be a multiple of ₹5.** Rounding produced 129 and 121, and the venue rejected the entry
+   with `OCS-TECH-0013 "The min tick size should be 5."` Entry limits are therefore **floored, never
+   rounded** (129.44 → 125), so a marketable limit can never round *up* past the market.
+2. **You cannot arm a stop after the fact.** There is no modify route, and a BUY's stop must sit *below*
+   market, so a protective buy-to-close with an above-market trigger is refused outright. The stop goes
+   **on the opening SELL**: `stopLoss = price × ONEDTE_SL_MULTIPLIER`. Confirm it after entry (§8).
+3. **Position rows carry no quantity.** A row has `positionValue` (a **string**, negative for a short),
+   `avgPrice`, `markPrice`, `stopLoss` — and **no `qty`**. Filtering on `qty` silently matches nothing, so
+   every open leg looks closed. Detect positions by **row presence**; only `positionValue === 0` is flat.
+4. **Every close must be reduce-only.** A duplicate close would flip a short into a long; the venue
+   rejects it with `422 "…reduce-only… no open positions."`
+5. **The options API wants the web session, not the HMAC keys.** Requests need
+   `Authorization: Bearer <token>` **and** a browser `User-Agent`; HMAC is rejected with 401. The token is
+   **IP-bound**, lives ~36 h, and the bot re-reads `session.token` on every request — so a refresh takes
+   effect without a restart.
+6. **The order API sometimes just says "retry".** `OCS-TECH-0024` ("Failed to place the order. Please
+   retry.") is a transient create failure. The client fails over from `/api/v2` to `/api/v1`, and the
+   fallback **does** carry the stop. You will see both lines; the order is fine.
+7. **Error codes:** `OCS-TECH-0015` → dead session token, refresh it. `0013` → symbol/stop/tick problem.
+   `0001` → missing parameter. `0002` → no route.
+8. **Instruments are discovered, never computed.** The bot reads the public instruments feed and groups by
+   expiry rather than deriving a date, because the venue's listing calendar skips days. If the feed is
+   unreachable it logs loudly and falls back to arithmetic; if neither works it aborts with zero orders.
+   Options sit on a **250 strike grid**.
+
+---
+
+## 8. Verify a live position (do this after your first entry)
+
+```bash
+cat state/onedte-state-<date>.json                # what the bot believes + the stops it intended
+npm run verify -- --cycle <YYYY-MM-DD>            # reconciles the cycle's records against the venue
+npm run doctor                                    # connectivity / token / account sanity
+python3 scripts/btc-position-monitor.py           # standalone, read-only position monitor
+```
+
+Then confirm the two things that matter on the **resting orders**:
+
+```
+stopOrderType: StopLoss      # the stop exists
+triggerPrice: 260            # == entry × ONEDTE_SL_MULTIPLIER
+slTriggerBy: MarkPrice       # mark-triggered, not last-price
+reduceOnly: True             # can only close, never flip you long
+orderStatus: Untriggered     # armed, waiting
+```
+
+If those fields are absent, your stop is **not** armed — and then the profit target is all you have.
+
+### Known cosmetic issue
+
+The entry's journal message still uses the retired 0 DTE straddle wording (`🚀 BTC 0DTE Straddle Entered`,
+`ATM Strike: $…`). The legs, strikes and fills printed beneath it are the 1 DTE strangle's and are correct.
+Cosmetic only.
+
+---
+
+## 9. Commands, tests and safe modes
+
+| Command | What it does |
+| --- | --- |
+| `npm run build` | Compile `src/` → `dist/` (the bot runs `dist/`) |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm test` | The 1 DTE executor suite: tick flooring, fill verification, half-fill unwind |
+| `npm run doctor` | Live connectivity / token / account check |
+| `npm run verify -- --cycle <date>` | Reconcile a cycle's recorded claims against the venue |
+| `npm run plan` | Read-only inspection: spot, strikes, expiry, margin preview — no orders |
+| `DRY_RUN=true npm run run-once:1dte` | One full 1 DTE cycle, no orders sent |
+| `npm run start:1dte` | Run the 1 DTE timer in the foreground (PM2 does this for you) |
+| `ALLOW_INSTANT_EXECUTION=true npm run run-once:1dte` | One 1 DTE cycle **immediately**, bypassing the 22:45 timer |
+| `npm run acceptance` | Legacy 0 DTE acceptance suite — still asserts 0 DTE behaviour and reports failures for the retired path. **Not a gate for this bot.** |
+
+`scripts/pre-commit-secrets.cjs` + `.githooks/` scan staged changes for tokens and secrets
+(`npm run scan-secrets`, `npm run verify:hooks`).
+
+---
+
+## 10. Records, verification and reports
+
+- **Per-cycle records** — `records/<date>.jsonl` (event ledger), `.mtm.jsonl` (mark-to-market tape) and
+  `.summary.json` (materialized summary), each recursively scrubbed of secrets.
+- **Venue verification** — every recorded claim is checked against the broker terminal and judged
+  `MATCH` / `MISMATCH` / `UNVERIFIED`, with an overall `VERIFIED` / `PARTIAL` / `FAILED` verdict.
+- **Daily reports** — generated at expiry + `REPORT_DELAY_MINUTES` and published to the bot-owned
+  `reports` branch via isolated git plumbing, never touching `main`:
+
+  ```bash
+  npm run report -- --cycle 2026-10-13 --stdout     # print
+  npm run report -- --cycle 2026-10-13 --dry-run    # build, don't publish
+  npm run report -- --cycle 2026-10-13              # publish to the reports branch
+  ```
+
+---
+
+## 11. Session refresh
+
+**Headless (recommended).** Set `COINDCX_WEB_EMAIL`, `COINDCX_WEB_PASSWORD`, `COINDCX_TOTP_SECRET`,
+`GMAIL_USER`, `GMAIL_APP_PASSWORD` in `.env`, then:
+
+```bash
+npm run refresh-session
+```
+
+Headless stealth Chromium logs in, polls Gmail for the 2FA email OTP, generates the Authenticator TOTP,
+and writes `session.token`.
+
+A nightly cron is worth it — the token lasts ~36 h, so one refresh a day keeps a 22:45 entry covered:
+
+```cron
+30 0 * * * cd /path/to/repo && npm run refresh-session >> logs/refresh.log 2>&1
+```
+
+*(00:30 UTC = 06:00 IST. A system crontab runs in **UTC** while the bot thinks in IST.)*
+
+**Manual fallback.** Log in to CoinDCX in Chrome → DevTools → **Network** → filter `options` → click any
+`api/v1/options/...` request → copy the `authorization` header value → `echo "<token>" > session.token`.
+Mind the IP binding.
+
+---
+
+## 12. Layout
+
+```
+src/oneDte/        config.ts · selector.ts · executor.ts · monitor.ts · stateStore.ts · index.ts
+src/client.ts      CoinDCX client: orders, positions, wallet, v2→v1 fallback
+src/records/       per-cycle ledger + venue verification
+src/reports/       daily report generation and git publishing
+scripts/           refresh-session.cjs · btc-position-monitor.py · acceptance runner · secret scanner
+state/ logs/ records/ reports/    runtime artefacts (all gitignored)
 ```
 
 ---
 
-## Running the Bot
+## Disclaimer
 
-- **Plan Mode (Safe Inspection — No Orders)**:
-  ```bash
-  npm run plan
-  ```
-  Validates spot price, ATM strike derivation on 250 grid, next expiry date, margin preview, and prints SL/PT levels.
-
-- **Run Single Cycle in Dry Run Mode (No Real Orders)**:
-  ```bash
-  DRY_RUN=true npm run run-once
-  ```
-
-- **Run Single Cycle Live**:
-  ```bash
-  ALLOW_INSTANT_EXECUTION=true npm run run-once
-  ```
-
-- **Start Daily 0 DTE Scheduler (6:15 PM IST)**:
-  ```bash
-  npm start
-  ```
-
-- **Start Daily 1 DTE Options Seller (10:45 PM IST)**:
-  ```bash
-  npm run start:1dte
-  ```
-
-- **Run 1 DTE Once (Immediate Execution)**:
-  ```bash
-  ALLOW_INSTANT_EXECUTION=true npm run run-once:1dte
-  ```
-
-- **Compile TypeScript**:
-  ```bash
-  npm run build
-  ```
-
-- **Typecheck**:
-  ```bash
-  npm run typecheck
-  ```
-
-- **Run Tests**:
-  ```bash
-  npm test
-  ```
-
-- **Generate Daily Trade Report**:
-  ```bash
-  # Print report for a cycle to stdout
-  npm run report -- --cycle 2026-10-05 --stdout
-
-  # Generate and publish to reports branch (dry run)
-  npm run report -- --cycle 2026-10-05 --dry-run
-
-  # Generate and commit to reports branch
-  npm run report -- --cycle 2026-10-05
-  ```
+Sold options carry unlimited risk in principle. This bot's protection is a stop order resting on the venue
+plus a 50%-of-credit target, sized at 0.01 BTC per leg. Trade it with money you can afford to lose, on an
+account you would not mind losing, and watch the first cycles by hand. No warranty; no liability for
+losses.
 
 ---
 
 ## CoinDCX Referral & Rewards
 
 > **Limited time: ₹10L worth of BTC rewards up for grabs!** 🚀
-> 
+>
 > Trade Spot or Futures on CoinDCX and win assured Bitcoin rewards worth up to ₹10L.
 > Tap here to register: [CoinDCX Referral Sign Up](https://invite.coindcx.com/49594056)
-> 
+>
 > Let's make your first step the right one! 🚀
-
