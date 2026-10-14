@@ -123,6 +123,7 @@ Everything is environment-driven; there are no hidden constants. The keys that m
 | `ONEDTE_ORDER_QUANTITY`                                              | 0.01              | BTC per leg                                                                  |
 | `ONEDTE_LEVERAGE`                                                    | 10                |                                                                              |
 | `ONEDTE_SL_MULTIPLIER`                                               | 2.0               | Venue stop = entry × this                                                    |
+| `SL_OVERRUN_TOLERANCE`                                               | 0.10              | Fallback close fires only once the mark overshoots the stop by this share    |
 | `ONEDTE_PROFIT_TARGET_RATIO`                                         | 0.50              | Exit when this share of the credit is earned                                 |
 | `ONEDTE_POLL_INTERVAL_MS`                                            | 3000              | Risk-monitor cadence                                                         |
 | `ONEDTE_PRICE_TICK`                                                  | 5                 | **Required by the venue** — see §7.1                                         |
