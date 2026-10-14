@@ -698,5 +698,98 @@ describe('1 DTE Entry Integrity Tests', () => {
     // Invariant: a leg that filled is bought back before attempt ends
     assert.ok(buyBacks.includes('BTC-TOMORROW-85000-C-USDT'));
   });
+
+  it('a FAILED cancel of the resting order withholds the replacement sell — no double sell', async () => {
+    const placed: Array<{ symbol: string; price: any }> = [];
+    let orderCounter = 0;
+    let cancelCalls = 0;
+
+    const mockClient = {
+      getOptionsInstruments: async () => getMockInstruments(),
+      getOptionsTicker: async () => [
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', askPrice: '130', markPrice: '125', bidSize: '10' },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '125', askPrice: '130', markPrice: '125', bidSize: '10' },
+      ],
+      // The venue refuses the cancel (already filled, not found, or a network fault): nothing was
+      // cancelled and the previous order may still be resting.
+      cancelOptionsOrder: async () => {
+        cancelCalls++;
+        return false;
+      },
+      placeOptionsOrder: async (symbol: string, _side: string, _q: number, _t: string, price: any) => {
+        orderCounter++;
+        placed.push({ symbol, price });
+        return { symbol, side: 'sell', success: true, orderId: `order-${orderCounter}-${symbol}`, limitPrice: Number(price) };
+      },
+      // Never fills: this is the case that triggers the re-quote.
+      getOptionsPositions: async () => [],
+    } as unknown as CoinDCXClient;
+
+    const cfg: OneDteConfig = {
+      ...dummyConfig,
+      premiumSource: 'bid',
+      requoteAfterMs: 50,
+      maxRequotes: 2,
+      entryFillTimeoutMs: 400,
+    };
+
+    const res = await executeOneDteEntry(mockClient, cfg);
+
+    assert.ok(cancelCalls > 0, 'SETUP: a cancel must have been attempted');
+    const callSells = placed.filter((p) => p.symbol.includes('-C-'));
+    const putSells = placed.filter((p) => p.symbol.includes('-P-'));
+    assert.equal(
+      callSells.length,
+      1,
+      `a second CALL sell must never be placed while the first may still be resting (placed: ${callSells.map((p) => p.price).join(', ')})`
+    );
+    assert.equal(putSells.length, 1, 'a second PUT sell must never be placed while the first may still be resting');
+    assert.equal(res, null, 'the attempt must abort');
+  });
+
+  it('a cancel that fails mid-chase stops further placements for that leg', async () => {
+    const placedIds: string[] = [];
+    let orderCounter = 0;
+    let callCancelCalls = 0;
+
+    const mockClient = {
+      getOptionsInstruments: async () => getMockInstruments(),
+      getOptionsTicker: async () => [
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', askPrice: '130', markPrice: '125', bidSize: '10' },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '125', askPrice: '130', markPrice: '125', bidSize: '10' },
+      ],
+      // CALL: the first cancel succeeds (so one replacement is placed), the second fails — after which no
+      // further sell may be placed, because the previous one may still be resting. PUT: cancels succeed.
+      cancelOptionsOrder: async (orderId: string) => {
+        if (orderId.includes('-C-')) {
+          callCancelCalls++;
+          return callCancelCalls === 1;
+        }
+        return true;
+      },
+      placeOptionsOrder: async (symbol: string, _side: string, _q: number, _t: string, price: any) => {
+        orderCounter++;
+        const id = `order-${orderCounter}-${symbol}`;
+        placedIds.push(id);
+        return { symbol, side: 'sell', success: true, orderId: id, limitPrice: Number(price) };
+      },
+      getOptionsPositions: async () => [],
+    } as unknown as CoinDCXClient;
+
+    const cfg: OneDteConfig = {
+      ...dummyConfig,
+      premiumSource: 'bid',
+      requoteAfterMs: 50,
+      maxRequotes: 2,
+      entryFillTimeoutMs: 400,
+    };
+
+    await executeOneDteEntry(mockClient, cfg);
+
+    const callPlacements = placedIds.filter((id) => id.includes('-C-')).length;
+    const putPlacements = placedIds.filter((id) => id.includes('-P-')).length;
+    assert.equal(callPlacements, 2, `the CALL must stop at 2 placements once a cancel fails (got ${callPlacements})`);
+    assert.equal(putPlacements, 3, `the PUT, whose cancels succeed, must still use all 3 placements (got ${putPlacements})`);
+  });
 });
 
