@@ -40,8 +40,17 @@ export interface OneDteConfig {
   // (0.5 = exit as soon as the combined gain reaches 50% of the total credit).
   readonly profitTargetRatio: number;
 
-  // The venue's price tick for option prices: limit prices must be a multiple of this
-  // (422 OCS-TECH-0013 "The min tick size should be 5." otherwise).
+  // Premium source: 'bid' | 'mark' (default: 'bid')
+  readonly premiumSource: 'bid' | 'mark';
+
+  // Allow out-of-band fallback: true | false (default: false)
+  readonly allowOutOfBandFallback: boolean;
+
+  // Re-quote timing & limits
+  readonly requoteAfterMs: number;
+  readonly maxRequotes: number;
+
+  // Option prices must be a multiple of this tick.
   readonly priceTick: number;
 }
 
@@ -100,6 +109,16 @@ export const oneDteConfig: OneDteConfig = {
 
   // Exit once this share of the credit sold has been earned (0.5 = 50%).
   profitTargetRatio: getEnvNumber('ONEDTE_PROFIT_TARGET_RATIO', 0.5),
+
+  // Premium source: 'bid' | 'mark', default 'bid'
+  premiumSource: (process.env.ONEDTE_PREMIUM_SOURCE === 'mark' ? 'mark' : 'bid'),
+
+  // Allow out-of-band fallback: default false
+  allowOutOfBandFallback: process.env.ONEDTE_ALLOW_OUT_OF_BAND_FALLBACK === 'true',
+
+  // Requote settings: default 5000ms, max 2 requotes
+  requoteAfterMs: getEnvNumber('ONEDTE_REQUOTE_AFTER_MS', 5000),
+  maxRequotes: getEnvNumber('ONEDTE_MAX_REQUOTES', 2),
 
   // Option prices must be a multiple of this tick.
   priceTick: getEnvNumber('ONEDTE_PRICE_TICK', 5),

@@ -64,6 +64,10 @@ export async function selectOneDteContracts(
   const targetMid = (config.minPremium + config.maxPremium) / 2;
 
   function extractPrice(t: OptionsTickerItem): number {
+    if (config.premiumSource === 'bid') {
+      const val = Number(t.bidPrice);
+      return Number.isFinite(val) && val > 0 ? val : 0;
+    }
     const raw = t.markPrice ?? t.lastPrice ?? t.ltp ?? t.askPrice ?? t.bidPrice;
     const val = Number(raw);
     return Number.isFinite(val) && val > 0 ? val : 0;
@@ -99,6 +103,21 @@ export async function selectOneDteContracts(
       return { symbol: chosen.symbol, strikePrice, premium };
     }
 
+    if (!config.allowOutOfBandFallback) {
+      // Log best observed bid
+      const sortedByDist = candidates.slice().sort((a, b) => {
+        const pA = extractPrice(a);
+        const pB = extractPrice(b);
+        const distA = pA < config.minPremium ? config.minPremium - pA : (pA > config.maxPremium ? pA - config.maxPremium : 0);
+        const distB = pB < config.minPremium ? config.minPremium - pB : (pB > config.maxPremium ? pB - config.maxPremium : 0);
+        return distA - distB;
+      });
+      const best = sortedByDist[0];
+      const bestBid = extractPrice(best);
+      console.warn(`[1DTE Discovery] ⚠️ No ${type} strictly in [${config.minPremium}, ${config.maxPremium}] and out-of-band fallback is disabled. Best observed: ${best?.symbol || 'none'} @ $${bestBid.toFixed(2)}`);
+      return null;
+    }
+
     // Fallback: Pick nearest strike to the range
     candidates.slice().sort((a, b) => {
       const pA = extractPrice(a);
@@ -116,6 +135,11 @@ export async function selectOneDteContracts(
 
   const chosenCall = pickBestContract(callTickers, 'CALL');
   const chosenPut = pickBestContract(putTickers, 'PUT');
+
+  if (!chosenCall || !chosenPut) {
+    console.error(`[1DTE Discovery] Could not select both legs in band (calls=${chosenCall ? 'found' : 'none'}, puts=${chosenPut ? 'found' : 'none'}).`);
+    return null;
+  }
 
   return {
     expiryTimeMs: targetExpiryMs,
