@@ -20,6 +20,10 @@ export const roundToTick = (price: number, tick: number): number => {
   return Math.floor(price / t) * t;
 };
 
+export const entryLimitFromBid = (bid: number, tick: number): number => {
+  return roundToTick(bid, tick);
+};
+
 export async function buyBackFilledLeg(
   client: CoinDCXClient,
   symbol: string,
@@ -191,21 +195,74 @@ export async function executeOneDteEntry(
     `[1DTE Execution] Target scheduled exit: ${new Date(targetExitUtcMs).toISOString()} (${config.exitHourIST}:${String(config.exitMinuteIST).padStart(2, '0')} IST next day)`
   );
 
-  // Compute entry limit prices and protective stopLoss triggers
-  const callLimitPrice = config.entryOrderType === 'Limit' ? roundToTick(call.premium, config.priceTick) : undefined;
-  const putLimitPrice = config.entryOrderType === 'Limit' ? roundToTick(put.premium, config.priceTick) : undefined;
+  // 3.6 Refuse to place an unpriceable leg
+  if (!call.premium || call.premium <= 0 || !put.premium || put.premium <= 0) {
+    const failureReason = `Unpriceable leg detected: Call bid=${call.premium}, Put bid=${put.premium}. Aborting entry before placing anything.`;
+    console.error(`[1DTE Execution] 🚨 ${failureReason}`);
+    const todayStr = getTodayDateStringIST();
+    const abortedState: OneDtePositionState = {
+      date: todayStr,
+      expiryTimeMs,
+      entryExecuted: false,
+      targetExitUtcMs,
+      callLeg: {
+        legType: 'CALL',
+        symbol: call.symbol,
+        strikePrice: call.strikePrice,
+        entryPrice: 0,
+        stopLossPrice: 0,
+        quantity: config.orderQuantity,
+        entryBid: call.premium,
+        status: 'closed',
+        currentPrice: 0,
+      },
+      putLeg: {
+        legType: 'PUT',
+        symbol: put.symbol,
+        strikePrice: put.strikePrice,
+        entryPrice: 0,
+        stopLossPrice: 0,
+        quantity: config.orderQuantity,
+        entryBid: put.premium,
+        status: 'closed',
+        currentPrice: 0,
+      },
+      totalCreditReceived: 0,
+      combinedPnLPoints: 0,
+      status: 'closed',
+      failureReason,
+    };
+    await saveOneDteState(abortedState, todayStr);
+    if (notifier) void notifier.notifyError('1 DTE Entry Aborted (Unpriceable Leg)', new Error(failureReason));
+    return null;
+  }
 
-  const callBasePrice = callLimitPrice ?? call.premium;
-  const putBasePrice = putLimitPrice ?? put.premium;
+  // 3.4 & 3.7 Compute entry limits, SL triggers, and log self-explaining entry lines
+  let callLimitPrice = config.entryOrderType === 'Limit' ? roundToTick(call.premium, config.priceTick) : undefined;
+  let putLimitPrice = config.entryOrderType === 'Limit' ? roundToTick(put.premium, config.priceTick) : undefined;
 
-  const callStopLoss = Math.round(callBasePrice * config.stopLossMultiplier);
-  const putStopLoss = Math.round(putBasePrice * config.stopLossMultiplier);
+  let callBasePrice = callLimitPrice ?? call.premium;
+  let putBasePrice = putLimitPrice ?? put.premium;
+
+  let callStopLoss = Math.round(callBasePrice * config.stopLossMultiplier);
+  let putStopLoss = Math.round(putBasePrice * config.stopLossMultiplier);
+
+  let currentCallBid = call.premium;
+  let currentPutBid = put.premium;
+
+  // Log self-explaining lines
+  console.log(
+    `[1DTE Entry Diagnostic] CALL: symbol=${call.symbol}, bid=${currentCallBid}, limit=${callLimitPrice ?? 'Market'}, SL=${callStopLoss}`
+  );
+  console.log(
+    `[1DTE Entry Diagnostic] PUT : symbol=${put.symbol}, bid=${currentPutBid}, limit=${putLimitPrice ?? 'Market'}, SL=${putStopLoss}`
+  );
 
   // Place Sell Orders with protective stopLoss armed on the opening SELL
   console.log(
     `[1DTE Execution] Placing SELL orders for ${call.symbol} (price: ${callLimitPrice ?? 'Market'}, SL: ${callStopLoss}) and ${put.symbol} (price: ${putLimitPrice ?? 'Market'}, SL: ${putStopLoss})...`
   );
-  const [callOrder, putOrder] = await Promise.all([
+  let [callOrder, putOrder] = await Promise.all([
     client.placeOptionsOrder(
       call.symbol,
       'sell',
@@ -248,6 +305,7 @@ export async function executeOneDteEntry(
         entryPrice: callBasePrice,
         stopLossPrice: callStopLoss,
         quantity: config.orderQuantity,
+        entryBid: currentCallBid,
         orderId: callOrder.orderId,
         status: 'closed',
         currentPrice: callBasePrice,
@@ -259,6 +317,7 @@ export async function executeOneDteEntry(
         entryPrice: putBasePrice,
         stopLossPrice: putStopLoss,
         quantity: config.orderQuantity,
+        entryBid: currentPutBid,
         orderId: putOrder.orderId,
         status: 'closed',
         currentPrice: putBasePrice,
@@ -294,6 +353,7 @@ export async function executeOneDteEntry(
         entryPrice: callOrder.limitPrice ?? callBasePrice,
         stopLossPrice: callStopLoss,
         quantity: config.orderQuantity,
+        entryBid: currentCallBid,
         orderId: callOrder.orderId,
         status: 'closed',
         currentPrice: callOrder.limitPrice ?? callBasePrice,
@@ -305,6 +365,7 @@ export async function executeOneDteEntry(
         entryPrice: putBasePrice,
         stopLossPrice: putStopLoss,
         quantity: config.orderQuantity,
+        entryBid: currentPutBid,
         orderId: putOrder.orderId,
         status: 'closed',
         currentPrice: putBasePrice,
@@ -340,6 +401,7 @@ export async function executeOneDteEntry(
         entryPrice: callBasePrice,
         stopLossPrice: callStopLoss,
         quantity: config.orderQuantity,
+        entryBid: currentCallBid,
         orderId: callOrder.orderId,
         status: 'closed',
         currentPrice: callBasePrice,
@@ -351,6 +413,7 @@ export async function executeOneDteEntry(
         entryPrice: putOrder.limitPrice ?? putBasePrice,
         stopLossPrice: putStopLoss,
         quantity: config.orderQuantity,
+        entryBid: currentPutBid,
         orderId: putOrder.orderId,
         status: 'closed',
         currentPrice: putOrder.limitPrice ?? putBasePrice,
@@ -368,15 +431,129 @@ export async function executeOneDteEntry(
     return null;
   }
 
-  // Case 3: both orders were ACCEPTED — now prove they actually filled.
-  // An accepted order can still be resting (a limit above the market), and a resting leg means the other
-  // side is short on its own. Verify against the venue; never record an entry that did not happen.
+  // Case 3: both orders were ACCEPTED — poll venue positions and re-quote if necessary.
   let callFillPrice: number | undefined;
   let putFillPrice: number | undefined;
+
   if (config.dryRun) {
     console.log('[1DTE Execution] DRY RUN: skipping venue fill verification.');
   } else {
-    const fills = await verifyFillsByPosition(client, call.symbol, put.symbol, config.entryFillTimeoutMs);
+    const startMs = Date.now();
+    const requoteIntervalMs = config.requoteAfterMs;
+    const maxRequotes = config.maxRequotes;
+    let requotesCount = 0;
+    let nextRequoteCheckTime = startMs + requoteIntervalMs;
+
+    let fills: FillCheck = { callFilled: false, putFilled: false };
+
+    while (Date.now() - startMs < config.entryFillTimeoutMs) {
+      try {
+        const positions = await client.getOptionsPositions();
+        const c = readLegFill(positions, call.symbol);
+        const p = readLegFill(positions, put.symbol);
+        fills = { callFilled: c.filled, putFilled: p.filled, callFillPrice: c.price, putFillPrice: p.price };
+        if (fills.callFilled && fills.putFilled) {
+          break;
+        }
+      } catch (err) {
+        console.warn(`[1DTE Execution] Position check error: ${(err as Error).message}`);
+      }
+
+      // Check if time for requote
+      if (Date.now() >= nextRequoteCheckTime && requotesCount < maxRequotes) {
+        requotesCount++;
+        console.log(`[1DTE Execution] Checking for re-quote (attempt ${requotesCount}/${maxRequotes})...`);
+
+        try {
+          // Re-fetch live tickers for updated bids
+          const tickers = await client.getOptionsTicker('BTC', expiryTimeMs);
+
+          // Handle CALL leg requote if not filled
+          if (!fills.callFilled && callOrder.orderId) {
+            console.log(`[1DTE Execution] Re-quoting CALL ${call.symbol}: cancelling resting order ${callOrder.orderId}...`);
+            const cancelled = await client.cancelOptionsOrder(callOrder.orderId, call.symbol);
+            console.log(`[1DTE Execution] Cancelled CALL order ${callOrder.orderId}: ${cancelled}`);
+
+            const callTicker = tickers.find((t) => t.symbol === call.symbol);
+            const rawBid = callTicker ? Number(callTicker.bidPrice) : 0;
+            if (rawBid > 0) {
+              currentCallBid = rawBid;
+              callLimitPrice = roundToTick(rawBid, config.priceTick);
+              callBasePrice = callLimitPrice;
+              callStopLoss = Math.round(callBasePrice * config.stopLossMultiplier);
+
+              console.log(
+                `[1DTE Execution] Re-placing SELL for CALL ${call.symbol} (bid: ${rawBid}, new limit: ${callLimitPrice}, new SL: ${callStopLoss})...`
+              );
+              callOrder = await client.placeOptionsOrder(
+                call.symbol,
+                'sell',
+                config.orderQuantity,
+                config.entryOrderType,
+                callLimitPrice,
+                String(callStopLoss),
+                '',
+                undefined,
+                false
+              );
+            } else {
+              console.warn(`[1DTE Execution] ⚠️ No valid bid found for CALL ${call.symbol} during re-quote`);
+            }
+          }
+
+          // Handle PUT leg requote if not filled
+          if (!fills.putFilled && putOrder.orderId) {
+            console.log(`[1DTE Execution] Re-quoting PUT ${put.symbol}: cancelling resting order ${putOrder.orderId}...`);
+            const cancelled = await client.cancelOptionsOrder(putOrder.orderId, put.symbol);
+            console.log(`[1DTE Execution] Cancelled PUT order ${putOrder.orderId}: ${cancelled}`);
+
+            const putTicker = tickers.find((t) => t.symbol === put.symbol);
+            const rawBid = putTicker ? Number(putTicker.bidPrice) : 0;
+            if (rawBid > 0) {
+              currentPutBid = rawBid;
+              putLimitPrice = roundToTick(rawBid, config.priceTick);
+              putBasePrice = putLimitPrice;
+              putStopLoss = Math.round(putBasePrice * config.stopLossMultiplier);
+
+              console.log(
+                `[1DTE Execution] Re-placing SELL for PUT ${put.symbol} (bid: ${rawBid}, new limit: ${putLimitPrice}, new SL: ${putStopLoss})...`
+              );
+              putOrder = await client.placeOptionsOrder(
+                put.symbol,
+                'sell',
+                config.orderQuantity,
+                config.entryOrderType,
+                putLimitPrice,
+                String(putStopLoss),
+                '',
+                undefined,
+                false
+              );
+            } else {
+              console.warn(`[1DTE Execution] ⚠️ No valid bid found for PUT ${put.symbol} during re-quote`);
+            }
+          }
+        } catch (rqErr) {
+          console.warn(`[1DTE Execution] ⚠️ Re-quote attempt ${requotesCount} failed: ${(rqErr as Error).message}`);
+        }
+
+        nextRequoteCheckTime = Date.now() + requoteIntervalMs;
+      }
+
+      const sleepMs = Math.max(10, Math.min(config.pollIntervalMs, config.requoteAfterMs, 1000));
+      await new Promise((resolve) => setTimeout(resolve, sleepMs));
+    }
+
+    // Final position check
+    if (!fills.callFilled || !fills.putFilled) {
+      try {
+        const positions = await client.getOptionsPositions();
+        const c = readLegFill(positions, call.symbol);
+        const p = readLegFill(positions, put.symbol);
+        fills = { callFilled: c.filled, putFilled: p.filled, callFillPrice: c.price, putFillPrice: p.price };
+      } catch {}
+    }
+
     if (!fills.callFilled || !fills.putFilled) {
       const missing = [!fills.callFilled ? call.symbol : '', !fills.putFilled ? put.symbol : ''].filter(Boolean).join(', ');
       const failureReason = `Fill verification failed for ${missing}: order accepted but no venue position within ${config.entryFillTimeoutMs}ms.`;
@@ -411,6 +588,7 @@ export async function executeOneDteEntry(
           entryPrice: callBasePrice,
           stopLossPrice: callStopLoss,
           quantity: config.orderQuantity,
+          entryBid: currentCallBid,
           orderId: callOrder.orderId,
           status: 'closed',
           currentPrice: callBasePrice,
@@ -422,6 +600,7 @@ export async function executeOneDteEntry(
           entryPrice: putBasePrice,
           stopLossPrice: putStopLoss,
           quantity: config.orderQuantity,
+          entryBid: currentPutBid,
           orderId: putOrder.orderId,
           status: 'closed',
           currentPrice: putBasePrice,
@@ -438,7 +617,7 @@ export async function executeOneDteEntry(
       }
       return null;
     }
-    // Record the venue's own fill prices, not our quoted limits.
+
     callFillPrice = fills.callFillPrice;
     putFillPrice = fills.putFillPrice;
   }
@@ -456,6 +635,7 @@ export async function executeOneDteEntry(
     entryPrice: callEntry,
     stopLossPrice: callStopLoss,
     quantity: config.orderQuantity,
+    entryBid: currentCallBid,
     orderId: callOrder.orderId,
     status: 'open',
     currentPrice: callEntry,
@@ -468,6 +648,7 @@ export async function executeOneDteEntry(
     entryPrice: putEntry,
     stopLossPrice: putStopLoss,
     quantity: config.orderQuantity,
+    entryBid: currentPutBid,
     orderId: putOrder.orderId,
     status: 'open',
     currentPrice: putEntry,

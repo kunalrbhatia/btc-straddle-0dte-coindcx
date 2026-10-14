@@ -9,6 +9,7 @@ export interface OneDteLeg {
   readonly quantity: number;
   readonly orderId?: string;
   readonly stopOrderId?: string;
+  readonly entryBid?: number;
   status: LegStatus;
   currentPrice: number;
   exitPrice?: number;

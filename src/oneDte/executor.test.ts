@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { roundToTick, executeOneDteEntry } from './executor';
+import { roundToTick, entryLimitFromBid, executeOneDteEntry } from './executor';
+import { selectOneDteContracts } from './selector';
 import { OneDteConfig } from './config';
 import { CoinDCXClient } from '../client';
 import { loadOneDteState } from './stateStore';
@@ -31,6 +32,10 @@ const dummyConfig: OneDteConfig = {
   pollIntervalMs: 3000,
   slOverrunTolerance: 0.1,
   profitTargetRatio: 0.5,
+  premiumSource: 'bid',
+  allowOutOfBandFallback: false,
+  requoteAfterMs: 5000,
+  maxRequotes: 2,
   priceTick: 5,
 };
 
@@ -101,6 +106,16 @@ describe('1 DTE Entry Integrity Tests', () => {
     assert.equal(roundToTick(120.6, 5) % 5, 0);
     assert.equal(roundToTick(100, 5) % 5, 0);
     assert.equal(roundToTick(102.5, 5) % 5, 0);
+
+    // Acceptance 1: Pricing helper entryLimitFromBid
+    assert.equal(entryLimitFromBid(90, 5), 90);
+    assert.equal(entryLimitFromBid(93.2, 5), 90);
+    assert.equal(entryLimitFromBid(92.5, 5), 90);
+    assert.equal(entryLimitFromBid(90, 5) % 5, 0);
+    assert.equal(entryLimitFromBid(93.2, 5) % 5, 0);
+    assert.equal(entryLimitFromBid(92.5, 5) % 5, 0);
+    // Math.round(93.2/5)*5 is 95, so an assertion using Math.round semantics must fail:
+    assert.notEqual(entryLimitFromBid(93.2, 5), Math.round(93.2 / 5) * 5);
   });
 
   it('opening SELL order payload arms stopLoss at exactly 2x price (> price) and satisfies price % 5 === 0', async () => {
@@ -117,8 +132,8 @@ describe('1 DTE Entry Integrity Tests', () => {
     const mockClient = {
       getOptionsInstruments: async () => getMockInstruments(),
       getOptionsTicker: async () => [
-        { symbol: 'BTC-TOMORROW-85000-C-USDT', lastPrice: 129.44 },
-        { symbol: 'BTC-TOMORROW-85000-P-USDT', lastPrice: 120.6 },
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', lastPrice: 129.44 },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '120', lastPrice: 120.6 },
       ],
       // The venue's own fills: 128 / 122, deliberately different from the 125 / 120 limits we quoted,
       // so the test proves the record uses the fill and not the quote.
@@ -205,8 +220,8 @@ describe('1 DTE Entry Integrity Tests', () => {
     const mockClient = {
       getOptionsInstruments: async () => getMockInstruments(),
       getOptionsTicker: async () => [
-        { symbol: 'BTC-TOMORROW-85000-C-USDT', lastPrice: 129.44 },
-        { symbol: 'BTC-TOMORROW-85000-P-USDT', lastPrice: 120.6 },
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', lastPrice: 129.44 },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '120', lastPrice: 120.6 },
       ],
       placeOptionsOrder: async (symbol: string, side: 'buy' | 'sell') => {
         if (side === 'sell') {
@@ -248,8 +263,8 @@ describe('1 DTE Entry Integrity Tests', () => {
     const mockClient = {
       getOptionsInstruments: async () => getMockInstruments(),
       getOptionsTicker: async () => [
-        { symbol: 'BTC-TOMORROW-85000-C-USDT', lastPrice: 125 },
-        { symbol: 'BTC-TOMORROW-85000-P-USDT', lastPrice: 125 },
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', lastPrice: 125 },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '125', lastPrice: 125 },
       ],
       placeOptionsOrder: async (
         symbol: string,
@@ -309,8 +324,8 @@ describe('1 DTE Entry Integrity Tests', () => {
     const mockClient = {
       getOptionsInstruments: async () => getMockInstruments(),
       getOptionsTicker: async () => [
-        { symbol: 'BTC-TOMORROW-85000-C-USDT', lastPrice: 125 },
-        { symbol: 'BTC-TOMORROW-85000-P-USDT', lastPrice: 125 },
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', lastPrice: 125 },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '125', lastPrice: 125 },
       ],
       placeOptionsOrder: async (
         symbol: string,
@@ -363,8 +378,8 @@ describe('1 DTE Entry Integrity Tests', () => {
     const mockClient = {
       getOptionsInstruments: async () => getMockInstruments(),
       getOptionsTicker: async () => [
-        { symbol: 'BTC-TOMORROW-85000-C-USDT', lastPrice: 125 },
-        { symbol: 'BTC-TOMORROW-85000-P-USDT', lastPrice: 125 },
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', lastPrice: 125 },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '125', lastPrice: 125 },
       ],
       placeOptionsOrder: async (symbol: string, side: 'buy' | 'sell') => {
         return {
@@ -387,4 +402,301 @@ describe('1 DTE Entry Integrity Tests', () => {
     assert.ok(state.failureReason?.includes('Both legs failed'));
     assert.ok(state.failureReason?.includes('422 OCS-TECH-0013'));
   });
+
+  // Acceptance 2: Selector picks on the bid
+  it('selector picks on the bid and rejects out-of-band contracts when fallback is disabled', async () => {
+    const realExcerpt = [
+      {
+        symbol: 'BTC-16OCT26-84250-C-USDT',
+        bidPrice: '90',
+        bidSize: '19.26',
+        askPrice: '95',
+        askSize: '19.95',
+        lastPrice: '90',
+        markPrice: '104.4239794',
+      },
+      {
+        symbol: 'BTC-16OCT26-79000-P-USDT',
+        bidPrice: '170',
+        bidSize: '41.81',
+        askPrice: '175',
+        askSize: '7.06',
+        lastPrice: '180',
+        markPrice: '137.70673063',
+      },
+    ];
+
+    const mockClient = {
+      getOptionsInstruments: async () => [
+        { symbol: 'BTC-TODAY-80000-C-USDT', optionsType: 'Call', expiryTime: String(Date.now() + 15 * 3600 * 1000), isActive: true },
+        { symbol: 'BTC-16OCT26-84250-C-USDT', optionsType: 'Call', expiryTime: '1792137600000', isActive: true },
+        { symbol: 'BTC-16OCT26-79000-P-USDT', optionsType: 'Put', expiryTime: '1792137600000', isActive: true },
+      ],
+      getOptionsTicker: async () => realExcerpt,
+    } as unknown as CoinDCXClient;
+
+    const cfgNoFallback: OneDteConfig = {
+      ...dummyConfig,
+      premiumSource: 'bid',
+      allowOutOfBandFallback: false,
+      minPremium: 100,
+      maxPremium: 150,
+    };
+
+    const resNoFallback = await selectOneDteContracts(mockClient, cfgNoFallback);
+    assert.equal(resNoFallback, null, 'BTC-16OCT26-84250-C-USDT (bid 90, mark 104.42) must NOT be chosen when allowOutOfBandFallback=false');
+
+    // Flip the fixture's bidPrice to 125
+    const flippedExcerpt = [
+      {
+        symbol: 'BTC-16OCT26-84250-C-USDT',
+        bidPrice: '125',
+        bidSize: '19.26',
+        askPrice: '130',
+        askSize: '19.95',
+        lastPrice: '90',
+        markPrice: '104.4239794',
+      },
+      {
+        symbol: 'BTC-16OCT26-79000-P-USDT',
+        bidPrice: '125',
+        bidSize: '41.81',
+        askPrice: '130',
+        askSize: '7.06',
+        lastPrice: '180',
+        markPrice: '137.70673063',
+      },
+    ];
+    const mockClientFlipped = {
+      getOptionsInstruments: async () => [
+        { symbol: 'BTC-TODAY-80000-C-USDT', optionsType: 'Call', expiryTime: String(Date.now() + 15 * 3600 * 1000), isActive: true },
+        { symbol: 'BTC-16OCT26-84250-C-USDT', optionsType: 'Call', expiryTime: '1792137600000', isActive: true },
+        { symbol: 'BTC-16OCT26-79000-P-USDT', optionsType: 'Put', expiryTime: '1792137600000', isActive: true },
+      ],
+      getOptionsTicker: async () => flippedExcerpt,
+    } as unknown as CoinDCXClient;
+
+    const resFlipped = await selectOneDteContracts(mockClientFlipped, cfgNoFallback);
+    assert.ok(resFlipped);
+    assert.equal(resFlipped.call.symbol, 'BTC-16OCT26-84250-C-USDT');
+    assert.equal(resFlipped.call.premium, 125);
+  });
+
+  // Acceptance 3: A missing bid is never invented
+  it('a missing or zero bid is never invented from markPrice or lastPrice', async () => {
+    const zeroBidExcerpt = [
+      {
+        symbol: 'BTC-16OCT26-84250-C-USDT',
+        bidPrice: '0',
+        bidSize: '0',
+        askPrice: '95',
+        askSize: '19.95',
+        lastPrice: '125',
+        markPrice: '125',
+      },
+      {
+        symbol: 'BTC-16OCT26-79000-P-USDT',
+        bidPrice: '125',
+        bidSize: '41.81',
+        askPrice: '130',
+        askSize: '7.06',
+        lastPrice: '125',
+        markPrice: '125',
+      },
+    ];
+
+    const mockClient = {
+      getOptionsInstruments: async () => [
+        { symbol: 'BTC-TODAY-80000-C-USDT', optionsType: 'Call', expiryTime: String(Date.now() + 15 * 3600 * 1000), isActive: true },
+        { symbol: 'BTC-16OCT26-84250-C-USDT', optionsType: 'Call', expiryTime: '1792137600000', isActive: true },
+        { symbol: 'BTC-16OCT26-79000-P-USDT', optionsType: 'Put', expiryTime: '1792137600000', isActive: true },
+      ],
+      getOptionsTicker: async () => zeroBidExcerpt,
+    } as unknown as CoinDCXClient;
+
+    const cfg: OneDteConfig = {
+      ...dummyConfig,
+      premiumSource: 'bid',
+      allowOutOfBandFallback: true, // even with fallback true, bid=0 must not be chosen
+    };
+
+    const res = await selectOneDteContracts(mockClient, cfg);
+    assert.equal(res, null, 'Selector must reject call with bidPrice 0, never using markPrice/lastPrice');
+  });
+
+  // Acceptance 4: Re-quote before giving up
+  it('cancels resting order before placing replacement on requote and records venue avgPrice', async () => {
+    const cancelledOrders: string[] = [];
+    const placedOrders: Array<{ symbol: string; side: string; price: any; stopLoss: string; orderId: string }> = [];
+    let orderCounter = 0;
+    let positionsCallCount = 0;
+
+    let tickerCallCount = 0;
+    const mockClient = {
+      getOptionsInstruments: async () => getMockInstruments(),
+      getOptionsTicker: async () => {
+        tickerCallCount++;
+        // On re-quote, bid moved from 125 to 120
+        const bid = tickerCallCount === 1 ? '125' : '120';
+        return [
+          { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: bid, askPrice: '130', markPrice: '125', bidSize: '10' },
+          { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: bid, askPrice: '130', markPrice: '125', bidSize: '10' },
+        ];
+      },
+      cancelOptionsOrder: async (orderId: string) => {
+        cancelledOrders.push(orderId);
+        return true;
+      },
+      placeOptionsOrder: async (symbol: string, side: string, _qty: number, _type: string, price: any, stopLoss: string) => {
+        orderCounter++;
+        const id = `order-${orderCounter}-${symbol}`;
+        placedOrders.push({ symbol, side, price, stopLoss, orderId: id });
+        return { symbol, side, success: true, orderId: id, limitPrice: Number(price) };
+      },
+      getOptionsPositions: async () => {
+        positionsCallCount++;
+        // First 2 checks: empty (unfilled). On 3rd check (after requote 1): show positions!
+        if (positionsCallCount >= 3) {
+          return [
+            { symbol: 'BTC-TOMORROW-85000-C-USDT', positionValue: '-0.01', avgPrice: '118' },
+            { symbol: 'BTC-TOMORROW-85000-P-USDT', positionValue: '-0.01', avgPrice: '119' },
+          ];
+        }
+        return [];
+      },
+    } as unknown as CoinDCXClient;
+
+    const cfg: OneDteConfig = {
+      ...dummyConfig,
+      premiumSource: 'bid',
+      requoteAfterMs: 50,
+      maxRequotes: 2,
+      entryFillTimeoutMs: 300,
+    };
+
+    const res = await executeOneDteEntry(mockClient, cfg);
+    assert.ok(res, 'Entry should succeed after requote');
+    assert.equal(res.entryExecuted, true);
+    assert.equal(res.status, 'active');
+
+    // Assert cancel before replacement
+    assert.ok(cancelledOrders.length >= 2, 'Both resting orders should have been cancelled before replacement');
+    // Check call count: exactly 1 cancel + 1 re-place per re-quote
+    assert.equal(placedOrders.filter(p => p.symbol.includes('-C-')).length, 2);
+    assert.equal(placedOrders.filter(p => p.symbol.includes('-P-')).length, 2);
+
+    // Assert entryPrice is venue avgPrice (118, 119), never the limit
+    assert.equal(res.callLeg.entryPrice, 118);
+    assert.equal(res.putLeg.entryPrice, 119);
+    assert.equal(res.callLeg.stopLossPrice, 240); // 2 * 120 (new limit)
+    assert.equal(res.putLeg.stopLossPrice, 240);
+  });
+
+  // Acceptance 5: Chase exhaustion stays safe
+  it('chase exhaustion ends with entryExecuted: false, resting orders cancelled, and unwound', async () => {
+    const cancelledOrders: string[] = [];
+    const buyBacks: string[] = [];
+    let orderCounter = 0;
+
+    const mockClient = {
+      getOptionsInstruments: async () => getMockInstruments(),
+      getOptionsTicker: async () => [
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', askPrice: '130', markPrice: '125' },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '125', askPrice: '130', markPrice: '125' },
+      ],
+      cancelOptionsOrder: async (orderId: string) => {
+        cancelledOrders.push(orderId);
+        return true;
+      },
+      placeOptionsOrder: async (symbol: string, side: string, _qty: number, _type: string, price: any, _sl: string, _tp: string, _cr: any, _reduceOnly = false) => {
+        if (side === 'buy') {
+          buyBacks.push(symbol);
+          return { symbol, side, success: true, orderId: `bb-${symbol}` };
+        }
+        orderCounter++;
+        return { symbol, side, success: true, orderId: `order-${orderCounter}`, limitPrice: Number(price) };
+      },
+      getOptionsPositions: async () => [], // Always empty
+    } as unknown as CoinDCXClient;
+
+    const cfg: OneDteConfig = {
+      ...dummyConfig,
+      premiumSource: 'bid',
+      requoteAfterMs: 50,
+      maxRequotes: 2,
+      entryFillTimeoutMs: 150,
+    };
+
+    const res = await executeOneDteEntry(mockClient, cfg);
+    assert.equal(res, null);
+
+    const todayStr = getTodayDateStringIST();
+    const st = await loadOneDteState(todayStr);
+    assert.ok(st);
+    assert.equal(st.entryExecuted, false);
+    assert.equal(st.status, 'closed');
+    assert.ok(cancelledOrders.length >= 2, 'Resting orders must be cancelled upon exhaustion');
+  });
+
+  // Acceptance 6: Invariants that must not break
+  it('enforces invariants: no entryExecuted without venue positions, SL === 2x limit, safe unwind', async () => {
+    let orderCounter = 0;
+    const placedPayloads: any[] = [];
+    const buyBacks: string[] = [];
+    let callFilledOnVenue = true;
+    let putFilledOnVenue = false;
+
+    const mockClient = {
+      getOptionsInstruments: async () => getMockInstruments(),
+      getOptionsTicker: async () => [
+        { symbol: 'BTC-TOMORROW-85000-C-USDT', bidPrice: '125', askPrice: '130', markPrice: '125' },
+        { symbol: 'BTC-TOMORROW-85000-P-USDT', bidPrice: '125', askPrice: '130', markPrice: '125' },
+      ],
+      cancelOptionsOrder: async () => true,
+      placeOptionsOrder: async (symbol: string, side: string, _qty: number, _orderType: string, price: any, stopLoss: string, _tp: string, _cr: any, reduceOnly = false) => {
+        placedPayloads.push({ symbol, side, price: Number(price), stopLoss: Number(stopLoss), reduceOnly });
+        if (side === 'buy') {
+          buyBacks.push(symbol);
+          callFilledOnVenue = false; // bought back!
+          return { symbol, side, success: true, orderId: `bb-${symbol}` };
+        }
+        orderCounter++;
+        return { symbol, side, success: true, orderId: `order-${orderCounter}`, limitPrice: Number(price) };
+      },
+      getOptionsPositions: async () => {
+        const pos = [];
+        if (callFilledOnVenue) pos.push({ symbol: 'BTC-TOMORROW-85000-C-USDT', positionValue: '-0.01', avgPrice: '125' });
+        if (putFilledOnVenue) pos.push({ symbol: 'BTC-TOMORROW-85000-P-USDT', positionValue: '-0.01', avgPrice: '125' });
+        return pos;
+      },
+    } as unknown as CoinDCXClient;
+
+    const cfg: OneDteConfig = {
+      ...dummyConfig,
+      premiumSource: 'bid',
+      requoteAfterMs: 50,
+      maxRequotes: 1,
+      entryFillTimeoutMs: 120,
+    };
+
+    const res = await executeOneDteEntry(mockClient, cfg);
+    assert.equal(res, null);
+
+    // Invariant: every entry sell payload carries stopLoss strictly above its limit, stopLoss === 2 * limit
+    const sellPayloads = placedPayloads.filter((p) => p.side === 'sell');
+    for (const p of sellPayloads) {
+      assert.equal(p.stopLoss, 2 * p.price);
+      assert.ok(p.stopLoss > p.price);
+    }
+
+    // Invariant: no persisted state records entryExecuted: true unless venue showed both
+    const todayStr = getTodayDateStringIST();
+    const st = await loadOneDteState(todayStr);
+    assert.ok(st);
+    assert.equal(st.entryExecuted, false);
+
+    // Invariant: a leg that filled is bought back before attempt ends
+    assert.ok(buyBacks.includes('BTC-TOMORROW-85000-C-USDT'));
+  });
 });
+
