@@ -287,6 +287,12 @@ export async function executeOneDteEntry(
     ),
   ]);
 
+  // Every order id we have placed for a leg. A re-quote replaces the tracked order, and an order we lose
+  // track of is an order we can never cancel — the unwind must be able to reach all of them.
+  const placedOrderIds: { CALL: string[]; PUT: string[] } = { CALL: [], PUT: [] };
+  if (callOrder.orderId) placedOrderIds.CALL.push(callOrder.orderId);
+  if (putOrder.orderId) placedOrderIds.PUT.push(putOrder.orderId);
+
   const todayStr = getTodayDateStringIST();
 
   // Case 1: Both legs failed
@@ -474,30 +480,47 @@ export async function executeOneDteEntry(
             const cancelled = await client.cancelOptionsOrder(callOrder.orderId, call.symbol);
             console.log(`[1DTE Execution] Cancelled CALL order ${callOrder.orderId}: ${cancelled}`);
 
-            const callTicker = tickers.find((t) => t.symbol === call.symbol);
-            const rawBid = callTicker ? Number(callTicker.bidPrice) : 0;
-            if (rawBid > 0) {
-              currentCallBid = rawBid;
-              callLimitPrice = roundToTick(rawBid, config.priceTick);
-              callBasePrice = callLimitPrice;
-              callStopLoss = Math.round(callBasePrice * config.stopLossMultiplier);
-
-              console.log(
-                `[1DTE Execution] Re-placing SELL for CALL ${call.symbol} (bid: ${rawBid}, new limit: ${callLimitPrice}, new SL: ${callStopLoss})...`
+            if (!cancelled) {
+              // A cancel that did NOT succeed leaves the previous order RESTING on the venue. Placing a
+              // replacement now would put two live sells on the same leg: if both fill, the intended 0.01
+              // short becomes 0.02, and the extra order is one the unwind cannot see. Withhold the
+              // replacement and let the unwind pass deal with the order that is still there.
+              console.error(
+                `[1DTE Execution] 🚨 CALL cancel of ${callOrder.orderId} did NOT succeed — withholding the replacement sell (a second live sell would double the position).`
               );
-              callOrder = await client.placeOptionsOrder(
-                call.symbol,
-                'sell',
-                config.orderQuantity,
-                config.entryOrderType,
-                callLimitPrice,
-                String(callStopLoss),
-                '',
-                undefined,
-                false
+              appendAlert(
+                'onedte_requote_cancel_failed',
+                `CALL re-quote cancelled nothing for ${call.symbol} (order ${callOrder.orderId}). Replacement withheld to avoid a double sell.`,
+                { symbol: call.symbol, orderId: callOrder.orderId },
+                { dedupKey: `requote_cancel_${call.symbol}` }
               );
             } else {
-              console.warn(`[1DTE Execution] ⚠️ No valid bid found for CALL ${call.symbol} during re-quote`);
+              const callTicker = tickers.find((t) => t.symbol === call.symbol);
+              const rawBid = callTicker ? Number(callTicker.bidPrice) : 0;
+              if (rawBid > 0) {
+                currentCallBid = rawBid;
+                callLimitPrice = roundToTick(rawBid, config.priceTick);
+                callBasePrice = callLimitPrice;
+                callStopLoss = Math.round(callBasePrice * config.stopLossMultiplier);
+
+                console.log(
+                  `[1DTE Execution] Re-placing SELL for CALL ${call.symbol} (bid: ${rawBid}, new limit: ${callLimitPrice}, new SL: ${callStopLoss})...`
+                );
+                callOrder = await client.placeOptionsOrder(
+                  call.symbol,
+                  'sell',
+                  config.orderQuantity,
+                  config.entryOrderType,
+                  callLimitPrice,
+                  String(callStopLoss),
+                  '',
+                  undefined,
+                  false
+                );
+                if (callOrder.orderId) placedOrderIds.CALL.push(callOrder.orderId);
+              } else {
+                console.warn(`[1DTE Execution] ⚠️ No valid bid found for CALL ${call.symbol} during re-quote`);
+              }
             }
           }
 
@@ -507,30 +530,45 @@ export async function executeOneDteEntry(
             const cancelled = await client.cancelOptionsOrder(putOrder.orderId, put.symbol);
             console.log(`[1DTE Execution] Cancelled PUT order ${putOrder.orderId}: ${cancelled}`);
 
-            const putTicker = tickers.find((t) => t.symbol === put.symbol);
-            const rawBid = putTicker ? Number(putTicker.bidPrice) : 0;
-            if (rawBid > 0) {
-              currentPutBid = rawBid;
-              putLimitPrice = roundToTick(rawBid, config.priceTick);
-              putBasePrice = putLimitPrice;
-              putStopLoss = Math.round(putBasePrice * config.stopLossMultiplier);
-
-              console.log(
-                `[1DTE Execution] Re-placing SELL for PUT ${put.symbol} (bid: ${rawBid}, new limit: ${putLimitPrice}, new SL: ${putStopLoss})...`
+            if (!cancelled) {
+              // Same rule as the CALL leg: never place a second live sell while the first may still be
+              // resting on the venue.
+              console.error(
+                `[1DTE Execution] 🚨 PUT cancel of ${putOrder.orderId} did NOT succeed — withholding the replacement sell (a second live sell would double the position).`
               );
-              putOrder = await client.placeOptionsOrder(
-                put.symbol,
-                'sell',
-                config.orderQuantity,
-                config.entryOrderType,
-                putLimitPrice,
-                String(putStopLoss),
-                '',
-                undefined,
-                false
+              appendAlert(
+                'onedte_requote_cancel_failed',
+                `PUT re-quote cancelled nothing for ${put.symbol} (order ${putOrder.orderId}). Replacement withheld to avoid a double sell.`,
+                { symbol: put.symbol, orderId: putOrder.orderId },
+                { dedupKey: `requote_cancel_${put.symbol}` }
               );
             } else {
-              console.warn(`[1DTE Execution] ⚠️ No valid bid found for PUT ${put.symbol} during re-quote`);
+              const putTicker = tickers.find((t) => t.symbol === put.symbol);
+              const rawBid = putTicker ? Number(putTicker.bidPrice) : 0;
+              if (rawBid > 0) {
+                currentPutBid = rawBid;
+                putLimitPrice = roundToTick(rawBid, config.priceTick);
+                putBasePrice = putLimitPrice;
+                putStopLoss = Math.round(putBasePrice * config.stopLossMultiplier);
+
+                console.log(
+                  `[1DTE Execution] Re-placing SELL for PUT ${put.symbol} (bid: ${rawBid}, new limit: ${putLimitPrice}, new SL: ${putStopLoss})...`
+                );
+                putOrder = await client.placeOptionsOrder(
+                  put.symbol,
+                  'sell',
+                  config.orderQuantity,
+                  config.entryOrderType,
+                  putLimitPrice,
+                  String(putStopLoss),
+                  '',
+                  undefined,
+                  false
+                );
+                if (putOrder.orderId) placedOrderIds.PUT.push(putOrder.orderId);
+              } else {
+                console.warn(`[1DTE Execution] ⚠️ No valid bid found for PUT ${put.symbol} during re-quote`);
+              }
             }
           }
         } catch (rqErr) {
@@ -559,18 +597,22 @@ export async function executeOneDteEntry(
       const failureReason = `Fill verification failed for ${missing}: order accepted but no venue position within ${config.entryFillTimeoutMs}ms.`;
       console.error(`[1DTE Execution] 🚨 ${failureReason}`);
 
-      // Cancel whatever is still resting (only the legs that did NOT fill), then unwind whichever leg
-      // did fill — never leave a lone side.
-      for (const [sym, outcome, filled] of [
-        [call.symbol, callOrder, fills.callFilled] as const,
-        [put.symbol, putOrder, fills.putFilled] as const,
+      // Cancel every order we have placed for a leg that did NOT fill — not just the last one — then unwind
+      // whichever leg did fill. A re-quote replaces the tracked order, so the earlier ids would otherwise be
+      // lost to the unwind; cancelling an id that is already gone is a harmless no-op. A leg that DID fill is
+      // left alone (it is unwound below), and the book is never left with a lone side.
+      for (const [sym, leg, filled] of [
+        [call.symbol, 'CALL', fills.callFilled] as const,
+        [put.symbol, 'PUT', fills.putFilled] as const,
       ]) {
-        if (filled || !outcome.orderId) continue;
-        try {
-          const cancelled = await client.cancelOptionsOrder(outcome.orderId, sym);
-          console.log(`[1DTE Execution] Cancelled resting order ${outcome.orderId} (${sym}): ${cancelled}`);
-        } catch (err) {
-          console.warn(`[1DTE Execution] Could not cancel ${outcome.orderId} (${sym}): ${(err as Error).message}`);
+        if (filled) continue;
+        for (const orderId of placedOrderIds[leg]) {
+          try {
+            const cancelled = await client.cancelOptionsOrder(orderId, sym);
+            console.log(`[1DTE Execution] Cancelled resting order ${orderId} (${sym}): ${cancelled}`);
+          } catch (err) {
+            console.warn(`[1DTE Execution] Could not cancel ${orderId} (${sym}): ${(err as Error).message}`);
+          }
         }
       }
       if (fills.callFilled) await buyBackFilledLeg(client, call.symbol, config.orderQuantity, 3, notifier);
